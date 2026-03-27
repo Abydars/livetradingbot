@@ -66,6 +66,7 @@ _last_symbol_scan: float = 0.0
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _trading_active: bool = False          # persisted in config.trading_active
+_prev_session_open: bool = False       # track trade close to trigger immediate scan
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 
@@ -97,7 +98,7 @@ async def _do_broadcast(msg: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch
+    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open
     cfg = await load_config()
 
     while True:
@@ -152,6 +153,13 @@ async def _ticker_loop() -> None:
             # Run trading tick (only when trading is enabled)
             if _trading_active:
                 await _engine.tick(cfg, price)
+
+            # Detect trade close → trigger immediate symbol scan
+            cur_session_open = _engine._session is not None
+            if _prev_session_open and not cur_session_open:
+                logger.info("Trade closed — triggering immediate symbol scan")
+                _last_symbol_scan = 0.0
+            _prev_session_open = cur_session_open
 
             # Symbol scan — always runs for sidebar; auto-switch is conditional
             if now - _last_symbol_scan >= cfg.scan_interval_s:
@@ -211,17 +219,13 @@ async def _scan_symbols(cfg) -> None:
 
         best      = top[0]
         new_sym   = best["symbol"]
-        cur_score = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
-        best_score = best["_score"]
 
         if new_sym == cfg.symbol:
-            return
-        if cur_score > 0 and best_score < cur_score * 1.2:
-            return  # not meaningfully better — stay put
+            return  # already on the top symbol
 
         logger.info(
-            "Auto-switch: %s → %s  (score %.1f → %.1f)",
-            cfg.symbol, new_sym, cur_score, best_score,
+            "Auto-switch: %s → %s  (score %.1f)",
+            cfg.symbol, new_sym, best["_score"],
         )
         await set_config_bulk({"symbol": new_sym})
         await _ws.switch_symbol(new_sym)
@@ -229,7 +233,7 @@ async def _scan_symbols(cfg) -> None:
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
             "type": "notification",
-            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
+            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best['_score']:.1f})",
         })
         await notify(cfg.discord_webhook, "AUTO_SWITCH", {
             "old_symbol": cfg.symbol,
