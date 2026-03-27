@@ -13,7 +13,6 @@ module.exports = {
       cwd: __dirname+"/bot",
       env: {
         NODE_ENV: "production",
-        PORT: "8100",
       },
       error_file: "../logs/err.log",
       out_file: "../logs/out.log",
