@@ -632,6 +632,42 @@
       margin: 2px 0;
     }
 
+    /* ── position log ── */
+    #pos-log-list {
+      max-height: 220px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+    .pl-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(255,255,255,.04);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .pl-row:last-child { border-bottom: none; }
+    .pl-badge {
+      flex-shrink: 0;
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 2px;
+      letter-spacing: .3px;
+      margin-top: 1px;
+    }
+    .pl-open       { background: rgba(63,185,80,.18);   color: var(--green); }
+    .pl-close      { background: rgba(248,81,73,.18);   color: var(--red); }
+    .pl-dca        { background: rgba(88,166,255,.18);  color: var(--blue); }
+    .pl-hedge-open { background: rgba(210,168,255,.18); color: var(--purple); }
+    .pl-hedge-close{ background: rgba(210,168,255,.12); color: #b09cdb; }
+    .pl-failed     { background: rgba(255,166,0,.18);   color: var(--gold); }
+    .pl-detail     { color: var(--fg); flex: 1; word-break: break-all; }
+    .pl-pnl-pos    { color: var(--green); }
+    .pl-pnl-neg    { color: var(--red); }
+    .pl-time       { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+
     /* ── signal log action badges ── */
     .act {
       font-size: 9px;
@@ -1057,6 +1093,12 @@
       <div id="ob-bids"></div>
     </section>
 
+    <!-- Position log -->
+    <section class="rcard" id="card-pos-log">
+      <div class="rcard-title">POSITION LOG</div>
+      <div id="pos-log-list"><div class="empty">No events yet</div></div>
+    </section>
+
   </div><!-- /right-col -->
 
 </div><!-- /main -->
@@ -1317,6 +1359,10 @@ function dispatch(msg) {
 
     case 'depth':
       if (msg.bids && msg.asks) updateOrderBook(msg.bids, msg.asks);
+      break;
+
+    case 'pos_log':
+      addPosLogEntry(msg);
       break;
 
     case 'notification':
@@ -1847,6 +1893,83 @@ function refreshPnL() {
 // helper: position row
 function pr(label, value) {
   return `<div class="pr"><span class="prk">${label}</span><span class="prv">${value}</span></div>`;
+}
+
+/* ═══════════════════════════════════════════════════════
+   POSITION LOG
+═══════════════════════════════════════════════════════ */
+const _posLogEntries = [];
+const _POS_LOG_MAX = 50;
+
+const _PL_LABELS = {
+  open:        'OPEN',
+  close:       'CLOSE',
+  dca:         'DCA',
+  hedge_open:  'HEDGE',
+  hedge_close: 'H-CLOSE',
+  failed:      'FAILED',
+};
+const _PL_CLASSES = {
+  open:        'pl-open',
+  close:       'pl-close',
+  dca:         'pl-dca',
+  hedge_open:  'pl-hedge-open',
+  hedge_close: 'pl-hedge-close',
+  failed:      'pl-failed',
+};
+
+function _fmtPosLogTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toTimeString().slice(0, 8);
+}
+
+function _buildPosLogDetail(e) {
+  const dir  = e.direction || '';
+  const px   = e.price  ? fmtPrice(e.price) : '';
+  const qty  = e.qty    ? ` qty=${fmtQty(e.qty)}` : '';
+  const sym  = e.symbol || '';
+  const mode = e.mode   ? ` [${e.mode.toUpperCase()}]` : '';
+  let detail = `${sym} ${dir} @ ${px}${qty}${mode}`;
+
+  if (e.event === 'dca')
+    detail += ` · DCA#${e.dca_n} avg=${fmtPrice(e.new_avg)}`;
+  if (e.event === 'hedge_open')
+    detail += ` · hedge#${e.hedge_n}`;
+
+  let pnlHtml = '';
+  if (e.pnl !== undefined) {
+    const cls = e.pnl >= 0 ? 'pl-pnl-pos' : 'pl-pnl-neg';
+    const sign = e.pnl >= 0 ? '+' : '';
+    pnlHtml = ` <span class="${cls}">${sign}${e.pnl.toFixed(4)} USDT`;
+    if (e.pnl_pct !== undefined) pnlHtml += ` (${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%)`;
+    pnlHtml += `</span>`;
+  }
+  if (e.reason) detail += ` · ${e.reason}`;
+  return `<span class="pl-detail">${detail}${pnlHtml}</span>`;
+}
+
+function _renderPosLog() {
+  const el = document.getElementById('pos-log-list');
+  if (!el) return;
+  if (!_posLogEntries.length) {
+    el.innerHTML = '<div class="empty">No events yet</div>';
+    return;
+  }
+  el.innerHTML = _posLogEntries.slice().reverse().map(e => {
+    const badgeCls = _PL_CLASSES[e.event] || 'pl-open';
+    const label    = _PL_LABELS[e.event]  || e.event.toUpperCase();
+    return `<div class="pl-row">
+      <span class="pl-badge ${badgeCls}">${label}</span>
+      ${_buildPosLogDetail(e)}
+      <span class="pl-time">${_fmtPosLogTime(e.ts)}</span>
+    </div>`;
+  }).join('');
+}
+
+function addPosLogEntry(e) {
+  _posLogEntries.push(e);
+  if (_posLogEntries.length > _POS_LOG_MAX) _posLogEntries.shift();
+  _renderPosLog();
 }
 
 /* ═══════════════════════════════════════════════════════
