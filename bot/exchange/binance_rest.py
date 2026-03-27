@@ -36,22 +36,51 @@ except ImportError:
 # Key-type resolution helper
 # ---------------------------------------------------------------------------
 
+def _load_ed25519_key(api_secret: str):
+    """
+    Load an Ed25519 private key from any format Binance uses:
+      - PEM PKCS#8 (with or without headers, with real or literal \\n)
+      - Raw base64 (32 bytes decoded)
+      - PKCS#8 DER base64 (48 bytes decoded)
+    Returns an Ed25519PrivateKey instance.
+    """
+    from cryptography.hazmat.primitives.serialization import (
+        load_pem_private_key, load_der_private_key,
+    )
+    # Normalise literal \n sequences from .env files
+    s = api_secret.strip().replace("\\n", "\n")
+
+    if "-----BEGIN" in s:
+        return load_pem_private_key(s.encode(), password=None)
+
+    # Base64-encoded DER or raw bytes
+    padded = s + "=" * (-len(s) % 4)
+    raw = base64.b64decode(padded)
+    if len(raw) == 32:
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    if len(raw) == 48:
+        return load_der_private_key(raw, password=None)
+    raise ValueError(
+        f"Unrecognised Ed25519 key length: {len(raw)} bytes "
+        "(expected PEM, or base64 of 32 raw bytes or 48 DER bytes)"
+    )
+
+
 def _resolve_key_type(api_secret: str, key_type: str):
     """Return (resolved_key_type, ed25519_key_or_None)."""
-    if key_type == "ed25519":
-        if not _ED25519_AVAILABLE:
-            raise ImportError("cryptography package required for Ed25519 keys")
-        key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(api_secret))
-        return "ed25519", key
     if key_type == "hmac":
         return "hmac", None
-    # "auto" — try Ed25519 first, fall back to HMAC
-    if _ED25519_AVAILABLE and api_secret:
-        try:
-            key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(api_secret))
-            return "ed25519", key
-        except Exception:
-            pass
+    if not _ED25519_AVAILABLE or not api_secret:
+        return "hmac", None
+    if key_type == "ed25519":
+        key = _load_ed25519_key(api_secret)  # raises on failure
+        return "ed25519", key
+    # "auto" — try Ed25519, fall back to HMAC
+    try:
+        key = _load_ed25519_key(api_secret)
+        return "ed25519", key
+    except Exception:
+        pass
     return "hmac", None
 
 

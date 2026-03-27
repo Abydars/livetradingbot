@@ -422,7 +422,7 @@ class BinanceClient:
 
         HMAC secrets from Binance are 64-character hex strings.
         """
-        stripped = secret.strip()
+        stripped = secret.strip().replace("\\n", "\n")
         # PEM format — definitive signal
         if "-----BEGIN PRIVATE KEY-----" in stripped or "-----BEGIN ED25519 PRIVATE KEY-----" in stripped:
             return "ed25519"
@@ -452,6 +452,11 @@ class BinanceClient:
         )
 
         stripped = secret.strip()
+
+        # Normalise literal \n sequences that appear when PEM keys are stored
+        # in .env files (python-dotenv doesn't expand escape sequences).
+        if "\\n" in stripped:
+            stripped = stripped.replace("\\n", "\n")
 
         # ── PEM format: -----BEGIN PRIVATE KEY----- ──────────────────────
         if "-----BEGIN" in stripped:
