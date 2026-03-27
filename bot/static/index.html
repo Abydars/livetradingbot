@@ -973,7 +973,7 @@
             <table id="tbl-history">
               <thead>
                 <tr>
-                  <th>TIME</th><th>SYM</th><th>DIR</th><th>ENTRY</th>
+                  <th>TIME</th><th>SYM</th><th>DIR</th><th>SIGNAL</th><th>ENTRY</th><th>AVG</th>
                   <th>QTY</th><th>PNL</th><th>DCA</th><th>HDG</th>
                   <th>STRENGTH</th><th>ENTRY REASON</th><th>EXIT REASON</th><th>DURATION</th><th></th>
                 </tr>
@@ -1779,10 +1779,11 @@ function updatePositionPanel() {
     : '';
 
   posEl.innerHTML = `
-    ${pr('Direction', `<span class="prv ${dir}">${s.direction}</span>`)}
-    ${pr('Symbol',    s.symbol || currentSymbol)}
-    ${pr('Entry',     fmtPrice(s.entry_price))}
-    ${pr('Avg Price', fmtPrice(s.avg_price))}
+    ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
+    ${pr('Symbol',       s.symbol || currentSymbol)}
+    ${s.signal_price ? pr('Signal Price', fmtPrice(s.signal_price)) : ''}
+    ${pr('Entry Price',  fmtPrice(s.entry_price))}
+    ${pr('Avg Price',    fmtPrice(s.avg_price))}
     ${pr('Trail Arm', `<span class="prv" style="color:var(--green)">${fmtPrice(tpPrice)}</span>`)}
     ${pr('Hard Stop', `<span class="prv" style="color:var(--red)">${fmtPrice(slPrice)}</span>`)}
     ${trailRow}
@@ -1997,7 +1998,7 @@ function updateHistoryTable(sessions) {
   const closed = sessions.filter(s => s.status === 'closed');
 
   if (!closed.length) {
-    tbody.innerHTML = '<tr><td colspan="13" class="empty">No closed trades yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">No closed trades yet</td></tr>';
     return;
   }
 
@@ -2013,7 +2014,9 @@ function updateHistoryTable(sessions) {
       <td class="cm">${fmtTime(s.open_time)}</td>
       <td>${s.symbol || currentSymbol}</td>
       <td class="${dir}">${s.direction}</td>
+      <td>${s.signal_price ? fmtPrice(s.signal_price) : '--'}</td>
       <td>${fmtPrice(s.entry_price)}</td>
+      <td>${fmtPrice(s.avg_price)}</td>
       <td>${s.qty}</td>
       <td class="${pnlCls}">${pnlTxt}</td>
       <td>${s.dca_count}</td>

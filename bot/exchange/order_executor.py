@@ -47,8 +47,16 @@ class OrderExecutor:
         return self.paper_mode or self._client is not None
 
     async def init(self) -> None:
-        """Fetch account position mode from Binance (demo/live only)."""
+        """Ensure hedge mode is enabled on Binance, then read back the active mode."""
         if self._client and not self.paper_mode:
+            # Always request hedge mode — the bot's hedge logic requires it.
+            # Binance returns code -4059 ("No need to change") if it's already set; that's fine.
+            try:
+                await self._client.set_position_mode(dual_side=True)
+                logger.info("OrderExecutor: position mode set to HEDGE")
+            except Exception as exc:
+                logger.warning("OrderExecutor: could not set hedge mode: %s", exc)
+
             try:
                 self._hedge_mode = await self._client.get_position_mode()
                 logger.info(
@@ -59,13 +67,49 @@ class OrderExecutor:
                 logger.warning("OrderExecutor: could not fetch position mode: %s", exc)
                 self._hedge_mode = False
 
+    async def prepare_symbol(self, symbol: str, leverage: int) -> None:
+        """
+        Configure symbol-level settings on Binance before trading begins.
+        Called at startup and on every auto-switch / symbol change so that
+        the first order can be placed immediately without any setup latency.
+
+          1. Margin type → ISOLATED  (risk-isolated per position)
+          2. Leverage    → cfg.leverage
+
+        Binance returns -4046 when margin type is already correct — silently ignored.
+        """
+        if self.paper_mode or not self._client:
+            return
+
+        from binance_client import MarginType
+
+        symbol = symbol.upper()
+
+        try:
+            await self._client.change_margin_type(symbol, MarginType.ISOLATED)
+            logger.info("OrderExecutor: margin type = ISOLATED for %s", symbol)
+        except Exception as exc:
+            if "-4046" in str(exc):
+                logger.debug("OrderExecutor: margin type already ISOLATED for %s", symbol)
+            else:
+                logger.warning("OrderExecutor: could not set margin type for %s: %s", symbol, exc)
+
+        try:
+            await self._client.change_leverage(symbol, leverage)
+            logger.info("OrderExecutor: leverage = %dx for %s", leverage, symbol)
+        except Exception as exc:
+            logger.warning("OrderExecutor: could not set leverage for %s: %s", symbol, exc)
+
     async def ensure_leverage(self, symbol: str, leverage: int) -> None:
-        """Set leverage on Binance for this symbol before opening a position."""
+        """
+        Last-resort leverage sync just before entry — catches cases where
+        leverage was changed in config after startup without a symbol switch.
+        The upfront prepare_symbol() call handles the normal path.
+        """
         if self.paper_mode or not self._client:
             return
         try:
             await self._client.change_leverage(symbol, leverage)
-            logger.info("OrderExecutor: leverage set to %dx for %s", leverage, symbol)
         except Exception as exc:
             logger.warning("OrderExecutor: could not set leverage: %s", exc)
 
@@ -76,17 +120,24 @@ class OrderExecutor:
         qty: float,
         reduce_only: bool = False,
         current_price: float = 0.0,
+        close_hedge: bool = False,
     ) -> dict:
         """
         Place a market order using the appropriate execution path.
+
+        close_hedge=True: closing a bot-tracked hedge position (not the main position).
+          - Hedge-mode account: flips positionSide to target the hedge leg (same as reduce_only).
+          - One-way account: sends a plain opposing order without reduceOnly, because in one-way
+            mode the hedge was just a partial close of the main position — there is no separate
+            LONG/SHORT position on Binance to "reduce".
 
         Returns an order-result dict with at minimum:
             orderId, symbol, side, origQty, avgPrice, executedQty, status
         """
         prefix = _MODE_PREFIX.get(self.trading_mode, "")
         logger.info(
-            "%splace_market_order %s %s qty=%.6f reduce_only=%s",
-            prefix, symbol, side, qty, reduce_only,
+            "%splace_market_order %s %s qty=%.6f reduce_only=%s close_hedge=%s",
+            prefix, symbol, side, qty, reduce_only, close_hedge,
         )
 
         if self.paper_mode:
@@ -111,19 +162,25 @@ class OrderExecutor:
 
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
 
+        # Treat close_hedge the same as reduce_only for positionSide selection in hedge mode.
+        is_close = reduce_only or close_hedge
+
         if self._hedge_mode:
-            # Hedge mode: positionSide determines which side to open/close
+            # Hedge mode: positionSide determines which side to open/close.
             # Opening: BUY → LONG, SELL → SHORT
-            # Closing (reduce_only): BUY closes SHORT, SELL closes LONG
-            if not reduce_only:
+            # Closing (reduce_only or close_hedge): BUY closes SHORT, SELL closes LONG
+            if not is_close:
                 pos_side = PositionSide.LONG if side == "BUY" else PositionSide.SHORT
             else:
                 pos_side = PositionSide.SHORT if side == "BUY" else PositionSide.LONG
             reduce = False  # reduceOnly is FORBIDDEN in hedge mode per docs
         else:
-            # One-way mode: always BOTH, use reduceOnly for closes
+            # One-way mode: always BOTH.
+            # reduce_only=True for main-position closes (safe guard against accidental opens).
+            # close_hedge: do NOT use reduceOnly — in one-way mode the hedge leg has no separate
+            # Binance position; closing it just places an opposing order to restore the main.
             pos_side = PositionSide.BOTH
-            reduce = reduce_only
+            reduce = reduce_only and not close_hedge
 
         result = await self._client.place_order_ws(
             symbol=symbol,

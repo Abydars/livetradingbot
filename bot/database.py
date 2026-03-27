@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     status           TEXT NOT NULL DEFAULT 'open',
     exit_reason      TEXT,
     entry_reason     TEXT,
-    signal_strength  REAL
+    signal_strength  REAL,
+    signal_price     REAL
 );
 
 CREATE TABLE IF NOT EXISTS hedge_positions (
@@ -111,6 +112,8 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         # sessions columns added in v3 — trail state persistence
         ("trail_active",    "INTEGER DEFAULT 0"),
         ("trail_price",     "REAL"),
+        # sessions columns added in v4 — signal price
+        ("signal_price",    "REAL"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
@@ -173,6 +176,7 @@ async def create_session(
     leverage: int,
     entry_reason: str = "",
     signal_strength: float = 0.0,
+    signal_price: float = 0.0,
 ) -> int:
     now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -180,10 +184,10 @@ async def create_session(
             """INSERT INTO sessions
                (open_time, symbol, direction, entry_price, avg_price,
                 qty, margin, leverage, dca_count, hedge_count, status,
-                entry_reason, signal_strength)
-               VALUES (?,?,?,?,?,?,?,?,0,0,'open',?,?)""",
+                entry_reason, signal_strength, signal_price)
+               VALUES (?,?,?,?,?,?,?,?,0,0,'open',?,?,?)""",
             (now, symbol, direction, entry_price, entry_price,
-             qty, margin, leverage, entry_reason, signal_strength),
+             qty, margin, leverage, entry_reason, signal_strength, signal_price),
         )
         await db.commit()
         return cursor.lastrowid

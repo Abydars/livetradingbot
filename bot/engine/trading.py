@@ -72,6 +72,10 @@ class TradingEngine:
         # DCA adverse pressure timer
         self._dca_pending_since: Optional[float] = None
 
+        # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
+        # Used by _on_user_data in main.py to compute correct blended average from true fill price.
+        self._pending_fills: Dict[int, Dict] = {}
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, used for ALL SL/TP decisions
@@ -259,6 +263,11 @@ class TradingEngine:
         )
         fill_price = float(order.get("avgPrice") or price)
 
+        # Track this order so _on_user_data can correct fill price if avgPrice was "0"
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
+
         session_id = await create_session(
             symbol=cfg.symbol,
             direction=direction,
@@ -268,6 +277,7 @@ class TradingEngine:
             leverage=cfg.leverage,
             entry_reason=signal["reason"],
             signal_strength=strength,
+            signal_price=price,
         )
         self._session = await get_open_session()
         self._hedges = []
@@ -489,6 +499,12 @@ class TradingEngine:
         )
         fill_price = float(order.get("avgPrice") or price)
 
+        # Track this order so _on_user_data can reblend with the true fill price.
+        # Store the pre-DCA state so the callback can compute: (prior_avg*prior_qty + fill*new_qty) / total
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {"type": "dca", "prior_qty": qty, "prior_avg": avg_price, "new_qty": new_qty}
+
         total_qty = qty + new_qty
         new_avg = (avg_price * qty + fill_price * new_qty) / total_qty
 
@@ -607,7 +623,7 @@ class TradingEngine:
             if h_price_pct >= p["tp_pct"]:
                 side = "SELL" if h_dir == "LONG" else "BUY"
                 order = await self._executor.place_market_order(
-                    cfg.symbol, side, h_qty, reduce_only=True, current_price=price
+                    cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
                 h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
@@ -632,7 +648,7 @@ class TradingEngine:
             elif main_price_pct >= 0:
                 side = "SELL" if h_dir == "LONG" else "BUY"
                 order = await self._executor.place_market_order(
-                    cfg.symbol, side, h_qty, reduce_only=True, current_price=price
+                    cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
                 h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
@@ -673,7 +689,7 @@ class TradingEngine:
             h_side = "SELL" if hedge["direction"] == "LONG" else "BUY"
             order = await self._executor.place_market_order(
                 cfg.symbol, h_side, hedge["qty"],
-                reduce_only=True, current_price=price,
+                close_hedge=True, current_price=price,
             )
             fill = float(order.get("avgPrice") or price)
             h_dir = hedge["direction"]
