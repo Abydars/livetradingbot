@@ -86,6 +86,12 @@ class OrderExecutor:
                 "paper":      True,
             }
 
+        if self._client is None:
+            raise RuntimeError(
+                f"Exchange client unavailable in {self.trading_mode} mode — "
+                "check API keys and startup logs"
+            )
+
         from binance_client import OrderSide, OrderType, PositionSide
 
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL

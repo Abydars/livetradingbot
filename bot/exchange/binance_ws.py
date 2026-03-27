@@ -45,10 +45,12 @@ class BinanceWebSocket:
         trading_mode: str,
         on_trade: Callable[[Dict], None],
         on_depth: Callable[[Dict], None],
+        on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.symbol = symbol.lower()
         self.on_trade = on_trade
         self.on_depth = on_depth
+        self._on_error = on_error
         self._base_url = _WS_STREAM_URLS.get(trading_mode, _WS_STREAM_URLS["live"])
 
         self._running = False
@@ -101,11 +103,10 @@ class BinanceWebSocket:
             except Exception as exc:
                 if not self._running:
                     return
-                logger.warning(
-                    "BinanceWebSocket: disconnected (%s). Reconnecting in %ss…",
-                    exc,
-                    delay,
-                )
+                msg = f"Market data WS disconnected: {exc}. Reconnecting in {delay}s…"
+                logger.warning("BinanceWebSocket: %s", msg)
+                if self._on_error:
+                    self._on_error(msg)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _BACKOFF_CAP)
 

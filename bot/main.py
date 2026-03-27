@@ -176,6 +176,12 @@ async def _ticker_loop() -> None:
             return
         except Exception as exc:
             logger.error("ticker_loop error: %s", exc, exc_info=True)
+            _broadcast({
+                "type": "pos_log",
+                "event": "failed",
+                "ts": int(time.time()),
+                "reason": str(exc),
+            })
 
         await asyncio.sleep(1.0)
 
@@ -256,11 +262,23 @@ async def _scan_symbols(cfg) -> None:
         })
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
+        _on_exchange_error(f"Symbol scan failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# WS trade/depth callbacks
+# WS trade/depth callbacks + exchange error callback
 # ---------------------------------------------------------------------------
+
+def _on_exchange_error(msg: str) -> None:
+    """Forward any Binance WS error to the position log in the UI."""
+    logger.warning("Exchange error: %s", msg)
+    _broadcast({
+        "type":   "pos_log",
+        "event":  "failed",
+        "ts":     int(time.time()),
+        "reason": msg,
+    })
+
 
 def _on_trade(event: Dict) -> None:
     global _last_price
@@ -374,6 +392,7 @@ async def lifespan(app: FastAPI):
                     mode=mode,
                     market="futures",
                     key_type=cfg.key_type,
+                    on_error=_on_exchange_error,
                 )
                 await _binance_client.start()
                 await _binance_client.subscribe_user_data(_on_user_data)
@@ -397,7 +416,8 @@ async def lifespan(app: FastAPI):
     await _engine.restore_state()
 
     _ws = BinanceWebSocket(
-        cfg.symbol, cfg.trading_mode, on_trade=_on_trade, on_depth=_on_depth
+        cfg.symbol, cfg.trading_mode, on_trade=_on_trade, on_depth=_on_depth,
+        on_error=_on_exchange_error,
     )
     await _ws.start()
 
@@ -711,6 +731,7 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                             mode=bc_mode,
                             market="futures",
                             key_type=cfg2.key_type,
+                            on_error=_on_exchange_error,
                         )
                         await _binance_client.start()
                         await _binance_client.subscribe_user_data(_on_user_data)
@@ -739,7 +760,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             # Reconnect WS to correct stream URL for the new mode
             await _ws.stop()
             _ws = BinanceWebSocket(
-                cfg2.symbol, new_mode, on_trade=_on_trade, on_depth=_on_depth
+                cfg2.symbol, new_mode, on_trade=_on_trade, on_depth=_on_depth,
+                on_error=_on_exchange_error,
             )
             await _ws.start()
             _last_candles_fetch = 0.0
