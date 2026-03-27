@@ -55,7 +55,10 @@ class OrderExecutor:
                 await self._client.set_position_mode(dual_side=True)
                 logger.info("OrderExecutor: position mode set to HEDGE")
             except Exception as exc:
-                logger.warning("OrderExecutor: could not set hedge mode: %s", exc)
+                if "-4059" in str(exc):
+                    logger.debug("OrderExecutor: position mode already HEDGE")
+                else:
+                    logger.warning("OrderExecutor: could not set hedge mode: %s", exc)
 
             try:
                 self._hedge_mode = await self._client.get_position_mode()
