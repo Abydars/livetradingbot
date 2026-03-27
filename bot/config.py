@@ -4,9 +4,18 @@ Provides a typed snapshot of all settings for use in the engine/exchange layers.
 """
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from database import get_all_config
+
+# Load .env from project root (parent of bot/) if present — does not override
+# variables already set in the shell environment.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+except ImportError:
+    pass
 
 
 @dataclass
