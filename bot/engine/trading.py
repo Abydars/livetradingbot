@@ -277,6 +277,7 @@ class TradingEngine:
             leverage=cfg.leverage,
             entry_reason=signal["reason"],
             signal_strength=strength,
+            signal_price=price,
         )
         self._session = await get_open_session()
         self._hedges = []
