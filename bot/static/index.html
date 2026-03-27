@@ -1894,6 +1894,9 @@ function _fmtPosLogTime(ts) {
 }
 
 function _buildPosLogDetail(e) {
+  if (e.event === 'failed')
+    return `<span class="pl-detail">${e.reason || 'unknown error'}</span>`;
+
   const dir  = e.direction || '';
   const px   = e.price  ? fmtPrice(e.price) : '';
   const qty  = e.qty    ? ` qty=${fmtQty(e.qty)}` : '';

@@ -176,6 +176,12 @@ async def _ticker_loop() -> None:
             return
         except Exception as exc:
             logger.error("ticker_loop error: %s", exc, exc_info=True)
+            _broadcast({
+                "type": "pos_log",
+                "event": "failed",
+                "ts": int(time.time()),
+                "reason": str(exc),
+            })
 
         await asyncio.sleep(1.0)
 

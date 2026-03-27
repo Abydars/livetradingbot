@@ -74,13 +74,7 @@ class OrderExecutor:
             prefix, symbol, side, qty, reduce_only,
         )
 
-        if self.paper_mode or self._client is None:
-            if self._client is None and not self.paper_mode:
-                logger.warning(
-                    "%splace_market_order: exchange client unavailable — simulating fill. "
-                    "Check API keys / BinanceClient startup logs.",
-                    prefix,
-                )
+        if self.paper_mode:
             return {
                 "orderId":    int(time.time() * 1000),
                 "symbol":     symbol,
@@ -91,6 +85,12 @@ class OrderExecutor:
                 "status":     "FILLED",
                 "paper":      True,
             }
+
+        if self._client is None:
+            raise RuntimeError(
+                f"Exchange client unavailable in {self.trading_mode} mode — "
+                "check API keys and startup logs"
+            )
 
         from binance_client import OrderSide, OrderType, PositionSide
 
