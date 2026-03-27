@@ -4,7 +4,7 @@ module.exports = {
       name: "livetradingbot",
       script: "main.py",
       cwd: "./bot",
-      interpreter: "python3",
+      interpreter: "venv/bin/python",
       interpreter_args: "-u",
       args: "",
       instances: 1,
