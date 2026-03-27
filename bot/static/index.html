@@ -1001,6 +1001,11 @@ function dispatch(msg) {
       curTrailActive = !!msg.trail_active;
       updatePositionPanel();
       updateTradeLevels(msg.session, curTrailPrice, curTrailActive, prevOpen, nowOpen);
+      // Trade just closed — refresh history immediately so it shows the new row
+      if (prevOpen && !nowOpen) {
+        wsSend({ type: 'get_sessions',    limit: 200 });
+        wsSend({ type: 'get_performance' });
+      }
       break;
     }
 
