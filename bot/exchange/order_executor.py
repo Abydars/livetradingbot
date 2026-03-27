@@ -41,6 +41,11 @@ class OrderExecutor:
         self.paper_mode = trading_mode == "paper"
         self._hedge_mode = False  # set by init() after querying Binance
 
+    @property
+    def is_ready(self) -> bool:
+        """True when orders can be placed (paper always ready; live/demo need a client)."""
+        return self.paper_mode or self._client is not None
+
     async def init(self) -> None:
         """Fetch account position mode from Binance (demo/live only)."""
         if self._client and not self.paper_mode:
