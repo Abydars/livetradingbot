@@ -504,7 +504,9 @@ class TradingEngine:
     ) -> None:
         hedge_dir  = "SHORT" if main_dir == "LONG" else "LONG"
         hedge_side = "SELL"  if main_dir == "LONG" else "BUY"
-        hedge_qty  = self._rest.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
+        # Size the hedge to match the current main position (including any DCA).
+        # Using main_qty directly ensures full exposure is offset, not just 1×margin.
+        hedge_qty  = main_qty
 
         order = await self._rest.place_market_order(
             cfg.symbol, hedge_side, hedge_qty, current_price=price
@@ -565,6 +567,7 @@ class TradingEngine:
             else:
                 h_price_pct = (h_price - price) / h_price * 100
 
+            # ── Hedge TP: market kept going adverse for main ──────────────
             if h_price_pct >= p["tp_pct"]:
                 side = "SELL" if h_dir == "LONG" else "BUY"
                 order = await self._rest.place_market_order(
@@ -584,6 +587,28 @@ class TradingEngine:
                     await self._close_position(cfg, price, main_pnl_pct, "hedge_tp_close")
                     return
 
+            # ── Recovery close: main has recovered to breakeven ───────────
+            # The hedge was protecting against further losses. Now that the
+            # main is no longer losing, stop the hedge from bleeding further.
+            elif main_price_pct >= 0:
+                side = "SELL" if h_dir == "LONG" else "BUY"
+                order = await self._rest.place_market_order(
+                    cfg.symbol, side, h_qty, reduce_only=True, current_price=price
+                )
+                fill_price = float(order.get("avgPrice") or price)
+                h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
+                await close_hedge(hedge["id"], h_pnl)
+                self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
+
+                msg = (
+                    f"{'[PAPER] ' if cfg.paper_mode else ''}"
+                    f"HEDGE CLOSED (recovery) @ {fill_price:.6f}  "
+                    f"hedge_pnl={h_pnl:+.4f}"
+                )
+                logger.info("TradingEngine: %s", msg)
+                self._broadcast({"type": "notification", "text": msg})
+                self._push_session()
+
     # ------------------------------------------------------------------
     # Close all
     # ------------------------------------------------------------------
@@ -600,7 +625,8 @@ class TradingEngine:
         qty       = sess["qty"]
         margin    = sess["margin"]
 
-        # Close any open hedges first
+        # Close any open hedges first and accumulate their PnL
+        total_hedge_pnl = 0.0
         for hedge in list(self._hedges):
             h_side = "SELL" if hedge["direction"] == "LONG" else "BUY"
             order = await self._rest.place_market_order(
@@ -614,6 +640,7 @@ class TradingEngine:
             else:
                 h_pnl = (hedge["entry_price"] - fill) / hedge["entry_price"] * hedge["margin"] * sess["leverage"]
             await close_hedge(hedge["id"], h_pnl)
+            total_hedge_pnl += h_pnl
         self._hedges = []
 
         # Close main
@@ -623,7 +650,8 @@ class TradingEngine:
         )
         fill_price = float(order.get("avgPrice") or price)
 
-        realized_pnl = pnl_pct / 100 * margin
+        # Include hedge PnL in the session total so history shows true net result
+        realized_pnl = pnl_pct / 100 * margin + total_hedge_pnl
         await close_session(sess["id"], round(realized_pnl, 4), reason)
 
         msg = (
