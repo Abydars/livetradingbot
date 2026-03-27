@@ -248,6 +248,11 @@ class TradingEngine:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
+        # Sync leverage to Binance before opening — Binance keeps its own
+        # per-symbol leverage setting that defaults to 20x and must be set
+        # explicitly, otherwise the exchange margin display will be wrong.
+        await self._executor.ensure_leverage(cfg.symbol, cfg.leverage)
+
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(
             cfg.symbol, side, qty, current_price=price

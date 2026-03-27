@@ -59,6 +59,16 @@ class OrderExecutor:
                 logger.warning("OrderExecutor: could not fetch position mode: %s", exc)
                 self._hedge_mode = False
 
+    async def ensure_leverage(self, symbol: str, leverage: int) -> None:
+        """Set leverage on Binance for this symbol before opening a position."""
+        if self.paper_mode or not self._client:
+            return
+        try:
+            await self._client.change_leverage(symbol, leverage)
+            logger.info("OrderExecutor: leverage set to %dx for %s", leverage, symbol)
+        except Exception as exc:
+            logger.warning("OrderExecutor: could not set leverage: %s", exc)
+
     async def place_market_order(
         self,
         symbol: str,
