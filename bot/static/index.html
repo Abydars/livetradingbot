@@ -609,6 +609,120 @@
       from { transform: translateX(110%); opacity: 0; }
       to   { transform: translateX(0);   opacity: 1; }
     }
+
+    /* ═══════════════════════════════ RESPONSIVE ══ */
+
+    /* Tables always allow horizontal scroll */
+    .tbl-scroll { overflow-x: auto; }
+
+    /* ── narrow desktop (< 1100px) ── */
+    @media (max-width: 1099px) {
+      #right-col { width: 240px; }
+    }
+
+    /* ── mobile layout (≤ 767px) ── */
+    @media (max-width: 767px) {
+      html, body {
+        height: auto;
+        min-height: 100svh;
+        overflow-x: hidden;
+        overflow-y: auto;
+      }
+
+      #main {
+        flex-direction: column;
+        overflow: visible;
+      }
+
+      #left-col { overflow: visible; }
+
+      #chart-wrap {
+        flex: none;
+        height: 52vw;
+        min-height: 200px;
+        max-height: 340px;
+      }
+
+      #tabs-wrap { height: 195px; }
+
+      #right-col {
+        width: 100%;
+        flex-shrink: 0;
+        border-left: none;
+        border-top: 1px solid var(--border);
+        overflow-y: visible;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        align-items: start;
+      }
+
+      #card-hedge,
+      #card-ob { grid-column: 1 / -1; }
+
+      #header {
+        height: auto;
+        min-height: 40px;
+        flex-wrap: wrap;
+        padding: 5px 10px;
+        row-gap: 5px;
+      }
+
+      #live-price {
+        min-width: 80px;
+        font-size: 13px;
+      }
+
+      .hspacer { display: none; }
+
+      #ws-status { margin-left: auto; }
+
+      #notif-wrap {
+        right: 8px;
+        left: 8px;
+        max-width: none;
+        bottom: 10px;
+      }
+
+      .toast { font-size: 11px; padding: 8px 10px; }
+
+      #cfg-modal { max-height: 92vh; }
+    }
+
+    /* ── small phones (≤ 479px) ── */
+    @media (max-width: 479px) {
+      #right-col { grid-template-columns: 1fr; }
+
+      #card-hedge,
+      #card-ob { grid-column: auto; }
+
+      #chart-wrap {
+        height: 58vw;
+        min-height: 180px;
+        max-height: 280px;
+      }
+
+      #tabs-wrap { height: 185px; }
+
+      #ws-label { display: none; }
+
+      .logo { font-size: 11px; letter-spacing: .03em; }
+
+      #header { gap: 6px; padding: 5px 8px; }
+
+      #ind-bar { gap: 8px; padding: 4px 8px; }
+
+      #perf-bar { gap: 8px; padding: 5px 8px; font-size: 10px; }
+
+      #live-price { font-size: 12px; }
+
+      .cr-row { flex-wrap: wrap; }
+      .cr-input { width: 100%; text-align: left; }
+
+      /* touch-friendly tap targets */
+      .tbtn { padding: 8px 12px; }
+      #btn-cfg { padding: 5px 10px; }
+      #symbol-select, #tf-select { padding: 5px 7px; }
+    }
   </style>
 </head>
 <body>
