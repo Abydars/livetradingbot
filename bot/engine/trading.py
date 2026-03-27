@@ -237,6 +237,8 @@ class TradingEngine:
         # ---- Hedge management -------------------------------------------
         if self._hedges:
             await self._manage_hedges(cfg, price, pnl_pct, signal)
+            if self._session is None:  # position was closed inside _manage_hedges
+                return
 
         # ---- Hedge trigger ----------------------------------------------
         if (
@@ -291,19 +293,22 @@ class TradingEngine:
                 else:
                     self._trail_price = price * (1 + trail_pct / 100)
                 logger.info(
-                    "TradingEngine: trailing TP activated @ %.4f", self._trail_price
+                    "TradingEngine: trailing TP activated @ %.6f", self._trail_price
                 )
+                self._push_session()   # broadcast so chart shows Trail line immediately
                 return False
             else:
-                # Update trailing stop
+                # Update trailing stop; push session so chart Trail line tracks live
                 if direction == "LONG":
                     new_trail = price * (1 - trail_pct / 100)
                     if new_trail > self._trail_price:
                         self._trail_price = new_trail
+                        self._push_session()
                 else:
                     new_trail = price * (1 + trail_pct / 100)
                     if new_trail < self._trail_price:
                         self._trail_price = new_trail
+                        self._push_session()
 
         # Check if trailing stop hit
         if self._trail_activated and self._trail_price is not None:

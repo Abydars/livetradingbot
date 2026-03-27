@@ -83,6 +83,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "discord_webhook":     "",
     "auto_switch":         "0",
     "scan_interval_s":     "60",
+    "timeframe":           "1m",
 }
 
 

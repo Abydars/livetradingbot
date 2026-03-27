@@ -33,6 +33,9 @@ class BotConfig:
     # Notifications
     discord_webhook: str
 
+    # Chart / candle timeframe
+    timeframe: str
+
     # Auto-switch
     auto_switch: bool
     scan_interval_s: int
@@ -72,6 +75,7 @@ async def load_config() -> BotConfig:
         atr_dca_multiplier=_f("atr_dca_multiplier", 1.0),
         trail_pct=_f("trail_pct", 0.15),
         min_signal_strength=_f("min_signal_strength", 0.25),
+        timeframe=_s("timeframe", "1m"),
         paper_mode=_b("paper_mode", True),
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", False),

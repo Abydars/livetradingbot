@@ -110,7 +110,7 @@ async def _ticker_loop() -> None:
 
             # Refresh candles periodically
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
-                raw = await _rest.get_klines(cfg.symbol, interval="1m", limit=200)
+                raw = await _rest.get_klines(cfg.symbol, interval=cfg.timeframe, limit=200)
                 candles = [
                     {
                         "open":   float(k[1]),
@@ -375,6 +375,7 @@ async def ws_endpoint(websocket: WebSocket):
             "type":       "init",
             "paper_mode": cfg.paper_mode,
             "symbol":     cfg.symbol,
+            "timeframe":  cfg.timeframe,
         }))
 
         # Send open session state if any
@@ -459,9 +460,11 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         if "symbol" in updates:
             new_sym = updates["symbol"]
             await _ws.switch_symbol(new_sym)
-            # Reset candle timer so the ticker loop fetches immediately
             _last_candles_fetch = 0.0
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+        # Reset candle fetch if timeframe changed so next tick fetches fresh candles
+        if "timeframe" in updates:
+            _last_candles_fetch = 0.0
         await ws.send_text(json.dumps({"type": "config_saved", "ok": True}))
 
     elif mtype == "get_config":
