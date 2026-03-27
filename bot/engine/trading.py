@@ -151,11 +151,16 @@ class TradingEngine:
         self._session = await get_open_session()
         if self._session:
             self._hedges = await get_open_hedges(self._session["id"])
+            # Restore trailing-stop state so it survives restarts
+            self._trail_activated = bool(self._session.get("trail_active", 0))
+            self._trail_price     = self._session.get("trail_price") or None
             logger.info(
-                "TradingEngine: restored session id=%d dir=%s hedges=%d",
+                "TradingEngine: restored session id=%d dir=%s hedges=%d trail=%s@%.6f",
                 self._session["id"],
                 self._session["direction"],
                 len(self._hedges),
+                self._trail_activated,
+                self._trail_price or 0.0,
             )
 
     # ------------------------------------------------------------------
@@ -371,36 +376,54 @@ class TradingEngine:
         """Returns True if position was closed. price_pct and thresholds are un-leveraged price %."""
         tp_pct    = p["tp_pct"]
         trail_pct = p["trail_pct"]
-        min_pct   = p["min_profit_pct"]
 
         if price_pct >= tp_pct:
             if not self._trail_activated:
+                # First time price reaches the TP level — arm the trail
                 self._trail_activated = True
                 if direction == "LONG":
                     self._trail_price = price * (1 - trail_pct / 100)
                 else:
                     self._trail_price = price * (1 + trail_pct / 100)
                 logger.info("TradingEngine: trailing TP activated @ %.6f", self._trail_price)
+                await update_session(
+                    self._session["id"],
+                    trail_active=1,
+                    trail_price=self._trail_price,
+                )
                 self._push_session()
                 return False
             else:
+                # Trail already armed — ratchet it in the favourable direction
+                moved = False
                 if direction == "LONG":
                     new_trail = price * (1 - trail_pct / 100)
                     if new_trail > self._trail_price:
                         self._trail_price = new_trail
-                        self._push_session()
+                        moved = True
                 else:
                     new_trail = price * (1 + trail_pct / 100)
                     if new_trail < self._trail_price:
                         self._trail_price = new_trail
-                        self._push_session()
+                        moved = True
+                if moved:
+                    await update_session(
+                        self._session["id"],
+                        trail_price=self._trail_price,
+                    )
+                    self._push_session()
 
         if self._trail_activated and self._trail_price is not None:
             trail_hit = (
                 (direction == "LONG"  and price <= self._trail_price)
                 or (direction == "SHORT" and price >= self._trail_price)
             )
-            if trail_hit and price_pct >= min_pct:
+            # Close unconditionally when trail is hit — the hard stop at
+            # hard_stop_pct is the only other exit and it's worse.
+            # The old min_pct guard was removed because a large single-tick
+            # adverse move could drop price through the trail AND below
+            # min_pct in the same tick, leaving the trail permanently ignored.
+            if trail_hit:
                 await self._close_position(cfg, price, pnl_pct, "trailing_tp")
                 return True
 
@@ -622,12 +645,12 @@ class TradingEngine:
             "paper":     cfg.paper_mode,
         })
 
-        self._session = None
-        self._hedges  = []
+        self._session         = None
+        self._hedges          = []
         self._trail_activated = False
-        self._trail_price = None
+        self._trail_price     = None
         self._dca_pending_since = None
-        self._entry_adaptive = {}
+        self._entry_adaptive  = {}
         self._push_session()
 
     async def _emergency_close(

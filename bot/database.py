@@ -101,11 +101,14 @@ async def init_db() -> None:
 
 async def _migrate(db: aiosqlite.Connection) -> None:
     """Apply any schema migrations that may be missing on an older DB."""
-    # sessions columns added in v2
     for col, defn in [
+        # sessions columns added in v2
         ("entry_reason",    "TEXT"),
         ("signal_strength", "REAL"),
         ("symbol",          "TEXT DEFAULT 'BTCUSDT'"),
+        # sessions columns added in v3 — trail state persistence
+        ("trail_active",    "INTEGER DEFAULT 0"),
+        ("trail_price",     "REAL"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
