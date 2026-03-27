@@ -65,6 +65,10 @@ class TradingEngine:
         self._session: Optional[Dict] = None
         self._hedges: List[Dict] = []
 
+        # Set True during _close_position / _emergency_close so that concurrent
+        # ACCOUNT_UPDATE events (pa=0) don't trigger a spurious external-close.
+        self._closing: bool = False
+
         # Trailing TP tracking
         self._trail_activated: bool = False
         self._trail_price: Optional[float] = None
@@ -673,6 +677,19 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     async def _close_position(
+        self,
+        cfg: BotConfig,
+        price: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        self._closing = True
+        try:
+            await self._close_position_inner(cfg, price, pnl_pct, reason)
+        finally:
+            self._closing = False
+
+    async def _close_position_inner(
         self,
         cfg: BotConfig,
         price: float,

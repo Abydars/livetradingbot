@@ -362,7 +362,7 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     (liquidation, manual close from exchange UI, another bot, etc.).
     Updates the DB session, clears engine state, and notifies the UI.
     """
-    if not (_engine and _engine._session):
+    if not (_engine and _engine._session) or _engine._closing:
         return
     sess      = _engine._session
     direction = sess["direction"]
@@ -430,16 +430,19 @@ async def _on_user_data(event: dict) -> None:
         fill_qty   = float(o.get("z", 0))
         symbol     = o.get("s", "")
         order_id   = o.get("i")
-        order_type = o.get("ot", "")
+        # "o" = current order type, "ot" = original order type — both are
+        # "LIQUIDATION" for liquidation orders per Binance Futures docs.
+        order_type = o.get("o", "") or o.get("ot", "")
 
         logger.info(
             "Fill: orderId=%s %s type=%s avgPrice=%.6f qty=%.4f",
             order_id, symbol, order_type, fill_price, fill_qty,
         )
 
-        # Liquidation — position was forcibly closed by the exchange
+        # Liquidation — position was forcibly closed by the exchange.
+        # L = last fill price (accurate); ap = average price (fallback).
         if order_type == "LIQUIDATION":
-            if _engine and _engine._session:
+            if _engine and _engine._session and not _engine._closing:
                 sess_sym = _engine._session.get("symbol", "").upper()
                 if sess_sym == symbol.upper():
                     liq_price = float(o.get("L") or o.get("ap") or 0)
@@ -478,7 +481,7 @@ async def _on_user_data(event: dict) -> None:
 
     # ── ACCOUNT_UPDATE ────────────────────────────────────────────────────
     if etype == "ACCOUNT_UPDATE":
-        if not (_engine and _engine._session):
+        if not (_engine and _engine._session and not _engine._closing):
             return
         sess     = _engine._session
         sess_sym = sess.get("symbol", "").upper()
