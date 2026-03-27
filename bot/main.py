@@ -349,6 +349,7 @@ async def lifespan(app: FastAPI):
         api_key=cfg.api_key,
         api_secret=cfg.api_secret,
         paper_mode=cfg.paper_mode,
+        key_type=cfg.key_type,
     )
     await _rest.init()
 
@@ -488,7 +489,10 @@ async def api_balance():
     if cfg.paper_mode:
         return {"usdt": None, "paper_mode": True}
     try:
-        bal = await _rest.get_balance()
+        if _binance_client:
+            bal = await _binance_client.get_balance()
+        else:
+            bal = await _rest.get_balance()
         return {"usdt": bal, "paper_mode": False}
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -722,6 +726,11 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                             "type": "notification",
                             "text": f"⚠ {new_mode.upper()} mode: exchange connection failed — check API keys",
                         }))
+
+            # Update REST client credentials for the new mode
+            await _rest.set_credentials(
+                cfg2.api_key, cfg2.api_secret, cfg2.paper_mode, cfg2.key_type
+            )
 
             _executor = OrderExecutor(_binance_client, _rest, new_mode)
             await _executor.init()
