@@ -389,7 +389,7 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
         reason, direction, symbol, fill_price, realized_pnl,
     )
 
-    label = "LIQUIDATED" if reason == "liquidated" else "Closed on exchange"
+    label = {"liquidated": "LIQUIDATED", "adl_close": "AUTO-DELEVERAGED"}.get(reason, "Closed on exchange")
     price_str = f"@ {fill_price:.6f}" if fill_price > 0 else "(price unknown)"
     _broadcast({"type": "notification",
                 "text": f"⚠ {label} {symbol} {price_str}  pnl={realized_pnl:+.4f}"})
@@ -430,23 +430,35 @@ async def _on_user_data(event: dict) -> None:
         fill_qty   = float(o.get("z", 0))
         symbol     = o.get("s", "")
         order_id   = o.get("i")
-        # "o" = current order type, "ot" = original order type — both are
-        # "LIQUIDATION" for liquidation orders per Binance Futures docs.
-        order_type = o.get("o", "") or o.get("ot", "")
-
-        logger.info(
-            "Fill: orderId=%s %s type=%s avgPrice=%.6f qty=%.4f",
-            order_id, symbol, order_type, fill_price, fill_qty,
+        # "o" = current Order Type (per docs: "LIQUIDATION" for forced closes)
+        # "ot" = Original Order Type (what the order was before modification)
+        # "c" = Client Order Id — Binance reserves special prefixes:
+        #   "autoclose-*"          → liquidation
+        #   "adl_autoclose"        → auto-deleveraging (ADL)
+        #   "settlement_autoclose-*" → delivery / delisting settlement
+        order_type = o.get("o", "")
+        client_id  = o.get("c", "")
+        is_forced_close = (
+            order_type == "LIQUIDATION"
+            or client_id == "adl_autoclose"
+            or client_id.startswith("autoclose-")
+            or client_id.startswith("settlement_autoclose-")
         )
 
-        # Liquidation — position was forcibly closed by the exchange.
+        logger.info(
+            "Fill: orderId=%s %s type=%s client=%s avgPrice=%.6f qty=%.4f",
+            order_id, symbol, order_type, client_id, fill_price, fill_qty,
+        )
+
+        # Forced close (liquidation / ADL / settlement) — position closed by exchange.
         # L = last fill price (accurate); ap = average price (fallback).
-        if order_type == "LIQUIDATION":
+        if is_forced_close:
+            reason = "liquidated" if order_type == "LIQUIDATION" or client_id.startswith("autoclose-") else "adl_close"
             if _engine and _engine._session and not _engine._closing:
                 sess_sym = _engine._session.get("symbol", "").upper()
                 if sess_sym == symbol.upper():
-                    liq_price = float(o.get("L") or o.get("ap") or 0)
-                    await _handle_external_close(liq_price, "liquidated")
+                    forced_price = float(o.get("L") or o.get("ap") or 0)
+                    await _handle_external_close(forced_price, reason)
             return
 
         # Entry / DCA fill price correction
@@ -499,7 +511,12 @@ async def _on_user_data(event: dict) -> None:
                 continue
             if abs(pa) < 1e-8:
                 reason_raw = event.get("a", {}).get("m", "").upper()
-                reason = "liquidated" if reason_raw == "LIQUIDATION" else "external_close"
+                if reason_raw == "LIQUIDATION":
+                    reason = "liquidated"
+                elif reason_raw == "POSITION_ADL":
+                    reason = "adl_close"
+                else:
+                    reason = "external_close"
                 await _handle_external_close(0.0, reason)
                 return
 
