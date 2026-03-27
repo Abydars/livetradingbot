@@ -58,6 +58,7 @@ _clients: Set[WebSocket] = set()
 # Latest price feed
 _last_price: float = 0.0
 _last_candles_fetch: float = 0.0
+_last_symbol_scan: float = 0.0
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 
 
@@ -88,7 +89,7 @@ async def _do_broadcast(msg: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch
+    global _last_price, _last_candles_fetch, _last_symbol_scan
     cfg = await load_config()
 
     while True:
@@ -135,9 +136,11 @@ async def _ticker_loop() -> None:
             # Run trading tick
             await _engine.tick(cfg, price)
 
-            # Auto-switch logic
+            # Auto-switch logic — throttled by scan_interval_s
             if cfg.auto_switch and _engine._session is None:
-                await _maybe_switch_symbol(cfg)
+                if now - _last_symbol_scan >= cfg.scan_interval_s:
+                    await _maybe_switch_symbol(cfg)
+                    _last_symbol_scan = now
 
         except asyncio.CancelledError:
             return

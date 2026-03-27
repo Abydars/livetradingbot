@@ -343,17 +343,34 @@ class BinanceRestClient:
     # Top movers for auto-switch
     # ------------------------------------------------------------------
 
-    async def get_top_movers(self, n: int = 5) -> List[Dict]:
+    async def get_top_movers(self, n: int = 5, min_quote_volume: float = 20_000_000.0) -> List[Dict]:
         """
-        Return top-n USDT perpetual symbols by 24hr volume,
-        suitable for auto-switching.
+        Return top-n USDT perpetual symbols ranked by current momentum spike.
+
+        Sorting by raw quoteVolume always returns BTC/ETH regardless of what is
+        actually moving right now.  Instead we score each symbol by:
+
+            score = abs(priceChangePercent) * log10(quoteVolume)
+
+        This rewards symbols with a large *relative* price move that also have
+        enough liquidity to trade.  A minimum 24-hr quoteVolume filter removes
+        illiquid micro-caps.
         """
-        tickers = await self.get_ticker_24hr()
+        import math
+        tickers    = await self.get_ticker_24hr()
         usdt_perps = {s for s in self.symbol_info}
-        filtered = [
-            t for t in tickers
-            if t.get("symbol", "").endswith("USDT")
-            and t["symbol"] in usdt_perps
-        ]
-        filtered.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
-        return filtered[:n]
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            if sym not in usdt_perps:
+                continue
+            qv  = float(t.get("quoteVolume", 0))
+            pcp = abs(float(t.get("priceChangePercent", 0)))
+            if qv < min_quote_volume:          # skip illiquid symbols
+                continue
+            score = pcp * math.log10(max(qv, 1))
+            candidates.append({**t, "_score": score})
+        candidates.sort(key=lambda t: t["_score"], reverse=True)
+        return candidates[:n]
