@@ -1383,7 +1383,7 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     title:            'Entry',
   });
 
-  // TP line (green dashed)
+  // Trail-arm line (green dashed) — price must reach here to activate trailing
   _tpLine = _removeLine(_tpLine);
   _tpLine = csSeries.createPriceLine({
     price:            curTpPrice || computeTPPrice(session),
@@ -1391,7 +1391,7 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     lineWidth:        1,
     lineStyle:        LightweightCharts.LineStyle.Dashed,
     axisLabelVisible: true,
-    title:            'TP',
+    title:            'TRAIL ARM',
   });
 
   // Hard-stop line (red dashed)
@@ -1534,7 +1534,7 @@ function updatePositionPanel() {
     ${pr('Symbol',    s.symbol || currentSymbol)}
     ${pr('Entry',     fmtPrice(s.entry_price))}
     ${pr('Avg Price', fmtPrice(s.avg_price))}
-    ${pr('TP Price',  `<span class="prv" style="color:var(--green)">${fmtPrice(tpPrice)}</span>`)}
+    ${pr('Trail Arm', `<span class="prv" style="color:var(--green)">${fmtPrice(tpPrice)}</span>`)}
     ${pr('SL Price',  `<span class="prv" style="color:var(--red)">${fmtPrice(slPrice)}</span>`)}
     ${trailRow}
     ${pr('Qty',       s.qty)}
