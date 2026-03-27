@@ -47,8 +47,16 @@ class OrderExecutor:
         return self.paper_mode or self._client is not None
 
     async def init(self) -> None:
-        """Fetch account position mode from Binance (demo/live only)."""
+        """Ensure hedge mode is enabled on Binance, then read back the active mode."""
         if self._client and not self.paper_mode:
+            # Always request hedge mode — the bot's hedge logic requires it.
+            # Binance returns code -4059 ("No need to change") if it's already set; that's fine.
+            try:
+                await self._client.set_position_mode(dual_side=True)
+                logger.info("OrderExecutor: position mode set to HEDGE")
+            except Exception as exc:
+                logger.warning("OrderExecutor: could not set hedge mode: %s", exc)
+
             try:
                 self._hedge_mode = await self._client.get_position_mode()
                 logger.info(
