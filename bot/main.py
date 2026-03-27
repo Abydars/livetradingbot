@@ -73,8 +73,11 @@ _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _trading_active: bool = False          # persisted in config.trading_active
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
+_exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
+_last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
+_CLIENT_WARN_INTERVAL = 60.0  # re-broadcast "client unavailable" at most once per minute
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +161,14 @@ async def _ticker_loop() -> None:
 
             # Run trading tick (only when trading is enabled)
             if _trading_active:
-                await _engine.tick(cfg, price)
+                if _executor and not _executor.is_ready:
+                    if now - _last_client_warn >= _CLIENT_WARN_INTERVAL:
+                        global _last_client_warn
+                        _last_client_warn = now
+                        err = _exchange_error or "Exchange client unavailable — check API keys"
+                        _on_exchange_error(err)
+                else:
+                    await _engine.tick(cfg, price)
 
             # Detect trade close → trigger immediate symbol scan (auto_switch only)
             cur_session_open = _engine._session is not None
@@ -396,12 +406,14 @@ async def lifespan(app: FastAPI):
                 )
                 await _binance_client.start()
                 await _binance_client.subscribe_user_data(_on_user_data)
+                _exchange_error = None
             except Exception as exc:
                 logger.error(
                     "BinanceClient startup failed (%s) — falling back to paper simulation. "
                     "Check your API keys and network.",
                     exc,
                 )
+                _exchange_error = f"BinanceClient startup failed: {exc}"
                 if _binance_client:
                     try:
                         await _binance_client.stop()
@@ -562,6 +574,15 @@ async def ws_endpoint(websocket: WebSocket):
                 "trail_active": _engine._trail_activated if _engine else False,
                 "tp_price":    tp_price,
                 "sl_price":    sl_price,
+            }))
+
+        # Surface any stored exchange startup error immediately
+        if _exchange_error:
+            await websocket.send_text(json.dumps({
+                "type":   "pos_log",
+                "event":  "failed",
+                "ts":     int(time.time()),
+                "reason": _exchange_error,
             }))
 
         # Send cached top-movers for the sidebar
@@ -735,6 +756,7 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                         )
                         await _binance_client.start()
                         await _binance_client.subscribe_user_data(_on_user_data)
+                        _exchange_error = None
                     except Exception as exc:
                         logger.error("BinanceClient init failed on mode change: %s", exc)
                         if _binance_client:
@@ -743,10 +765,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                             except Exception:
                                 pass
                         _binance_client = None
-                        await ws.send_text(json.dumps({
-                            "type": "notification",
-                            "text": f"⚠ {new_mode.upper()} mode: exchange connection failed — check API keys",
-                        }))
+                        _exchange_error = f"BinanceClient init failed: {exc}"
+                        _on_exchange_error(_exchange_error)
 
             # Update REST client credentials for the new mode
             await _rest.set_credentials(
