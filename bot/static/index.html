@@ -1402,7 +1402,7 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     lineWidth:        1,
     lineStyle:        LightweightCharts.LineStyle.Dashed,
     axisLabelVisible: true,
-    title:            'SL',
+    title:            'HARD STOP',
   });
 
   // Trailing stop line (orange dotted, only when active)
@@ -1535,7 +1535,7 @@ function updatePositionPanel() {
     ${pr('Entry',     fmtPrice(s.entry_price))}
     ${pr('Avg Price', fmtPrice(s.avg_price))}
     ${pr('Trail Arm', `<span class="prv" style="color:var(--green)">${fmtPrice(tpPrice)}</span>`)}
-    ${pr('SL Price',  `<span class="prv" style="color:var(--red)">${fmtPrice(slPrice)}</span>`)}
+    ${pr('Hard Stop', `<span class="prv" style="color:var(--red)">${fmtPrice(slPrice)}</span>`)}
     ${trailRow}
     ${pr('Qty',       s.qty)}
     ${pr('Margin',    '$' + s.margin.toFixed(2))}
