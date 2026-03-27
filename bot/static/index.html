@@ -610,6 +610,52 @@
       to   { transform: translateX(0);   opacity: 1; }
     }
 
+    /* ═══════════════════════════════ SYMBOL SIDEBAR ══ */
+    #sym-sidebar {
+      width: 148px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      background: var(--bg1);
+      overflow: hidden;
+    }
+
+    #sym-sidebar-head {
+      font-size: 9px;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: .12em;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #sym-list {
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .sym-item {
+      padding: 6px 10px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(33,38,45,.5);
+      border-left: 2px solid transparent;
+      transition: background .1s;
+    }
+    .sym-item:hover { background: rgba(255,255,255,.04); }
+    .sym-item.active {
+      background: rgba(63,185,80,.07);
+      border-left-color: var(--green);
+    }
+
+    .sym-rank  { font-size: 9px; color: var(--muted); margin-bottom: 1px; }
+    .sym-name  { font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.2; }
+    .sym-chg   { font-size: 10px; margin-top: 1px; }
+    .sym-chg.up { color: var(--green); }
+    .sym-chg.dn { color: var(--red); }
+    .sym-meta  { font-size: 9px; color: var(--muted); margin-top: 1px; }
+
     /* ═══════════════════════════════ RESPONSIVE ══ */
 
     /* Tables always allow horizontal scroll */
@@ -622,6 +668,8 @@
 
     /* ── mobile layout (≤ 767px) ── */
     @media (max-width: 767px) {
+      #sym-sidebar { display: none; }
+
       html, body {
         height: auto;
         min-height: 100svh;
@@ -757,6 +805,12 @@
 
 <!-- ═══════════════════════════════════════════ MAIN ════ -->
 <div id="main">
+
+  <!-- ── SYMBOL SIDEBAR ── -->
+  <div id="sym-sidebar">
+    <div id="sym-sidebar-head">WATCHLIST</div>
+    <div id="sym-list"></div>
+  </div>
 
   <!-- ── LEFT COLUMN ── -->
   <div id="left-col">
@@ -1065,9 +1119,12 @@ function dispatch(msg) {
       setSymbolSelect(currentSymbol);
       setTfSelect(currentTf);
       hideSymLoader();
-      // Request candles explicitly — server also pushes them on connect,
-      // but this covers the edge case where the cache was empty at that moment.
       wsSend({ type: 'get_candles' });
+      wsSend({ type: 'get_top_movers' });
+      break;
+
+    case 'top_movers':
+      if (msg.movers?.length) updateSymSidebar(msg.movers);
       break;
 
     case 'price':
@@ -1168,6 +1225,33 @@ function dispatch(msg) {
 /* ═══════════════════════════════════════════════════════
    PRICE & CANDLES — Step 5
 ═══════════════════════════════════════════════════════ */
+function fmtVol(v) {
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K';
+  return v.toFixed(0);
+}
+
+let _lastMovers = [];
+
+function updateSymSidebar(movers) {
+  _lastMovers = movers;
+  const list = document.getElementById('sym-list');
+  if (!list) return;
+  list.innerHTML = movers.map((m, i) => {
+    const active  = m.symbol === currentSymbol ? 'active' : '';
+    const chgCls  = m.change >= 0 ? 'up' : 'dn';
+    const chgSign = m.change >= 0 ? '+' : '';
+    const coin    = m.symbol.replace('USDT', '');
+    return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
+      <div class="sym-rank">#${i + 1} &middot; ${m.score.toFixed(0)}pts</div>
+      <div class="sym-name">${coin}</div>
+      <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
+      <div class="sym-meta">${fmtVol(m.volume)} vol</div>
+    </div>`;
+  }).join('');
+}
+
 function fmtPrice(p) {
   if (p == null || p === 0) return p === 0 ? '0' : '--';
   const a = Math.abs(p);
@@ -1842,6 +1926,7 @@ function setSymbolSelect(sym) {
   currentSymbol = sym;
   const sel = document.getElementById('symbol-select');
   if (sel) sel.value = sym;
+  if (_lastMovers.length) updateSymSidebar(_lastMovers);
 }
 
 function setTfSelect(tf) {

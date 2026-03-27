@@ -60,6 +60,7 @@ _last_price: float = 0.0
 _last_candles_fetch: float = 0.0
 _last_symbol_scan: float = 0.0
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
+_last_top_movers: list = []            # cached for new WS clients
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 
@@ -146,11 +147,10 @@ async def _ticker_loop() -> None:
             # Run trading tick
             await _engine.tick(cfg, price)
 
-            # Auto-switch logic — throttled by scan_interval_s
-            if cfg.auto_switch and _engine._session is None:
-                if now - _last_symbol_scan >= cfg.scan_interval_s:
-                    await _maybe_switch_symbol(cfg)
-                    _last_symbol_scan = now
+            # Symbol scan — always runs for sidebar; auto-switch is conditional
+            if now - _last_symbol_scan >= cfg.scan_interval_s:
+                _last_symbol_scan = now
+                await _scan_symbols(cfg)
 
         except asyncio.CancelledError:
             return
@@ -173,30 +173,46 @@ def _safe_ind(ind: Dict) -> Dict:
     return out
 
 
-async def _maybe_switch_symbol(cfg) -> None:
-    """Switch to top-momentum symbol when idle, if it clearly beats the current one."""
+def _format_movers(top: list) -> list:
+    """Convert raw get_top_movers rows to a lean, JSON-safe list for the UI."""
+    import math
+    out = []
+    for t in top:
+        out.append({
+            "symbol": t["symbol"],
+            "score":  round(t["_score"], 1),
+            "change": round(float(t.get("priceChangePercent", 0)), 2),
+            "volume": round(float(t.get("quoteVolume", 0))),
+            "price":  float(t.get("lastPrice", 0)),
+        })
+    return out
+
+
+async def _scan_symbols(cfg) -> None:
+    """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
+    global _last_top_movers, _last_candles_fetch
     try:
-        top = await _rest.get_top_movers(n=5)
+        top = await _rest.get_top_movers(n=10)
         if not top:
             return
 
-        best = top[0]
-        new_sym = best["symbol"]
+        _last_top_movers = _format_movers(top)
+        await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
-        # Find current symbol's score in the same batch (may be absent if off top-5)
-        cur_score = next(
-            (t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0
-        )
+        # Auto-switch only when enabled and no open position
+        if not cfg.auto_switch or _engine._session is not None:
+            return
+
+        best      = top[0]
+        new_sym   = best["symbol"]
+        cur_score = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
         best_score = best["_score"]
 
-        # Only switch if the new symbol is >20% better than what we're on,
-        # or the current symbol didn't make the top-5 at all.
         if new_sym == cfg.symbol:
             return
         if cur_score > 0 and best_score < cur_score * 1.2:
             return  # not meaningfully better — stay put
 
-        global _last_candles_fetch
         logger.info(
             "Auto-switch: %s → %s  (score %.1f → %.1f)",
             cfg.symbol, new_sym, cur_score, best_score,
@@ -206,8 +222,8 @@ async def _maybe_switch_symbol(cfg) -> None:
         _last_candles_fetch = 0.0
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
-            "type":  "notification",
-            "text":  f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
+            "type": "notification",
+            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
         })
         await notify(cfg.discord_webhook, "AUTO_SWITCH", {
             "old_symbol": cfg.symbol,
@@ -215,7 +231,7 @@ async def _maybe_switch_symbol(cfg) -> None:
             "paper":      cfg.paper_mode,
         })
     except Exception as exc:
-        logger.warning("Auto-switch error: %s", exc)
+        logger.warning("_scan_symbols error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +428,13 @@ async def ws_endpoint(websocket: WebSocket):
                 "sl_price":    sl_price,
             }))
 
+        # Send cached top-movers for the sidebar
+        if _last_top_movers:
+            await websocket.send_text(json.dumps({
+                "type":   "top_movers",
+                "movers": _last_top_movers,
+            }))
+
         # Send cached candles immediately so the chart doesn't wait 30 s
         if _engine and _engine.candles:
             await websocket.send_text(json.dumps({
@@ -506,6 +529,21 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 "type":    "candles",
                 "candles": _engine.candles[-100:],
             }))
+
+    elif mtype == "get_top_movers":
+        if _last_top_movers:
+            await ws.send_text(json.dumps({
+                "type":   "top_movers",
+                "movers": _last_top_movers,
+            }))
+        else:
+            # Cold start — fetch immediately for this client
+            try:
+                top = await _rest.get_top_movers(n=10)
+                movers = _format_movers(top)
+                await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
