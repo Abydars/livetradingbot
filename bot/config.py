@@ -31,6 +31,7 @@ class BotConfig:
     # Auto-switch
     auto_switch: bool
     scan_interval_s: int
+    switch_threshold: float  # min score ratio for #1 vs current to trigger switch
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -66,6 +67,7 @@ async def load_config() -> BotConfig:
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 30),
+        switch_threshold=_f("switch_threshold", 1.1),
         # Secrets from environment only
         api_key=os.environ.get("BINANCE_API_KEY", ""),
         api_secret=os.environ.get("BINANCE_SECRET", ""),

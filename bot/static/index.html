@@ -1815,8 +1815,8 @@ function updatePerf(data) {
   const dd  = data.max_drawdown;
   const pnl = data.total_pnl;
 
-  setPerf('p-pf',  pf  != null ? pf.toFixed(2)  : '--',
-                   pf  != null && pf >= 1  ? 'cg' : '');
+  setPerf('p-pf',  pf  != null ? pf.toFixed(2)  : (data.total_trades > 0 ? '∞' : '--'),
+                   pf  != null && pf >= 1  ? 'cg' : (data.total_trades > 0 && pf == null ? 'cg' : ''));
   setPerf('p-dd',  dd  != null ? '-$' + Math.abs(dd).toFixed(2) : '--', 'cr');
   setPerf('p-dur', data.avg_duration_s != null ? fmtDur(data.avg_duration_s) : '--', '');
   setPerf('p-wr',  data.win_rate != null ? (data.win_rate * 100).toFixed(1) + '%' : '--', '');
@@ -1885,8 +1885,9 @@ const CFG_SCHEMA = [
   ]},
   { section: 'System', fields: [
     { key: 'paper_mode',    label: 'Paper Mode',         type: 'toggle' },
-    { key: 'auto_switch',   label: 'Auto Symbol Switch', type: 'toggle' },
-    { key: 'scan_interval_s', label: 'Scan Interval (s)', type: 'number' },
+    { key: 'auto_switch',      label: 'Auto Symbol Switch',       type: 'toggle' },
+    { key: 'scan_interval_s',  label: 'Scan Interval (s)',        type: 'number' },
+    { key: 'switch_threshold', label: 'Switch Threshold (ratio)', type: 'number' },
     { key: 'discord_webhook', label: 'Discord Webhook',  type: 'text', wide: true },
   ]},
 ];

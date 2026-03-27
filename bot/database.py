@@ -79,6 +79,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "scan_interval_s":     "30",
     "timeframe":           "1m",
     "trading_active":      "0",
+    "switch_threshold":    "1.1",
 }
 
 
@@ -364,7 +365,7 @@ async def get_performance() -> Dict[str, Any]:
 
     gross_profit = sum(wins) if wins else 0.0
     gross_loss = abs(sum(losses)) if losses else 0.0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
 
     durations = [
         r["close_time"] - r["open_time"]
@@ -388,7 +389,7 @@ async def get_performance() -> Dict[str, Any]:
     return {
         "total_trades": len(rows),
         "win_rate": len(wins) / len(pnls) if pnls else 0.0,
-        "profit_factor": round(profit_factor, 3),
+        "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
         "avg_duration_s": round(avg_duration, 1),
         "max_drawdown": round(max_dd, 4),
         "total_pnl": round(sum(pnls), 4),

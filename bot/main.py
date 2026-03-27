@@ -217,15 +217,19 @@ async def _scan_symbols(cfg) -> None:
         if not cfg.auto_switch or _engine._session is not None:
             return
 
-        best      = top[0]
-        new_sym   = best["symbol"]
+        best       = top[0]
+        new_sym    = best["symbol"]
+        best_score = best["_score"]
+        cur_score  = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
 
         if new_sym == cfg.symbol:
             return  # already on the top symbol
+        if cur_score > 0 and best_score < cur_score * cfg.switch_threshold:
+            return  # not meaningfully better — stay put
 
         logger.info(
-            "Auto-switch: %s → %s  (score %.1f)",
-            cfg.symbol, new_sym, best["_score"],
+            "Auto-switch: %s → %s  (score %.1f → %.1f, threshold %.2fx)",
+            cfg.symbol, new_sym, cur_score, best_score, cfg.switch_threshold,
         )
         await set_config_bulk({"symbol": new_sym})
         await _ws.switch_symbol(new_sym)
@@ -233,7 +237,7 @@ async def _scan_symbols(cfg) -> None:
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
             "type": "notification",
-            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best['_score']:.1f})",
+            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
         })
         await notify(cfg.discord_webhook, "AUTO_SWITCH", {
             "old_symbol": cfg.symbol,
