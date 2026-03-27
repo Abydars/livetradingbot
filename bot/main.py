@@ -412,6 +412,13 @@ async def ws_endpoint(websocket: WebSocket):
                 "sl_price":    sl_price,
             }))
 
+        # Send cached candles immediately so the chart doesn't wait 30 s
+        if _engine and _engine.candles:
+            await websocket.send_text(json.dumps({
+                "type":    "candles",
+                "candles": _engine.candles[-100:],
+            }))
+
         # Send recent signal + indicators
         if _engine and _engine.last_signal:
             await websocket.send_text(json.dumps({

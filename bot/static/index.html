@@ -1065,6 +1065,9 @@ function dispatch(msg) {
       setSymbolSelect(currentSymbol);
       setTfSelect(currentTf);
       hideSymLoader();
+      // Request candles explicitly — server also pushes them on connect,
+      // but this covers the edge case where the cache was empty at that moment.
+      wsSend({ type: 'get_candles' });
       break;
 
     case 'price':
