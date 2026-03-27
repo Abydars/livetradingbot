@@ -5,11 +5,36 @@ Only sends if discord_webhook config is non-empty.
 All network errors are caught and logged; they never raise into the caller.
 """
 import logging
+import math
 from typing import Dict
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_p(p: float) -> str:
+    """
+    Format a price with enough decimal places for any coin magnitude.
+    Uses 4 significant figures so low-priced coins (SHIB, PEPE) are readable.
+    """
+    if not p:
+        return "0"
+    mag = math.floor(math.log10(abs(p)))
+    dec = max(2, -mag + 3)          # 4 sig figs: e.g. 0.000025 → dec=8 → "0.00002500"
+    return f"{p:.{dec}f}"
+
+
+def _fmt_qty(q: float) -> str:
+    """Format quantity — strips unnecessary trailing zeros for large integers,
+    uses significant figures for fractional quantities."""
+    if not q:
+        return "0"
+    if q >= 1:
+        return f"{q:g}"
+    mag = math.floor(math.log10(abs(q)))
+    dec = max(2, -mag + 3)
+    return f"{q:.{dec}f}"
 
 # Discord embed colours (decimal)
 _COLOUR = {
@@ -60,7 +85,7 @@ def _build_embed(event: str, data: Dict) -> Dict:
             "fields": [
                 {"name": "Symbol",    "value": symbol,                          "inline": True},
                 {"name": "Direction", "value": data.get("direction", ""),       "inline": True},
-                {"name": "Price",     "value": f"{data.get('price', 0):.4f}",   "inline": True},
+                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),     "inline": True},
                 {"name": "Margin",    "value": f"{data.get('margin', 0)} USDT", "inline": True},
                 {"name": "Strength",  "value": f"{data.get('strength', 0):.2%}","inline": True},
             ],
@@ -73,8 +98,8 @@ def _build_embed(event: str, data: Dict) -> Dict:
             "fields": [
                 {"name": "Symbol",        "value": symbol,                              "inline": True},
                 {"name": "Direction",     "value": data.get("direction", ""),           "inline": True},
-                {"name": "Fill Price",    "value": f"{data.get('price', 0):.4f}",       "inline": True},
-                {"name": "New Avg",       "value": f"{data.get('new_avg', 0):.4f}",     "inline": True},
+                {"name": "Fill Price",    "value": _fmt_p(data.get('price', 0)),           "inline": True},
+                {"name": "New Avg",       "value": _fmt_p(data.get('new_avg', 0)),       "inline": True},
                 {"name": "Total Margin",  "value": f"{data.get('total_margin', 0)} USDT","inline": True},
             ],
         }
@@ -86,8 +111,8 @@ def _build_embed(event: str, data: Dict) -> Dict:
             "fields": [
                 {"name": "Symbol",    "value": symbol,                        "inline": True},
                 {"name": "Direction", "value": data.get("direction", ""),     "inline": True},
-                {"name": "Price",     "value": f"{data.get('price', 0):.4f}", "inline": True},
-                {"name": "Qty",       "value": str(data.get("qty", 0)),       "inline": True},
+                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),   "inline": True},
+                {"name": "Qty",       "value": _fmt_qty(data.get("qty", 0)),  "inline": True},
             ],
         }
 
@@ -101,8 +126,8 @@ def _build_embed(event: str, data: Dict) -> Dict:
             "fields": [
                 {"name": "Symbol",    "value": symbol,                              "inline": True},
                 {"name": "Direction", "value": data.get("direction", ""),           "inline": True},
-                {"name": "Price",     "value": f"{data.get('price', 0):.4f}",       "inline": True},
-                {"name": "PnL",       "value": f"{pnl:+.4f} USDT ({data.get('pnl_pct', 0):+.2f}%)", "inline": True},
+                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),         "inline": True},
+                {"name": "PnL",       "value": f"{pnl:+.2f} USDT ({data.get('pnl_pct', 0):+.2f}%)", "inline": True},
                 {"name": "Reason",    "value": data.get("reason", ""),              "inline": True},
             ],
         }
@@ -113,7 +138,7 @@ def _build_embed(event: str, data: Dict) -> Dict:
             "color": _COLOUR["HARD_STOP"],
             "fields": [
                 {"name": "Symbol",  "value": symbol,                              "inline": True},
-                {"name": "Price",   "value": f"{data.get('price', 0):.4f}",       "inline": True},
+                {"name": "Price",   "value": _fmt_p(data.get('price', 0)),         "inline": True},
                 {"name": "PnL %",   "value": f"{data.get('pnl_pct', 0):+.2f}%",  "inline": True},
             ],
         }

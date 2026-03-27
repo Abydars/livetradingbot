@@ -319,7 +319,14 @@ class BinanceRestClient:
         """Round qty to exchange step size and enforce min_qty."""
         info = self.symbol_info.get(symbol)
         if info is None:
-            return round(qty, 3)
+            # exchangeInfo not loaded yet; derive precision from the qty magnitude
+            # rather than assuming a fixed 3 decimals (wrong for low-priced coins)
+            import math
+            if qty <= 0:
+                return qty
+            mag = math.floor(math.log10(abs(qty)))
+            decimals = max(0, 8 - mag)   # smaller qty → more decimals, capped at 8
+            return round(qty, decimals)
         step = info.step_size
         if step <= 0:
             return qty
