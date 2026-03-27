@@ -62,6 +62,9 @@ class TradingEngine:
         # DCA adverse pressure timer
         self._dca_pending_since: Optional[float] = None
 
+        # Adaptive risk parameters (computed from ATR each tick, price %)
+        self._adaptive: Dict[str, float] = {}
+
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
         self.last_indicators: Dict = {}
@@ -73,13 +76,48 @@ class TradingEngine:
 
     def _push_session(self) -> None:
         """Push current session + hedges + trade-level prices to all WS clients."""
+        tp_price = sl_price = None
+        if self._session and self._adaptive:
+            avg = self._session["avg_price"]
+            d   = self._session["direction"]
+            tp  = self._adaptive["tp_pct"]
+            sl  = self._adaptive["hard_stop_pct"]
+            if d == "LONG":
+                tp_price = avg * (1 + tp / 100)
+                sl_price = avg * (1 - sl / 100)
+            else:
+                tp_price = avg * (1 - tp / 100)
+                sl_price = avg * (1 + sl / 100)
         self._broadcast({
-            "type":        "session",
-            "session":     self._session,
-            "hedges":      self._hedges,
-            "trail_price": self._trail_price,
+            "type":         "session",
+            "session":      self._session,
+            "hedges":       self._hedges,
+            "trail_price":  self._trail_price,
             "trail_active": self._trail_activated,
+            "tp_price":     tp_price,
+            "sl_price":     sl_price,
         })
+
+    @staticmethod
+    def _compute_adaptive(atr: float, price: float) -> Dict[str, float]:
+        """
+        Derive all risk thresholds from ATR.
+        All values are un-leveraged price percentages.
+
+        Ordering guaranteed:
+          dca_step < hedge_trigger < hard_stop
+          trail_pct < tp_pct
+          min_profit_pct < tp_pct
+        """
+        atr_pct = (atr / price * 100) if price > 0 else 1.0
+        return {
+            "tp_pct":            max(atr_pct * 2.0, 0.5),   # TP: 2× ATR
+            "trail_pct":         max(atr_pct * 0.8, 0.15),  # trail: 0.8× ATR
+            "min_profit_pct":    max(atr_pct * 0.3, 0.05),  # min to close: 0.3× ATR
+            "dca_step_pct":      max(atr_pct * 1.5, 0.3),   # DCA: 1.5× ATR
+            "hedge_trigger_pct": max(atr_pct * 3.5, 0.8),   # hedge: 3.5× ATR
+            "hard_stop_pct":     max(atr_pct * 7.0, 2.0),   # stop: 7× ATR
+        }
 
     # ------------------------------------------------------------------
     # Startup
@@ -209,60 +247,63 @@ class TradingEngine:
         ind: Dict,
         atr_val: float,
     ) -> None:
-        sess = self._session
-        direction  = sess["direction"]
-        avg_price  = sess["avg_price"]
-        qty        = sess["qty"]
-        leverage   = sess["leverage"]
-        dca_count  = sess["dca_count"]
+        sess        = self._session
+        direction   = sess["direction"]
+        avg_price   = sess["avg_price"]
+        qty         = sess["qty"]
+        leverage    = sess["leverage"]
+        dca_count   = sess["dca_count"]
         hedge_count = sess["hedge_count"]
 
-        # PnL calculation
-        if direction == "LONG":
-            pnl_pct = (price - avg_price) / avg_price * 100 * leverage
-        else:
-            pnl_pct = (avg_price - price) / avg_price * 100 * leverage
+        # Update adaptive params from current ATR
+        if atr_val > 0 and price > 0:
+            self._adaptive = self._compute_adaptive(atr_val, price)
+        p = self._adaptive or self._compute_adaptive(price * 0.005, price)
 
-        # ---- Hard stop (4× hedge trigger) --------------------------------
-        hard_stop_pct = cfg.hedge_trigger_pct * 4
-        if pnl_pct <= -hard_stop_pct:
-            logger.warning("TradingEngine: HARD STOP triggered pnl_pct=%.2f", pnl_pct)
+        # Un-leveraged price movement (positive = favourable for direction)
+        if direction == "LONG":
+            price_pct = (price - avg_price) / avg_price * 100
+        else:
+            price_pct = (avg_price - price) / avg_price * 100
+        # Leveraged pnl — used only for dollar PnL calculations
+        pnl_pct = price_pct * leverage
+
+        # ---- Hard stop -------------------------------------------------------
+        if price_pct <= -p["hard_stop_pct"]:
+            logger.warning(
+                "TradingEngine: HARD STOP  price_pct=%.2f%%  hard_stop=%.2f%%",
+                price_pct, p["hard_stop_pct"],
+            )
             await self._emergency_close(cfg, price, pnl_pct)
             return
 
-        # ---- Take-profit / trailing TP -----------------------------------
-        if await self._check_tp(cfg, price, pnl_pct, avg_price, direction, qty):
+        # ---- Take-profit / trailing TP ---------------------------------------
+        if await self._check_tp(cfg, price, price_pct, pnl_pct, direction, p):
             return
 
-        # ---- Hedge management -------------------------------------------
+        # ---- Hedge management -----------------------------------------------
         if self._hedges:
-            await self._manage_hedges(cfg, price, pnl_pct, signal)
-            if self._session is None:  # position was closed inside _manage_hedges
+            await self._manage_hedges(cfg, price, price_pct, pnl_pct, p, signal)
+            if self._session is None:
                 return
 
-        # ---- Hedge trigger ----------------------------------------------
+        # ---- Hedge trigger --------------------------------------------------
         if (
             not self._hedges
-            and pnl_pct <= -cfg.hedge_trigger_pct
+            and price_pct <= -p["hedge_trigger_pct"]
             and hedge_count < cfg.max_re_hedge
         ):
-            # Hedge direction validation: if signal now agrees with main direction,
-            # skip the hedge and let it recover
             if signal["direction"] == direction and signal["filters_passed"]:
-                logger.info(
-                    "TradingEngine: hedge skipped — signal agrees with main (%s)", direction
-                )
+                logger.info("TradingEngine: hedge skipped — signal agrees with main (%s)", direction)
                 self._broadcast({"type": "notification",
                                  "text": f"Hedge skipped: signal agrees with {direction}"})
             else:
                 await self._open_hedge(cfg, price, direction, qty)
             return
 
-        # ---- DCA ---------------------------------------------------------
-        if dca_count < cfg.max_dca:
-            dca_step = self._calc_dca_step(cfg, atr_val, price)
-            if pnl_pct <= -dca_step * leverage:
-                await self._try_dca(cfg, price, direction, avg_price, qty, dca_count)
+        # ---- DCA ------------------------------------------------------------
+        if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"]:
+            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count)
 
     # ------------------------------------------------------------------
     # Take-profit logic (trailing + fixed floor)
@@ -272,33 +313,27 @@ class TradingEngine:
         self,
         cfg: BotConfig,
         price: float,
+        price_pct: float,
         pnl_pct: float,
-        avg_price: float,
         direction: str,
-        qty: float,
+        p: Dict[str, float],
     ) -> bool:
-        """Returns True if position was closed."""
-        tp_pct = cfg.tp_pct
-        trail_pct = cfg.trail_pct
-        min_pct = cfg.min_profit_pct
-        sess = self._session
+        """Returns True if position was closed. price_pct and thresholds are un-leveraged price %."""
+        tp_pct    = p["tp_pct"]
+        trail_pct = p["trail_pct"]
+        min_pct   = p["min_profit_pct"]
 
-        # Initial TP threshold
-        if pnl_pct >= tp_pct:
+        if price_pct >= tp_pct:
             if not self._trail_activated:
-                # Activate trailing stop
                 self._trail_activated = True
                 if direction == "LONG":
                     self._trail_price = price * (1 - trail_pct / 100)
                 else:
                     self._trail_price = price * (1 + trail_pct / 100)
-                logger.info(
-                    "TradingEngine: trailing TP activated @ %.6f", self._trail_price
-                )
-                self._push_session()   # broadcast so chart shows Trail line immediately
+                logger.info("TradingEngine: trailing TP activated @ %.6f", self._trail_price)
+                self._push_session()
                 return False
             else:
-                # Update trailing stop; push session so chart Trail line tracks live
                 if direction == "LONG":
                     new_trail = price * (1 - trail_pct / 100)
                     if new_trail > self._trail_price:
@@ -310,13 +345,12 @@ class TradingEngine:
                         self._trail_price = new_trail
                         self._push_session()
 
-        # Check if trailing stop hit
         if self._trail_activated and self._trail_price is not None:
             trail_hit = (
-                (direction == "LONG" and price <= self._trail_price)
+                (direction == "LONG"  and price <= self._trail_price)
                 or (direction == "SHORT" and price >= self._trail_price)
             )
-            if trail_hit and pnl_pct >= min_pct:
+            if trail_hit and price_pct >= min_pct:
                 await self._close_position(cfg, price, pnl_pct, "trailing_tp")
                 return True
 
@@ -325,14 +359,6 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # DCA
     # ------------------------------------------------------------------
-
-    def _calc_dca_step(self, cfg: BotConfig, atr_val: float, price: float) -> float:
-        """Return DCA step as a percentage of price (un-leveraged)."""
-        fixed_step = cfg.dca_step_pct / 100
-        if atr_val > 0 and price > 0:
-            atr_step = atr_val * cfg.atr_dca_multiplier / price
-            return max(fixed_step, atr_step) * 100
-        return cfg.dca_step_pct
 
     async def _try_dca(
         self,
@@ -447,11 +473,13 @@ class TradingEngine:
         self,
         cfg: BotConfig,
         price: float,
+        main_price_pct: float,
         main_pnl_pct: float,
+        p: Dict[str, float],
         signal: Dict,
     ) -> None:
         """Check if hedges should be closed (recovery or TP)."""
-        sess = self._session
+        sess    = self._session
         main_dir = sess["direction"]
 
         for hedge in list(self._hedges):
@@ -460,28 +488,26 @@ class TradingEngine:
             h_qty   = hedge["qty"]
 
             if h_dir == "LONG":
-                h_pnl_pct = (price - h_price) / h_price * 100 * sess["leverage"]
+                h_price_pct = (price - h_price) / h_price * 100
             else:
-                h_pnl_pct = (h_price - price) / h_price * 100 * sess["leverage"]
+                h_price_pct = (h_price - price) / h_price * 100
 
-            # Close hedge if it hit TP
-            if h_pnl_pct >= cfg.tp_pct:
+            if h_price_pct >= p["tp_pct"]:
                 side = "SELL" if h_dir == "LONG" else "BUY"
                 order = await self._rest.place_market_order(
                     cfg.symbol, side, h_qty, reduce_only=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
-                pnl = h_pnl_pct / 100 * hedge["margin"]
-                await close_hedge(hedge["id"], pnl)
+                h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
+                await close_hedge(hedge["id"], h_pnl)
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
-                msg = f"{'[PAPER] ' if cfg.paper_mode else ''}HEDGE CLOSED (TP) @ {fill_price:.4f}"
+                msg = f"{'[PAPER] ' if cfg.paper_mode else ''}HEDGE CLOSED (TP) @ {fill_price:.6f}"
                 logger.info("TradingEngine: %s", msg)
                 self._broadcast({"type": "notification", "text": msg})
                 self._push_session()
 
-                # If main is also profitable, close everything
-                if main_pnl_pct >= cfg.min_profit_pct:
+                if main_price_pct >= p["min_profit_pct"]:
                     await self._close_position(cfg, price, main_pnl_pct, "hedge_tp_close")
                     return
 

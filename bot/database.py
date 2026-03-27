@@ -70,14 +70,8 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "symbol":              "BTCUSDT",
     "leverage":            "10",
     "margin_usdt":         "10",
-    "dca_step_pct":        "0.5",
     "max_dca":             "3",
-    "tp_pct":              "0.8",
-    "hedge_trigger_pct":   "1.0",
     "max_re_hedge":        "3",
-    "min_profit_pct":      "0.1",
-    "atr_dca_multiplier":  "1.0",
-    "trail_pct":           "0.15",
     "min_signal_strength": "0.25",
     "paper_mode":          "1",
     "discord_webhook":     "",
@@ -85,6 +79,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "scan_interval_s":     "30",
     "timeframe":           "1m",
 }
+
 
 
 async def init_db() -> None:

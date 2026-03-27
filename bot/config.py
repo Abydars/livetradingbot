@@ -15,16 +15,8 @@ class BotConfig:
     symbol: str
     leverage: int
     margin_usdt: float
-    dca_step_pct: float
     max_dca: int
-    tp_pct: float
-    hedge_trigger_pct: float
     max_re_hedge: int
-    min_profit_pct: float
-
-    # New in v2
-    atr_dca_multiplier: float
-    trail_pct: float
     min_signal_strength: float
 
     # Mode
@@ -66,14 +58,8 @@ async def load_config() -> BotConfig:
         symbol=_s("symbol", "BTCUSDT"),
         leverage=_i("leverage", 10),
         margin_usdt=_f("margin_usdt", 10.0),
-        dca_step_pct=_f("dca_step_pct", 0.5),
         max_dca=_i("max_dca", 3),
-        tp_pct=_f("tp_pct", 0.8),
-        hedge_trigger_pct=_f("hedge_trigger_pct", 1.0),
         max_re_hedge=_i("max_re_hedge", 3),
-        min_profit_pct=_f("min_profit_pct", 0.1),
-        atr_dca_multiplier=_f("atr_dca_multiplier", 1.0),
-        trail_pct=_f("trail_pct", 0.15),
         min_signal_strength=_f("min_signal_strength", 0.25),
         timeframe=_s("timeframe", "1m"),
         paper_mode=_b("paper_mode", True),
