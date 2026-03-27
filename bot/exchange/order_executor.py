@@ -76,17 +76,24 @@ class OrderExecutor:
         qty: float,
         reduce_only: bool = False,
         current_price: float = 0.0,
+        close_hedge: bool = False,
     ) -> dict:
         """
         Place a market order using the appropriate execution path.
+
+        close_hedge=True: closing a bot-tracked hedge position (not the main position).
+          - Hedge-mode account: flips positionSide to target the hedge leg (same as reduce_only).
+          - One-way account: sends a plain opposing order without reduceOnly, because in one-way
+            mode the hedge was just a partial close of the main position — there is no separate
+            LONG/SHORT position on Binance to "reduce".
 
         Returns an order-result dict with at minimum:
             orderId, symbol, side, origQty, avgPrice, executedQty, status
         """
         prefix = _MODE_PREFIX.get(self.trading_mode, "")
         logger.info(
-            "%splace_market_order %s %s qty=%.6f reduce_only=%s",
-            prefix, symbol, side, qty, reduce_only,
+            "%splace_market_order %s %s qty=%.6f reduce_only=%s close_hedge=%s",
+            prefix, symbol, side, qty, reduce_only, close_hedge,
         )
 
         if self.paper_mode:
@@ -111,19 +118,25 @@ class OrderExecutor:
 
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
 
+        # Treat close_hedge the same as reduce_only for positionSide selection in hedge mode.
+        is_close = reduce_only or close_hedge
+
         if self._hedge_mode:
-            # Hedge mode: positionSide determines which side to open/close
+            # Hedge mode: positionSide determines which side to open/close.
             # Opening: BUY → LONG, SELL → SHORT
-            # Closing (reduce_only): BUY closes SHORT, SELL closes LONG
-            if not reduce_only:
+            # Closing (reduce_only or close_hedge): BUY closes SHORT, SELL closes LONG
+            if not is_close:
                 pos_side = PositionSide.LONG if side == "BUY" else PositionSide.SHORT
             else:
                 pos_side = PositionSide.SHORT if side == "BUY" else PositionSide.LONG
             reduce = False  # reduceOnly is FORBIDDEN in hedge mode per docs
         else:
-            # One-way mode: always BOTH, use reduceOnly for closes
+            # One-way mode: always BOTH.
+            # reduce_only=True for main-position closes (safe guard against accidental opens).
+            # close_hedge: do NOT use reduceOnly — in one-way mode the hedge leg has no separate
+            # Binance position; closing it just places an opposing order to restore the main.
             pos_side = PositionSide.BOTH
-            reduce = reduce_only
+            reduce = reduce_only and not close_hedge
 
         result = await self._client.place_order_ws(
             symbol=symbol,
