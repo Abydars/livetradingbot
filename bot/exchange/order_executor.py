@@ -74,7 +74,13 @@ class OrderExecutor:
             prefix, symbol, side, qty, reduce_only,
         )
 
-        if self.paper_mode:
+        if self.paper_mode or self._client is None:
+            if self._client is None and not self.paper_mode:
+                logger.warning(
+                    "%splace_market_order: exchange client unavailable — simulating fill. "
+                    "Check API keys / BinanceClient startup logs.",
+                    prefix,
+                )
             return {
                 "orderId":    int(time.time() * 1000),
                 "symbol":     symbol,
