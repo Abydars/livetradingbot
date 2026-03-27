@@ -159,15 +159,17 @@ async def _ticker_loop() -> None:
                 "symbol": cfg.symbol,
             })
 
-            # Run trading tick (only when trading is enabled)
-            if _trading_active:
-                if _executor and not _executor.is_ready:
+            # Always tick to manage any open position (TP/SL/DCA/hedge).
+            # allow_entry=False when trading is stopped — existing position
+            # continues to be managed but no new entries are opened.
+            if _executor and not _executor.is_ready:
+                if _trading_active:
                     if now - _last_client_warn >= _CLIENT_WARN_INTERVAL:
                         _last_client_warn = now
                         err = _exchange_error or "Exchange client unavailable — check API keys"
                         _on_exchange_error(err)
-                else:
-                    await _engine.tick(cfg, price)
+            else:
+                await _engine.tick(cfg, price, allow_entry=_trading_active)
 
             # Detect trade close → trigger immediate symbol scan (auto_switch only)
             cur_session_open = _engine._session is not None

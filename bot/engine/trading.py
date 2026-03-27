@@ -193,7 +193,7 @@ class TradingEngine:
     # Main tick — called every N seconds by the scheduler
     # ------------------------------------------------------------------
 
-    async def tick(self, cfg: BotConfig, price: float) -> None:
+    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True) -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
         signal = self._signal_engine.compute(self.candles, flow_summary, ind)
@@ -205,7 +205,8 @@ class TradingEngine:
         atr_val = ind.get("atr") or 0.0
 
         if self._session is None:
-            await self._try_entry(cfg, price, signal, ind, atr_val)
+            if allow_entry:
+                await self._try_entry(cfg, price, signal, ind, atr_val)
         else:
             await self._manage_position(cfg, price, signal, ind, atr_val)
 
