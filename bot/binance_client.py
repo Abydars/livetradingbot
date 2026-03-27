@@ -273,6 +273,13 @@ class WSConnection:
                     try:
                         async for raw in ws:
                             data = json.loads(raw)
+                            # serverShutdown: server closes conn after 24h; reconnect cleanly
+                            if data.get("event") == "serverShutdown" or data.get("e") == "serverShutdown":
+                                msg = f"[{self.name}] serverShutdown received — reconnecting"
+                                logger.warning(msg)
+                                if self._on_error:
+                                    self._on_error(msg)
+                                break
                             for handler in self._handlers:
                                 asyncio.create_task(handler(data))
                     finally:
@@ -375,6 +382,10 @@ class BinanceClient:
         # REST session (persistent, connection pooling)
         self._session: Optional[aiohttp.ClientSession] = None
         self._on_error = on_error
+
+        # WS API message rate limiter: Binance limit = 10 incoming msgs/sec
+        # We stay well under with capacity=8, refill=8/s
+        self._ws_msg_limiter = TokenBucket(capacity=8, refill_rate=8.0)
 
         # WebSocket API connection (order placement)
         self._ws_api: Optional[WSConnection] = None
@@ -666,6 +677,13 @@ class BinanceClient:
                 raw_sig = self._ed25519_key.sign(payload.encode("ASCII"))
                 p["signature"] = base64.b64encode(raw_sig).decode("ASCII")
             else:
+                # Per Binance docs: WS API (ws-fapi) ONLY supports Ed25519 for
+                # session auth. HMAC will always return -1022. The bot will fall
+                # back to REST for every order — functional but slower.
+                logger.warning(
+                    "WS API: HMAC key in use. Binance ws-fapi requires Ed25519. "
+                    "Create an Ed25519 API key for native WS order placement."
+                )
                 p["signature"] = hmac.new(
                     self.api_secret.encode("utf-8"),
                     payload.encode("utf-8"),
@@ -682,6 +700,9 @@ class BinanceClient:
         loop = asyncio.get_event_loop()
         fut  = loop.create_future()
         self._ws_api_pending[req_id] = fut
+
+        # Respect Binance 10 incoming messages/sec limit
+        await self._ws_msg_limiter.acquire()
 
         try:
             await self._ws_api.send(payload_json)
