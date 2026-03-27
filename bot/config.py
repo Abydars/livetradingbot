@@ -78,8 +78,8 @@ async def load_config() -> BotConfig:
         timeframe=_s("timeframe", "1m"),
         paper_mode=_b("paper_mode", True),
         discord_webhook=_s("discord_webhook", ""),
-        auto_switch=_b("auto_switch", False),
-        scan_interval_s=_i("scan_interval_s", 60),
+        auto_switch=_b("auto_switch", True),
+        scan_interval_s=_i("scan_interval_s", 30),
         # Secrets from environment only
         api_key=os.environ.get("BINANCE_API_KEY", ""),
         api_secret=os.environ.get("BINANCE_SECRET", ""),

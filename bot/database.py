@@ -81,8 +81,8 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "min_signal_strength": "0.25",
     "paper_mode":          "1",
     "discord_webhook":     "",
-    "auto_switch":         "0",
-    "scan_interval_s":     "60",
+    "auto_switch":         "1",
+    "scan_interval_s":     "30",
     "timeframe":           "1m",
 }
 

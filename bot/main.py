@@ -174,28 +174,46 @@ def _safe_ind(ind: Dict) -> Dict:
 
 
 async def _maybe_switch_symbol(cfg) -> None:
-    """Auto-switch to highest-volume symbol if auto_switch is enabled."""
+    """Switch to top-momentum symbol when idle, if it clearly beats the current one."""
     try:
-        top = await _rest.get_top_movers(n=1)
+        top = await _rest.get_top_movers(n=5)
         if not top:
             return
-        new_sym = top[0]["symbol"]
-        if new_sym != cfg.symbol:
-            global _last_candles_fetch
-            logger.info("Auto-switch: %s → %s", cfg.symbol, new_sym)
-            await set_config_bulk({"symbol": new_sym})
-            await _ws.switch_symbol(new_sym)
-            _last_candles_fetch = 0.0
-            await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
-            await _do_broadcast({
-                "type":       "notification",
-                "text":       f"Auto-switched: {cfg.symbol} → {new_sym}",
-            })
-            await notify(cfg.discord_webhook, "AUTO_SWITCH", {
-                "old_symbol": cfg.symbol,
-                "new_symbol": new_sym,
-                "paper":      cfg.paper_mode,
-            })
+
+        best = top[0]
+        new_sym = best["symbol"]
+
+        # Find current symbol's score in the same batch (may be absent if off top-5)
+        cur_score = next(
+            (t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0
+        )
+        best_score = best["_score"]
+
+        # Only switch if the new symbol is >20% better than what we're on,
+        # or the current symbol didn't make the top-5 at all.
+        if new_sym == cfg.symbol:
+            return
+        if cur_score > 0 and best_score < cur_score * 1.2:
+            return  # not meaningfully better — stay put
+
+        global _last_candles_fetch
+        logger.info(
+            "Auto-switch: %s → %s  (score %.1f → %.1f)",
+            cfg.symbol, new_sym, cur_score, best_score,
+        )
+        await set_config_bulk({"symbol": new_sym})
+        await _ws.switch_symbol(new_sym)
+        _last_candles_fetch = 0.0
+        await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+        await _do_broadcast({
+            "type":  "notification",
+            "text":  f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
+        })
+        await notify(cfg.discord_webhook, "AUTO_SWITCH", {
+            "old_symbol": cfg.symbol,
+            "new_symbol": new_sym,
+            "paper":      cfg.paper_mode,
+        })
     except Exception as exc:
         logger.warning("Auto-switch error: %s", exc)
 
