@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 
 from config import load_config
 from database import (
+    close_hedge,
+    close_session,
     delete_all_sessions,
     delete_session,
     get_config,
@@ -75,6 +77,8 @@ _trading_active: bool = False          # persisted in config.trading_active
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
+_last_position_check: float = 0.0     # throttle REST position sync
+_POSITION_CHECK_S = 60.0              # check Binance position every N seconds
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 _CLIENT_WARN_INTERVAL = 60.0  # re-broadcast "client unavailable" at most once per minute
@@ -106,8 +110,32 @@ async def _do_broadcast(msg: Dict) -> None:
 # Ticker loop (called from trading ticker)
 # ---------------------------------------------------------------------------
 
+async def _sync_position_rest(cfg) -> None:
+    """
+    REST fallback: query Binance for the current position and close the session
+    if the position no longer exists (pa≈0). Runs every _POSITION_CHECK_S seconds
+    to catch any external closes that the user data stream may have missed.
+    """
+    if not (_engine and _engine._session and _binance_client):
+        return
+    try:
+        positions = await _binance_client.get_positions(cfg.symbol)
+        sess_dir  = _engine._session["direction"]
+        for pos in positions:
+            ps = pos.get("positionSide", "")
+            pa = float(pos.get("positionAmt", 1))
+            if ps not in (sess_dir, "BOTH"):
+                continue
+            if abs(pa) < 1e-8:
+                logger.warning("Position sync: %s %s shows pa=0 — closed externally", cfg.symbol, sess_dir)
+                await _handle_external_close(0.0, "external_close")
+                return
+    except Exception as exc:
+        logger.debug("Position sync REST check failed: %s", exc)
+
+
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn
+    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check
     cfg = await load_config()
 
     while True:
@@ -182,6 +210,11 @@ async def _ticker_loop() -> None:
             if now - _last_symbol_scan >= cfg.scan_interval_s:
                 _last_symbol_scan = now
                 await _scan_symbols(cfg)
+
+            # REST position sync — catch external closes missed by user data stream
+            if _engine._session and now - _last_position_check >= _POSITION_CHECK_S:
+                _last_position_check = now
+                await _sync_position_rest(cfg)
 
         except asyncio.CancelledError:
             return
@@ -323,60 +356,149 @@ def _on_depth(event: Dict) -> None:
 # User data stream callback (fill price sync)
 # ---------------------------------------------------------------------------
 
-async def _on_user_data(event: dict) -> None:
+async def _handle_external_close(fill_price: float, reason: str) -> None:
     """
-    Sync actual fill prices from Binance user data stream.
-    ORDER_TRADE_UPDATE fires on every order state change.
-    When status=FILLED, ap=average fill price for the order, z=cumulative filled qty.
+    Called when Binance reports a position was closed externally
+    (liquidation, manual close from exchange UI, another bot, etc.).
+    Updates the DB session, clears engine state, and notifies the UI.
+    """
+    if not (_engine and _engine._session):
+        return
+    sess      = _engine._session
+    direction = sess["direction"]
+    avg_price = sess["avg_price"]
+    leverage  = sess["leverage"]
+    margin    = sess["margin"]
+    symbol    = sess.get("symbol", "")
 
-    Uses _engine._pending_fills to determine if this is an entry or DCA fill:
-    - entry: set avg_price = ap directly
-    - dca:   reblend using stored prior_qty/prior_avg + this fill's price/qty
-    Orders not in _pending_fills (closes, hedge orders) are ignored.
-    """
-    if event.get("e") != "ORDER_TRADE_UPDATE":
-        return
-    o = event.get("o", {})
-    if o.get("X") != "FILLED":
-        return
-    fill_price = float(o.get("ap", 0))
-    fill_qty   = float(o.get("z", 0))
-    symbol     = o.get("s", "")
-    order_id   = o.get("i")
-    logger.info(
-        "Fill: orderId=%s %s avgPrice=%.4f qty=%.4f",
-        order_id, symbol, fill_price, fill_qty,
+    if fill_price > 0:
+        if direction == "LONG":
+            pnl_pct = (fill_price - avg_price) / avg_price * 100 * leverage
+        else:
+            pnl_pct = (avg_price - fill_price) / avg_price * 100 * leverage
+        realized_pnl = round(pnl_pct / 100 * margin, 4)
+    else:
+        pnl_pct = realized_pnl = 0.0
+
+    for hedge in list(_engine._hedges):
+        await close_hedge(hedge["id"], 0.0)
+
+    await close_session(sess["id"], realized_pnl, reason)
+    logger.warning(
+        "External close [%s]: %s %s fill=%.6f pnl=%.4f",
+        reason, direction, symbol, fill_price, realized_pnl,
     )
 
-    if not (_engine and _engine._session and fill_price > 0 and order_id):
-        return
+    label = "LIQUIDATED" if reason == "liquidated" else "Closed on exchange"
+    price_str = f"@ {fill_price:.6f}" if fill_price > 0 else "(price unknown)"
+    _broadcast({"type": "notification",
+                "text": f"⚠ {label} {symbol} {price_str}  pnl={realized_pnl:+.4f}"})
+    _broadcast({"type": "pos_log", "event": reason, "ts": int(time.time()),
+                "symbol": symbol, "price": fill_price, "pnl": realized_pnl})
 
-    order_id_int = int(order_id)
-    pending = _engine._pending_fills.pop(order_id_int, None)
-    if pending is None:
-        # Not a tracked order (close, hedge, etc.) — don't touch avg_price
-        return
+    _engine._session         = None
+    _engine._hedges          = []
+    _engine._trail_activated = False
+    _engine._trail_price     = None
+    _engine._dca_pending_since = None
+    _engine._entry_adaptive  = {}
+    _engine._pending_fills.clear()
+    _engine._push_session()
 
-    sess = _engine._session
-    if pending["type"] == "entry":
-        new_avg = fill_price
-    else:
-        # DCA: blend using the pre-DCA state stored at order placement time
-        prior_qty = pending["prior_qty"]
-        prior_avg = pending["prior_avg"]
-        new_qty   = pending.get("new_qty", fill_qty)
-        total_qty = prior_qty + new_qty
-        new_avg   = (prior_avg * prior_qty + fill_price * new_qty) / total_qty
 
-    if abs(sess["avg_price"] - new_avg) > 0.001 * new_avg:
-        old_avg = sess["avg_price"]
-        await update_session(sess["id"], avg_price=new_avg)
-        _engine._session = await get_open_session()
+async def _on_user_data(event: dict) -> None:
+    """
+    Handle Binance user data stream events:
+
+    ORDER_TRADE_UPDATE / FILLED
+      - Entry/DCA fills: correct avg_price in DB using true fill price.
+      - Liquidation orders: detect and close session as "liquidated".
+
+    ACCOUNT_UPDATE
+      - If position for the tracked symbol goes to zero, the position was
+        closed externally (manual close, liquidation, another bot).
+    """
+    etype = event.get("e")
+
+    # ── ORDER_TRADE_UPDATE ────────────────────────────────────────────────
+    if etype == "ORDER_TRADE_UPDATE":
+        o = event.get("o", {})
+        if o.get("X") != "FILLED":
+            return
+
+        fill_price = float(o.get("ap", 0))
+        fill_qty   = float(o.get("z", 0))
+        symbol     = o.get("s", "")
+        order_id   = o.get("i")
+        order_type = o.get("ot", "")
+
         logger.info(
-            "Fill sync (%s): updated avg_price %.4f → %.4f (true fill=%.4f)",
-            pending["type"], old_avg, new_avg, fill_price,
+            "Fill: orderId=%s %s type=%s avgPrice=%.6f qty=%.4f",
+            order_id, symbol, order_type, fill_price, fill_qty,
         )
-        _engine._push_session()
+
+        # Liquidation — position was forcibly closed by the exchange
+        if order_type == "LIQUIDATION":
+            if _engine and _engine._session:
+                sess_sym = _engine._session.get("symbol", "").upper()
+                if sess_sym == symbol.upper():
+                    liq_price = float(o.get("L") or o.get("ap") or 0)
+                    await _handle_external_close(liq_price, "liquidated")
+            return
+
+        # Entry / DCA fill price correction
+        if not (_engine and _engine._session and fill_price > 0 and order_id):
+            return
+
+        order_id_int = int(order_id)
+        pending = _engine._pending_fills.pop(order_id_int, None)
+        if pending is None:
+            return  # close/hedge/external order — don't touch avg_price
+
+        sess = _engine._session
+        if pending["type"] == "entry":
+            new_avg = fill_price
+        else:
+            prior_qty = pending["prior_qty"]
+            prior_avg = pending["prior_avg"]
+            new_qty   = pending.get("new_qty", fill_qty)
+            total_qty = prior_qty + new_qty
+            new_avg   = (prior_avg * prior_qty + fill_price * new_qty) / total_qty
+
+        if abs(sess["avg_price"] - new_avg) > 0.001 * new_avg:
+            old_avg = sess["avg_price"]
+            await update_session(sess["id"], avg_price=new_avg)
+            _engine._session = await get_open_session()
+            logger.info(
+                "Fill sync (%s): avg_price %.6f → %.6f (fill=%.6f)",
+                pending["type"], old_avg, new_avg, fill_price,
+            )
+            _engine._push_session()
+        return
+
+    # ── ACCOUNT_UPDATE ────────────────────────────────────────────────────
+    if etype == "ACCOUNT_UPDATE":
+        if not (_engine and _engine._session):
+            return
+        sess     = _engine._session
+        sess_sym = sess.get("symbol", "").upper()
+        sess_dir = sess["direction"]          # "LONG" or "SHORT"
+
+        for pos in event.get("a", {}).get("P", []):
+            sym = pos.get("s", "").upper()
+            ps  = pos.get("ps", "")           # "LONG", "SHORT", or "BOTH"
+            pa  = float(pos.get("pa", 1))     # position amount (negative for SHORT)
+
+            if sym != sess_sym:
+                continue
+            # In hedge mode match the exact leg; in one-way mode ps=="BOTH"
+            if ps not in (sess_dir, "BOTH"):
+                continue
+            if abs(pa) < 1e-8:
+                reason_raw = event.get("a", {}).get("m", "").upper()
+                reason = "liquidated" if reason_raw == "LIQUIDATION" else "external_close"
+                await _handle_external_close(0.0, reason)
+                return
 
 
 # ---------------------------------------------------------------------------
