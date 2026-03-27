@@ -154,9 +154,9 @@ async def _ticker_loop() -> None:
             if _trading_active:
                 await _engine.tick(cfg, price)
 
-            # Detect trade close → trigger immediate symbol scan
+            # Detect trade close → trigger immediate symbol scan (auto_switch only)
             cur_session_open = _engine._session is not None
-            if _prev_session_open and not cur_session_open:
+            if _prev_session_open and not cur_session_open and cfg.auto_switch:
                 logger.info("Trade closed — triggering immediate symbol scan")
                 _last_symbol_scan = 0.0
             _prev_session_open = cur_session_open
@@ -204,7 +204,7 @@ def _format_movers(top: list) -> list:
 
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _last_top_movers, _last_candles_fetch
+    global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
     try:
         top = await _rest.get_top_movers(n=10)
         if not top:
@@ -234,6 +234,10 @@ async def _scan_symbols(cfg) -> None:
         await set_config_bulk({"symbol": new_sym})
         await _ws.switch_symbol(new_sym)
         _last_candles_fetch = 0.0
+        # Reset price so next tick fetches a fresh mark-price for the new symbol
+        # instead of using stale price from the old symbol
+        _last_price = 0.0
+        _last_price_rest_fetch = 0.0
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
             "type": "notification",
