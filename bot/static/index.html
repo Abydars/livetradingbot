@@ -1300,17 +1300,21 @@ function updateLiveCandle(price) {
    TRADE LEVELS — entry/TP/SL/trailing lines + markers
 ═══════════════════════════════════════════════════════ */
 function computeTPPrice(session) {
-  const tpPct    = parseFloat(configData.tp_pct     ?? 0.8);
-  const lev      = session.leverage || 10;
-  const move     = session.avg_price * tpPct / (100 * lev);
-  return session.direction === 'LONG' ? session.avg_price + move : session.avg_price - move;
+  // Mirror engine: tp_pct is an UN-LEVERAGED price % (not divided by leverage)
+  const tpPct = Math.max(parseFloat(configData.tp_pct ?? 0.8), 0.8);
+  const move  = session.avg_price * tpPct / 100;
+  return session.direction === 'LONG'
+    ? session.avg_price + move
+    : session.avg_price - move;
 }
 
 function computeSLPrice(session) {
-  const trigPct  = parseFloat(configData.hedge_trigger_pct ?? 1.0) * 4;
-  const lev      = session.leverage || 10;
-  const move     = session.avg_price * trigPct / (100 * lev);
-  return session.direction === 'LONG' ? session.avg_price - move : session.avg_price + move;
+  // Mirror engine: hard_stop_pct is UN-LEVERAGED, minimum 2.0%
+  const slPct = 2.0;
+  const move  = session.avg_price * slPct / 100;
+  return session.direction === 'LONG'
+    ? session.avg_price - move
+    : session.avg_price + move;
 }
 
 function _removeLine(ref) {

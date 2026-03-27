@@ -125,6 +125,24 @@ class TradingEngine:
         }
 
     # ------------------------------------------------------------------
+    # Level prices helper (used by WS initial-state and _push_session)
+    # ------------------------------------------------------------------
+
+    def get_level_prices(self):
+        """Return (tp_price, sl_price) for the current session, or (None, None)."""
+        ref = self._entry_adaptive or self._adaptive
+        if not self._session or not ref:
+            return None, None
+        avg = self._session["avg_price"]
+        d   = self._session["direction"]
+        tp  = ref["tp_pct"]
+        sl  = ref["hard_stop_pct"]
+        if d == "LONG":
+            return avg * (1 + tp / 100), avg * (1 - sl / 100)
+        else:
+            return avg * (1 - tp / 100), avg * (1 + sl / 100)
+
+    # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
 
