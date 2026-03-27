@@ -259,6 +259,9 @@ async def _scan_symbols(cfg) -> None:
         # instead of using stale price from the old symbol
         _last_price = 0.0
         _last_price_rest_fetch = 0.0
+        # Pre-configure the new symbol on Binance (margin type, leverage) so the
+        # first order fires immediately without setup latency.
+        await _executor.prepare_symbol(new_sym, cfg.leverage)
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
             "type": "notification",
@@ -447,6 +450,7 @@ async def lifespan(app: FastAPI):
 
     _executor = OrderExecutor(_binance_client, _rest, cfg.trading_mode)
     await _executor.init()
+    await _executor.prepare_symbol(cfg.symbol, cfg.leverage)
 
     _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
@@ -817,7 +821,14 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             new_sym = updates["symbol"]
             await _ws.switch_symbol(new_sym)
             _last_candles_fetch = 0.0
+            cfg2 = await load_config()
+            await _executor.prepare_symbol(new_sym, cfg2.leverage)
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+
+        # Re-apply leverage immediately if it was changed
+        if "leverage" in updates and "symbol" not in updates:
+            cfg2 = await load_config()
+            await _executor.prepare_symbol(cfg2.symbol, cfg2.leverage)
 
         # Reset candle fetch if timeframe changed
         if "timeframe" in updates:

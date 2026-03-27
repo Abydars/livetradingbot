@@ -67,13 +67,49 @@ class OrderExecutor:
                 logger.warning("OrderExecutor: could not fetch position mode: %s", exc)
                 self._hedge_mode = False
 
+    async def prepare_symbol(self, symbol: str, leverage: int) -> None:
+        """
+        Configure symbol-level settings on Binance before trading begins.
+        Called at startup and on every auto-switch / symbol change so that
+        the first order can be placed immediately without any setup latency.
+
+          1. Margin type → ISOLATED  (risk-isolated per position)
+          2. Leverage    → cfg.leverage
+
+        Binance returns -4046 when margin type is already correct — silently ignored.
+        """
+        if self.paper_mode or not self._client:
+            return
+
+        from binance_client import MarginType
+
+        symbol = symbol.upper()
+
+        try:
+            await self._client.change_margin_type(symbol, MarginType.ISOLATED)
+            logger.info("OrderExecutor: margin type = ISOLATED for %s", symbol)
+        except Exception as exc:
+            if "-4046" in str(exc):
+                logger.debug("OrderExecutor: margin type already ISOLATED for %s", symbol)
+            else:
+                logger.warning("OrderExecutor: could not set margin type for %s: %s", symbol, exc)
+
+        try:
+            await self._client.change_leverage(symbol, leverage)
+            logger.info("OrderExecutor: leverage = %dx for %s", leverage, symbol)
+        except Exception as exc:
+            logger.warning("OrderExecutor: could not set leverage for %s: %s", symbol, exc)
+
     async def ensure_leverage(self, symbol: str, leverage: int) -> None:
-        """Set leverage on Binance for this symbol before opening a position."""
+        """
+        Last-resort leverage sync just before entry — catches cases where
+        leverage was changed in config after startup without a symbol switch.
+        The upfront prepare_symbol() call handles the normal path.
+        """
         if self.paper_mode or not self._client:
             return
         try:
             await self._client.change_leverage(symbol, leverage)
-            logger.info("OrderExecutor: leverage set to %dx for %s", leverage, symbol)
         except Exception as exc:
             logger.warning("OrderExecutor: could not set leverage: %s", exc)
 
