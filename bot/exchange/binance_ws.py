@@ -141,6 +141,10 @@ class BinanceWebSocket:
         except json.JSONDecodeError:
             return
 
+        # Combined-stream messages are wrapped: {"stream": "...", "data": {...}}
+        if "data" in msg:
+            msg = msg["data"]
+
         event = msg.get("e", "")
 
         if event == "aggTrade":

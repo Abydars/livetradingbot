@@ -59,7 +59,9 @@ _clients: Set[WebSocket] = set()
 _last_price: float = 0.0
 _last_candles_fetch: float = 0.0
 _last_symbol_scan: float = 0.0
+_last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
+_PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +91,24 @@ async def _do_broadcast(msg: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan
+    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch
     cfg = await load_config()
 
     while True:
         try:
             cfg = await load_config()
-            price = _last_price or await _rest.get_mark_price(cfg.symbol)
+            now = time.time()
+            if _last_price:
+                price = _last_price
+            elif now - _last_price_rest_fetch >= _PRICE_REST_FALLBACK_S:
+                # WS not yet delivering prices — fetch once via REST until it does
+                price = await _rest.get_mark_price(cfg.symbol)
+                _last_price_rest_fetch = now
+            else:
+                await asyncio.sleep(1.0)
+                continue
 
             # Refresh candles periodically
-            now = time.time()
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
                 raw = await _rest.get_klines(cfg.symbol, interval="1m", limit=200)
                 candles = [

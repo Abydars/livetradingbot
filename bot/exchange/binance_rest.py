@@ -55,12 +55,14 @@ class _RateLimiter:
 
 class SymbolInfo:
     def __init__(self, symbol: str, step_size: float, min_qty: float,
-                 tick_size: float, min_notional: float) -> None:
+                 tick_size: float, min_notional: float,
+                 status: str = "TRADING") -> None:
         self.symbol = symbol
         self.step_size = step_size
         self.min_qty = min_qty
         self.tick_size = tick_size
         self.min_notional = min_notional
+        self.status = status
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +312,7 @@ class BinanceRestClient:
                 min_qty=min_qty,
                 tick_size=tick_size,
                 min_notional=min_notional,
+                status=sym.get("status", ""),
             )
         logger.info(
             "BinanceRestClient: loaded info for %d symbols", len(self.symbol_info)
@@ -365,7 +368,11 @@ class BinanceRestClient:
         """
         import math
         tickers    = await self.get_ticker_24hr()
-        usdt_perps = {s for s in self.symbol_info}
+        # Only include USDT perpetual symbols that are actively trading
+        usdt_perps = {
+            s for s, info in self.symbol_info.items()
+            if info.status == "TRADING"
+        }
         candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
