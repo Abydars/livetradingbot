@@ -40,6 +40,10 @@ def _mode_prefix(trading_mode: str) -> str:
     return _MODE_PREFIXES.get(trading_mode, "")
 
 
+def _ts() -> int:
+    return int(time.time())
+
+
 class TradingEngine:
     """
     Encapsulates all trading state.  Call tick() periodically.
@@ -108,6 +112,10 @@ class TradingEngine:
             "tp_price":     tp_price,
             "sl_price":     sl_price,
         })
+
+    def _pos_log(self, event: str, **kw) -> None:
+        """Broadcast a structured position-log entry to all connected clients."""
+        self._broadcast({"type": "pos_log", "event": event, "ts": _ts(), **kw})
 
     @staticmethod
     def _compute_adaptive(atr: float, price: float) -> Dict[str, float]:
@@ -272,6 +280,8 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._pos_log("open", direction=direction, price=fill_price, qty=qty,
+                      symbol=cfg.symbol, mode=cfg.trading_mode)
         self._push_session()
 
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
@@ -493,6 +503,9 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._pos_log("dca", direction=direction, price=fill_price, qty=new_qty,
+                      dca_n=dca_count + 1, new_avg=round(new_avg, 6),
+                      symbol=cfg.symbol, mode=cfg.trading_mode)
         self._push_session()
 
         await log_signal(cfg.symbol, direction, 0.0, {}, "dca")
@@ -548,6 +561,9 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._pos_log("hedge_open", direction=hedge_dir, price=fill_price, qty=hedge_qty,
+                      hedge_n=self._session["hedge_count"],
+                      symbol=cfg.symbol, mode=cfg.trading_mode)
         self._push_session()
 
         await log_signal(cfg.symbol, hedge_dir, 0.0, {}, "hedge")
@@ -596,6 +612,9 @@ class TradingEngine:
                 msg = f"{_mode_prefix(cfg.trading_mode)}HEDGE CLOSED (TP) @ {fill_price:.6f}"
                 logger.info("TradingEngine: %s", msg)
                 self._broadcast({"type": "notification", "text": msg})
+                self._pos_log("hedge_close", direction=h_dir, price=fill_price,
+                              pnl=round(h_pnl, 4), reason="tp",
+                              symbol=cfg.symbol, mode=cfg.trading_mode)
                 self._push_session()
 
                 if main_price_pct >= p["min_profit_pct"]:
@@ -622,6 +641,9 @@ class TradingEngine:
                 )
                 logger.info("TradingEngine: %s", msg)
                 self._broadcast({"type": "notification", "text": msg})
+                self._pos_log("hedge_close", direction=h_dir, price=fill_price,
+                              pnl=round(h_pnl, 4), reason="recovery",
+                              symbol=cfg.symbol, mode=cfg.trading_mode)
                 self._push_session()
 
     # ------------------------------------------------------------------
@@ -676,6 +698,9 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._pos_log("close", direction=direction, price=fill_price,
+                      pnl=round(realized_pnl, 4), pnl_pct=round(pnl_pct, 2),
+                      reason=reason, symbol=cfg.symbol, mode=cfg.trading_mode)
 
         await log_signal(cfg.symbol, direction, 0.0, {}, "close")
         await notify(cfg.discord_webhook, "TRADE_CLOSE", {
