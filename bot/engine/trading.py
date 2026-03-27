@@ -72,6 +72,10 @@ class TradingEngine:
         # DCA adverse pressure timer
         self._dca_pending_since: Optional[float] = None
 
+        # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
+        # Used by _on_user_data in main.py to compute correct blended average from true fill price.
+        self._pending_fills: Dict[int, Dict] = {}
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, used for ALL SL/TP decisions
@@ -258,6 +262,11 @@ class TradingEngine:
             cfg.symbol, side, qty, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
+
+        # Track this order so _on_user_data can correct fill price if avgPrice was "0"
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
 
         session_id = await create_session(
             symbol=cfg.symbol,
@@ -488,6 +497,12 @@ class TradingEngine:
             cfg.symbol, side, new_qty, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
+
+        # Track this order so _on_user_data can reblend with the true fill price.
+        # Store the pre-DCA state so the callback can compute: (prior_avg*prior_qty + fill*new_qty) / total
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {"type": "dca", "prior_qty": qty, "prior_avg": avg_price, "new_qty": new_qty}
 
         total_qty = qty + new_qty
         new_avg = (avg_price * qty + fill_price * new_qty) / total_qty

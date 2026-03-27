@@ -322,31 +322,56 @@ async def _on_user_data(event: dict) -> None:
     """
     Sync actual fill prices from Binance user data stream.
     ORDER_TRADE_UPDATE fires on every order state change.
-    When status=FILLED, ap=average fill price, z=cumulative filled qty.
+    When status=FILLED, ap=average fill price for the order, z=cumulative filled qty.
+
+    Uses _engine._pending_fills to determine if this is an entry or DCA fill:
+    - entry: set avg_price = ap directly
+    - dca:   reblend using stored prior_qty/prior_avg + this fill's price/qty
+    Orders not in _pending_fills (closes, hedge orders) are ignored.
     """
     if event.get("e") != "ORDER_TRADE_UPDATE":
         return
     o = event.get("o", {})
     if o.get("X") != "FILLED":
         return
-    avg_price  = float(o.get("ap", 0))
-    filled_qty = float(o.get("z", 0))
+    fill_price = float(o.get("ap", 0))
+    fill_qty   = float(o.get("z", 0))
     symbol     = o.get("s", "")
     order_id   = o.get("i")
     logger.info(
         "Fill: orderId=%s %s avgPrice=%.4f qty=%.4f",
-        order_id, symbol, avg_price, filled_qty,
+        order_id, symbol, fill_price, fill_qty,
     )
-    # If engine has an open session and fill price differs, update DB
-    if _engine and _engine._session and avg_price > 0:
-        sess = _engine._session
-        if abs(sess["avg_price"] - avg_price) > 0.001 * avg_price:
-            await update_session(sess["id"], avg_price=avg_price)
-            _engine._session = await get_open_session()
-            logger.info(
-                "Fill sync: updated session avg_price %.4f → %.4f",
-                sess["avg_price"], avg_price,
-            )
+
+    if not (_engine and _engine._session and fill_price > 0 and order_id):
+        return
+
+    order_id_int = int(order_id)
+    pending = _engine._pending_fills.pop(order_id_int, None)
+    if pending is None:
+        # Not a tracked order (close, hedge, etc.) — don't touch avg_price
+        return
+
+    sess = _engine._session
+    if pending["type"] == "entry":
+        new_avg = fill_price
+    else:
+        # DCA: blend using the pre-DCA state stored at order placement time
+        prior_qty = pending["prior_qty"]
+        prior_avg = pending["prior_avg"]
+        new_qty   = pending.get("new_qty", fill_qty)
+        total_qty = prior_qty + new_qty
+        new_avg   = (prior_avg * prior_qty + fill_price * new_qty) / total_qty
+
+    if abs(sess["avg_price"] - new_avg) > 0.001 * new_avg:
+        old_avg = sess["avg_price"]
+        await update_session(sess["id"], avg_price=new_avg)
+        _engine._session = await get_open_session()
+        logger.info(
+            "Fill sync (%s): updated avg_price %.4f → %.4f (true fill=%.4f)",
+            pending["type"], old_avg, new_avg, fill_price,
+        )
+        _engine._push_session()
 
 
 # ---------------------------------------------------------------------------
