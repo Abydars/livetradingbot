@@ -98,32 +98,7 @@
       transition: color .15s;
     }
 
-    /* ── trading mode selector ── */
-    #mode-selector {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .mode-btn {
-      background: var(--bg2);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      font-family: var(--font);
-      font-size: 10px;
-      padding: 2px 8px;
-      cursor: pointer;
-      letter-spacing: .04em;
-      transition: color .15s, border-color .15s;
-    }
-    .mode-btn:hover { color: var(--text); border-color: var(--muted); }
-    .mode-btn.active {
-      color: var(--text);
-      border-color: var(--blue);
-    }
-    .mode-btn.mode-live.active {
-      color: var(--red);
-      border-color: var(--red);
-    }
+    /* ── trading mode badge ── */
     #mode-badge {
       font-size: 10px;
       font-weight: 600;
@@ -934,12 +909,7 @@
     <option value="4h">4h</option>
   </select>
   <span id="live-price">——</span>
-  <div id="mode-selector">
-    <button class="mode-btn" data-mode="paper" onclick="setMode('paper')">📄 Paper</button>
-    <button class="mode-btn" data-mode="demo"  onclick="setMode('demo')">🧪 Demo</button>
-    <button class="mode-btn mode-live" data-mode="live" onclick="setMode('live')">⚡ Live</button>
-    <span id="mode-badge"></span>
-  </div>
+  <span id="mode-badge"></span>
   <div class="hspacer"></div>
   <button id="btn-trade" onclick="toggleTrading()">▶ START</button>
   <button id="btn-cfg" onclick="openCfgModal()">⚙ CONFIG</button>
@@ -2184,7 +2154,6 @@ function onSelectCfg(el) {
   const key = el.dataset.key;
   const val = el.value;
   if (key === 'timeframe') { changeTf(val); return; }
-  if (key === 'trading_mode') { setMode(val); return; }
   wsSend({ type: 'set_config', config: { [key]: val } });
 }
 
@@ -2192,7 +2161,6 @@ function saveConfig() {
   const updates = {};
   document.querySelectorAll('#cfg-form [data-key]').forEach(el => {
     const key = el.dataset.key;
-    if (key === 'trading_mode') return; // handled immediately by onSelectCfg → setMode
     if (el.type === 'checkbox') updates[key] = el.checked ? 1 : 0;
     else if (el.type === 'number') updates[key] = parseFloat(el.value) || el.value;
     else updates[key] = el.value;
@@ -2280,28 +2248,14 @@ function changeSymbol(sym) {
   wsSend({ type: 'set_config', config: { symbol: sym } });
 }
 
-// Trading mode selector
-function setMode(mode) {
-  if (mode === 'live' && !confirm('⚠ Switch to LIVE mode?\nReal money will be used.')) return;
-  if (window._sessionOpen) {
-    alert('Close the open position before changing mode.');
-    return;
-  }
-  wsSend({ type: 'set_config', config: { trading_mode: mode } });
-}
-
 function updateModeDisplay(mode) {
-  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-  const btn = document.querySelector(`.mode-btn[data-mode="${mode}"]`);
-  if (btn) btn.classList.add('active');
-  const badges = { paper: 'PAPER', demo: 'DEMO', live: '⚡ LIVE' };
+  const labels = { paper: 'PAPER', demo: 'DEMO', live: '⚡ LIVE' };
   const badge = document.getElementById('mode-badge');
-  badge.textContent = badges[mode] || mode;
+  badge.textContent = labels[mode] || mode.toUpperCase();
   badge.className = `badge-${mode}`;
   isPaperMode = mode === 'paper';
 }
 
-// (kept for backwards compat with any remaining callers)
 function updatePaperBadge() { /* superseded by updateModeDisplay */ }
 
 // Tab switching
