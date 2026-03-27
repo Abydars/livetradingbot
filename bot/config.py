@@ -65,12 +65,17 @@ async def load_config() -> BotConfig:
     trading_mode = _s("trading_mode", "paper")
 
     if trading_mode == "live":
-        api_key    = os.environ.get("BINANCE_LIVE_KEY", "")
-        api_secret = os.environ.get("BINANCE_LIVE_SECRET", "")
+        # New names preferred; fall back to legacy BINANCE_API_KEY / BINANCE_SECRET
+        api_key    = (os.environ.get("BINANCE_LIVE_KEY")
+                      or os.environ.get("BINANCE_API_KEY", ""))
+        api_secret = (os.environ.get("BINANCE_LIVE_SECRET")
+                      or os.environ.get("BINANCE_SECRET", ""))
         key_type   = os.environ.get("BINANCE_LIVE_KEY_TYPE", "auto")
     elif trading_mode == "demo":
-        api_key    = os.environ.get("BINANCE_DEMO_KEY", "")
-        api_secret = os.environ.get("BINANCE_DEMO_SECRET", "")
+        api_key    = (os.environ.get("BINANCE_DEMO_KEY")
+                      or os.environ.get("BINANCE_API_KEY", ""))
+        api_secret = (os.environ.get("BINANCE_DEMO_SECRET")
+                      or os.environ.get("BINANCE_SECRET", ""))
         key_type   = "hmac"
     else:
         api_key = api_secret = key_type = ""

@@ -355,17 +355,39 @@ async def lifespan(app: FastAPI):
     # BinanceClient for order placement (demo/live only)
     _binance_client = None
     if cfg.trading_mode in ("demo", "live"):
-        from binance_client import BinanceClient, BinanceMode
-        mode = BinanceMode.DEMO if cfg.trading_mode == "demo" else BinanceMode.LIVE
-        _binance_client = BinanceClient(
-            api_key=cfg.api_key,
-            api_secret=cfg.api_secret,
-            mode=mode,
-            market="futures",
-            key_type=cfg.key_type,
-        )
-        await _binance_client.start()
-        await _binance_client.subscribe_user_data(_on_user_data)
+        if not cfg.api_key or not cfg.api_secret:
+            logger.warning(
+                "*** %s mode selected but API keys are missing — "
+                "falling back to paper simulation. "
+                "Set BINANCE_LIVE_KEY / BINANCE_LIVE_SECRET (live) or "
+                "BINANCE_DEMO_KEY / BINANCE_DEMO_SECRET (demo). ***",
+                cfg.trading_mode.upper(),
+            )
+        else:
+            try:
+                from binance_client import BinanceClient, BinanceMode
+                mode = BinanceMode.DEMO if cfg.trading_mode == "demo" else BinanceMode.LIVE
+                _binance_client = BinanceClient(
+                    api_key=cfg.api_key,
+                    api_secret=cfg.api_secret,
+                    mode=mode,
+                    market="futures",
+                    key_type=cfg.key_type,
+                )
+                await _binance_client.start()
+                await _binance_client.subscribe_user_data(_on_user_data)
+            except Exception as exc:
+                logger.error(
+                    "BinanceClient startup failed (%s) — falling back to paper simulation. "
+                    "Check your API keys and network.",
+                    exc,
+                )
+                if _binance_client:
+                    try:
+                        await _binance_client.stop()
+                    except Exception:
+                        pass
+                _binance_client = None
 
     _executor = OrderExecutor(_binance_client, _rest, cfg.trading_mode)
     await _executor.init()
@@ -664,17 +686,42 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 _binance_client = None
 
             if new_mode in ("demo", "live"):
-                from binance_client import BinanceClient, BinanceMode
-                bc_mode = BinanceMode.DEMO if new_mode == "demo" else BinanceMode.LIVE
-                _binance_client = BinanceClient(
-                    api_key=cfg2.api_key,
-                    api_secret=cfg2.api_secret,
-                    mode=bc_mode,
-                    market="futures",
-                    key_type=cfg2.key_type,
-                )
-                await _binance_client.start()
-                await _binance_client.subscribe_user_data(_on_user_data)
+                if not cfg2.api_key or not cfg2.api_secret:
+                    logger.warning(
+                        "Mode → %s but API keys missing — orders will be simulated. "
+                        "Set BINANCE_LIVE_KEY/BINANCE_LIVE_SECRET (live) or "
+                        "BINANCE_DEMO_KEY/BINANCE_DEMO_SECRET (demo).",
+                        new_mode.upper(),
+                    )
+                    await ws.send_text(json.dumps({
+                        "type": "notification",
+                        "text": f"⚠ {new_mode.upper()} mode: API keys missing — simulating orders",
+                    }))
+                else:
+                    try:
+                        from binance_client import BinanceClient, BinanceMode
+                        bc_mode = BinanceMode.DEMO if new_mode == "demo" else BinanceMode.LIVE
+                        _binance_client = BinanceClient(
+                            api_key=cfg2.api_key,
+                            api_secret=cfg2.api_secret,
+                            mode=bc_mode,
+                            market="futures",
+                            key_type=cfg2.key_type,
+                        )
+                        await _binance_client.start()
+                        await _binance_client.subscribe_user_data(_on_user_data)
+                    except Exception as exc:
+                        logger.error("BinanceClient init failed on mode change: %s", exc)
+                        if _binance_client:
+                            try:
+                                await _binance_client.stop()
+                            except Exception:
+                                pass
+                        _binance_client = None
+                        await ws.send_text(json.dumps({
+                            "type": "notification",
+                            "text": f"⚠ {new_mode.upper()} mode: exchange connection failed — check API keys",
+                        }))
 
             _executor = OrderExecutor(_binance_client, _rest, new_mode)
             await _executor.init()
