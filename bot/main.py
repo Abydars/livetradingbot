@@ -171,9 +171,12 @@ async def _maybe_switch_symbol(cfg) -> None:
             return
         new_sym = top[0]["symbol"]
         if new_sym != cfg.symbol:
+            global _last_candles_fetch
             logger.info("Auto-switch: %s → %s", cfg.symbol, new_sym)
             await set_config_bulk({"symbol": new_sym})
             await _ws.switch_symbol(new_sym)
+            _last_candles_fetch = 0.0
+            await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
             await _do_broadcast({
                 "type":       "notification",
                 "text":       f"Auto-switched: {cfg.symbol} → {new_sym}",
@@ -437,12 +440,16 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         }))
 
     elif mtype == "set_config":
+        global _last_candles_fetch
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
         await set_config_bulk(updates)
         # Reload WS subscription if symbol changed
         if "symbol" in updates:
             new_sym = updates["symbol"]
             await _ws.switch_symbol(new_sym)
+            # Reset candle timer so the ticker loop fetches immediately
+            _last_candles_fetch = 0.0
+            await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await ws.send_text(json.dumps({"type": "config_saved", "ok": True}))
 
     elif mtype == "get_config":

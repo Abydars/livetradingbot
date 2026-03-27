@@ -68,6 +68,18 @@ class TradingEngine:
         self.candles: List[Dict] = []
 
     # ------------------------------------------------------------------
+    # Session broadcast helper
+    # ------------------------------------------------------------------
+
+    def _push_session(self) -> None:
+        """Push current session + hedges state to all connected WS clients."""
+        self._broadcast({
+            "type":    "session",
+            "session": self._session,
+            "hedges":  self._hedges,
+        })
+
+    # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
 
@@ -172,6 +184,7 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._push_session()
 
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
             "symbol":    cfg.symbol,
@@ -359,6 +372,7 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._push_session()
 
         await log_signal(cfg.symbol, direction, 0.0, {}, "dca")
         await notify(cfg.discord_webhook, "TRADE_DCA", {
@@ -411,6 +425,7 @@ class TradingEngine:
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
+        self._push_session()
 
         await log_signal(cfg.symbol, hedge_dir, 0.0, {}, "hedge")
         await notify(cfg.discord_webhook, "HEDGE_OPEN", {
@@ -456,6 +471,7 @@ class TradingEngine:
                 msg = f"{'[PAPER] ' if cfg.paper_mode else ''}HEDGE CLOSED (TP) @ {fill_price:.4f}"
                 logger.info("TradingEngine: %s", msg)
                 self._broadcast({"type": "notification", "text": msg})
+                self._push_session()
 
                 # If main is also profitable, close everything
                 if main_pnl_pct >= cfg.min_profit_pct:
@@ -524,9 +540,11 @@ class TradingEngine:
         })
 
         self._session = None
+        self._hedges  = []
         self._trail_activated = False
         self._trail_price = None
         self._dca_pending_since = None
+        self._push_session()
 
     async def _emergency_close(
         self,

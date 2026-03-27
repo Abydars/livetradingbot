@@ -542,6 +542,35 @@
     .act.hedge { background: rgba(210,168,255,.15);color: var(--purple); }
     .act.close { background: rgba(248,81,73,.15);  color: var(--red); }
 
+    /* ── symbol switch overlay ── */
+    #sym-loader {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(7,9,14,.75);
+      z-index: 300;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+    }
+    #sym-loader.show { display: flex; }
+
+    .spin {
+      width: 28px; height: 28px;
+      border: 2px solid var(--border);
+      border-top-color: var(--green);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #sym-loader-text {
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: .05em;
+    }
+
     /* ── notification toasts ── */
     #notif-wrap {
       position: fixed;
@@ -732,6 +761,12 @@
 <!-- Notification toasts -->
 <div id="notif-wrap"></div>
 
+<!-- ═══════════════════════════════════════════ SYMBOL LOADER ══ -->
+<div id="sym-loader">
+  <div class="spin"></div>
+  <div id="sym-loader-text">Switching symbol…</div>
+</div>
+
 <!-- ═══════════════════════════════════════════ CONFIG MODAL ══ -->
 <div id="cfg-modal-overlay" onclick="onOverlayClick(event)">
   <div id="cfg-modal">
@@ -872,14 +907,25 @@ function dispatch(msg) {
       currentSymbol = msg.symbol || 'BTCUSDT';
       updatePaperBadge();
       setSymbolSelect(currentSymbol);
+      hideSymLoader();
       break;
 
     case 'price':
       updatePrice(msg.price);
       break;
 
+    case 'symbol_ready':
+      setSymbolSelect(msg.symbol);
+      // candles will follow immediately; loader hides on first candle
+      document.getElementById('sym-loader-text').textContent =
+        `Loading ${msg.symbol} data…`;
+      break;
+
     case 'candles':
-      if (msg.candles?.length) processCandleUpdate(msg.candles);
+      if (msg.candles?.length) {
+        processCandleUpdate(msg.candles);
+        hideSymLoader();   // data arrived — switch complete
+      }
       break;
 
     case 'indicators':
@@ -1441,11 +1487,25 @@ function setSymbolSelect(sym) {
   if (sel) sel.value = sym;
 }
 
+let _symLoaderTimer = null;
+
+function showSymLoader(sym) {
+  document.getElementById('sym-loader-text').textContent = `Switching to ${sym}…`;
+  document.getElementById('sym-loader').classList.add('show');
+  // Safety fallback: hide after 8s even if server never responds
+  clearTimeout(_symLoaderTimer);
+  _symLoaderTimer = setTimeout(hideSymLoader, 8000);
+}
+
+function hideSymLoader() {
+  clearTimeout(_symLoaderTimer);
+  document.getElementById('sym-loader').classList.remove('show');
+}
+
 function changeSymbol(sym) {
   currentSymbol = sym;
+  showSymLoader(sym);
   wsSend({ type: 'set_config', config: { symbol: sym } });
-  wsSend({ type: 'get_candles' });
-  showToast(`Symbol → ${sym}`, 'info');
 }
 
 // Paper badge
