@@ -373,6 +373,23 @@
     #btn-trade.active:hover { background: rgba(248,81,73,.12); }
 
     /* delete buttons in trade history */
+    #btn-close-pos {
+      display: block;
+      width: 100%;
+      margin-top: 10px;
+      padding: 6px 0;
+      background: rgba(248,81,73,.1);
+      border: 1px solid var(--red);
+      color: var(--red);
+      font-family: var(--font);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    #btn-close-pos:hover { background: rgba(248,81,73,.22); }
+
     .btn-del {
       background: none;
       border: 1px solid var(--border);
@@ -1705,6 +1722,7 @@ function updatePositionPanel() {
     ${pr('Hedge #',   s.hedge_count)}
     ${pr('Duration',  fmtDur(elapsed))}
     <div id="pos-pnl-row" class="pr"><span class="prk">Unrealised PnL</span><span class="prv" id="pos-pnl">--</span></div>
+    <button id="btn-close-pos" onclick="closePosition()">✕ CLOSE POSITION</button>
   `;
 
   refreshPnL();
@@ -2075,6 +2093,12 @@ function initTabs() {
       }
     });
   });
+}
+
+// Manual position close
+function closePosition() {
+  if (!confirm('Close the current position at market price?')) return;
+  wsSend({ type: 'manual_close' });
 }
 
 // Start/Stop trading

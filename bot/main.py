@@ -542,6 +542,16 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             }))
             await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 
+    elif mtype == "manual_close":
+        if _engine and _engine._session:
+            cfg2 = await load_config()
+            price = _last_price or await _rest.get_mark_price(cfg2.symbol)
+            await _engine.force_close_all(cfg2, price)
+        else:
+            await ws.send_text(json.dumps({
+                "type": "notification", "text": "No open position to close",
+            }))
+
     elif mtype == "delete_all_sessions":
         await delete_all_sessions()
         sessions = await get_sessions(200)
