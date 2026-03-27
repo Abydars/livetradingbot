@@ -256,12 +256,88 @@
     .cgo { color: var(--gold); }
     .cm  { color: var(--muted); }
 
-    /* ── config tab ── */
-    #cfg-form {
-      padding: 12px;
-      overflow-y: auto;
-      height: 100%;
+    /* ── config modal ── */
+    #cfg-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.65);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
     }
+    #cfg-modal-overlay.open { display: flex; }
+
+    #cfg-modal {
+      background: var(--bg1);
+      border: 1px solid var(--border);
+      width: 520px;
+      max-width: 96vw;
+      max-height: 86vh;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 16px 48px rgba(0,0,0,.6);
+      animation: modalIn .15s ease-out;
+    }
+    @keyframes modalIn {
+      from { transform: translateY(-12px); opacity: 0; }
+      to   { transform: translateY(0);    opacity: 1; }
+    }
+
+    #cfg-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #cfg-modal-head span {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .1em;
+      color: var(--text);
+    }
+    #cfg-modal-close {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+      font-family: var(--font);
+      padding: 0 2px;
+    }
+    #cfg-modal-close:hover { color: var(--text); }
+
+    #cfg-form {
+      padding: 14px 16px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    #cfg-modal-foot {
+      display: flex;
+      align-items: center;
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    /* cfg button in header */
+    #btn-cfg {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 3px 10px;
+      cursor: pointer;
+      letter-spacing: .05em;
+    }
+    #btn-cfg:hover { color: var(--text); border-color: var(--muted); }
+
     .cs-title {
       font-size: 10px;
       font-weight: 600;
@@ -505,6 +581,8 @@
   <span id="live-price">——</span>
   <span id="paper-badge">PAPER</span>
   <div class="hspacer"></div>
+  <button id="btn-cfg" onclick="openCfgModal()">⚙ CONFIG</button>
+  <div class="hdiv"></div>
   <div id="ws-status">
     <span id="ws-dot"></span>
     <span id="ws-label">connecting…</span>
@@ -539,7 +617,6 @@
       <nav id="tab-nav">
         <button class="tbtn active" data-tab="history">TRADE HISTORY</button>
         <button class="tbtn" data-tab="signals">SIGNAL LOG</button>
-        <button class="tbtn" data-tab="config">CONFIG</button>
       </nav>
 
       <div id="tab-body">
@@ -585,11 +662,6 @@
               </tbody>
             </table>
           </div>
-        </div>
-
-        <!-- Config -->
-        <div class="tpane" id="tab-config">
-          <div id="cfg-form"><!-- rendered by JS --></div>
         </div>
 
       </div><!-- /tab-body -->
@@ -659,6 +731,21 @@
 
 <!-- Notification toasts -->
 <div id="notif-wrap"></div>
+
+<!-- ═══════════════════════════════════════════ CONFIG MODAL ══ -->
+<div id="cfg-modal-overlay" onclick="onOverlayClick(event)">
+  <div id="cfg-modal">
+    <div id="cfg-modal-head">
+      <span>CONFIG</span>
+      <button id="cfg-modal-close" onclick="closeCfgModal()">✕</button>
+    </div>
+    <div id="cfg-form"><!-- rendered by JS --></div>
+    <div id="cfg-modal-foot">
+      <button class="cfg-btn" onclick="saveConfig()">SAVE</button>
+      <button class="cfg-btn danger" onclick="resetBot()">RESET BOT</button>
+    </div>
+  </div>
+</div>
 
 <script>
 /* ═══════════════════════════════════════════════════════
@@ -1270,8 +1357,6 @@ function renderConfig(cfg) {
       }
     }
   }
-  html += `<button class="cfg-btn" onclick="saveConfig()">SAVE CONFIG</button>`;
-  html += `<button class="cfg-btn danger" onclick="resetBot()">RESET BOT</button>`;
   document.getElementById('cfg-form').innerHTML = html;
 }
 
@@ -1350,18 +1435,34 @@ function initTabs() {
       btn.classList.add('active');
       document.getElementById('tab-' + tab).classList.add('active');
 
-      // lazy-load data on tab switch
       if (tab === 'history') {
-        wsSend({ type: 'get_sessions',    limit: 200 });
+        wsSend({ type: 'get_sessions',   limit: 200 });
         wsSend({ type: 'get_performance' });
       } else if (tab === 'signals') {
-        wsSend({ type: 'get_signal_log',  limit: 200 });
-      } else if (tab === 'config') {
-        wsSend({ type: 'get_config' });
+        wsSend({ type: 'get_signal_log', limit: 200 });
       }
     });
   });
 }
+
+// Config modal
+function openCfgModal() {
+  wsSend({ type: 'get_config' });
+  document.getElementById('cfg-modal-overlay').classList.add('open');
+}
+
+function closeCfgModal() {
+  document.getElementById('cfg-modal-overlay').classList.remove('open');
+}
+
+function onOverlayClick(e) {
+  if (e.target === document.getElementById('cfg-modal-overlay')) closeCfgModal();
+}
+
+// Close on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeCfgModal();
+});
 
 // Notification toasts
 function showToast(text, type = '') {
