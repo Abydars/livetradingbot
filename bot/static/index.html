@@ -1084,6 +1084,7 @@ let _entryLine = null;
 let _tpLine    = null;
 let _slLine    = null;
 let _trailLine = null;
+let _hedgeLines = [];   // one price line per open hedge
 
 // entry/exit markers [ {time, position, color, shape, text} ]
 let _markers = [];
@@ -1508,6 +1509,8 @@ function clearTradeLevels() {
   _tpLine    = _removeLine(_tpLine);
   _slLine    = _removeLine(_slLine);
   _trailLine = _removeLine(_trailLine);
+  _hedgeLines.forEach(l => _removeLine(l));
+  _hedgeLines = [];
 }
 
 function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
@@ -1595,6 +1598,21 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
       title:            'Trail',
     });
   }
+
+  // Hedge entry lines (purple dashed, one per open hedge)
+  _hedgeLines.forEach(l => _removeLine(l));
+  _hedgeLines = [];
+  curHedges.filter(h => h.status === 'open').forEach((h, i) => {
+    const line = csSeries.createPriceLine({
+      price:            h.entry_price,
+      color:            '#d2a8ff',
+      lineWidth:        1,
+      lineStyle:        LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title:            `HDG${i + 1} ${h.direction[0]}`,
+    });
+    _hedgeLines.push(line);
+  });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1731,13 +1749,25 @@ function updatePositionPanel() {
   const openHedges = curHedges.filter(h => h.status === 'open');
   if (openHedges.length) {
     hedgeCard.style.display = 'block';
-    hedgeEl.innerHTML = openHedges.map(h => {
+    hedgeEl.innerHTML = openHedges.map((h, i) => {
       const hdir = h.direction === 'LONG' ? 'long' : 'short';
+      const hPnl = lastPrice
+        ? (h.direction === 'LONG'
+            ? (lastPrice - h.entry_price) * h.qty
+            : (h.entry_price - lastPrice) * h.qty)
+        : null;
+      const hPnlTxt = hPnl !== null
+        ? `${hPnl >= 0 ? '+' : ''}$${hPnl.toFixed(2)}`
+        : '--';
+      const hPnlCls = hPnl !== null ? (hPnl >= 0 ? 'cg' : 'cr') : '';
+      const elapsed = h.open_time ? (Date.now() / 1000 - h.open_time) : 0;
       return `<div class="hedge-box">
-        ${pr('Dir',    `<span class="prv ${hdir}">${h.direction}</span>`)}
-        ${pr('Entry',  fmtPrice(h.entry_price))}
-        ${pr('Qty',    h.qty)}
-        ${pr('Margin', '$' + h.margin.toFixed(2))}
+        <div class="pr"><span class="prk">Hedge #${i + 1}</span><span class="prv ${hdir}">${h.direction}</span></div>
+        ${pr('Entry',    fmtPrice(h.entry_price))}
+        ${pr('Qty',      h.qty)}
+        ${pr('Margin',   '$' + h.margin.toFixed(2))}
+        ${pr('Duration', fmtDur(elapsed))}
+        <div class="pr"><span class="prk">Unreal PnL</span><span class="prv hedge-pnl ${hPnlCls}" data-dir="${h.direction}" data-entry="${h.entry_price}" data-qty="${h.qty}">${hPnlTxt}</span></div>
       </div>`;
     }).join('');
   } else {
@@ -1746,16 +1776,35 @@ function updatePositionPanel() {
 }
 
 function refreshPnL() {
+  if (!lastPrice) return;
+
+  // Main position PnL
   const el = document.getElementById('pos-pnl');
-  if (!el || !curSession || !lastPrice) return;
-  const s   = curSession;
-  const raw = s.direction === 'LONG'
-    ? (lastPrice - s.avg_price) * s.qty
-    : (s.avg_price - lastPrice) * s.qty;
-  const pct  = s.margin > 0 ? (raw / s.margin * 100) : 0;
-  const sign = raw >= 0 ? '+' : '';
-  el.textContent = `${sign}$${raw.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
-  el.className   = 'prv ' + (raw >= 0 ? 'pnlp' : 'pnln');
+  if (el && curSession) {
+    const s   = curSession;
+    const raw = s.direction === 'LONG'
+      ? (lastPrice - s.avg_price) * s.qty
+      : (s.avg_price - lastPrice) * s.qty;
+    const pct  = s.margin > 0 ? (raw / s.margin * 100) : 0;
+    const sign = raw >= 0 ? '+' : '';
+    el.textContent = `${sign}$${raw.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
+    el.className   = 'prv ' + (raw >= 0 ? 'pnlp' : 'pnln');
+  }
+
+  // Hedge PnLs
+  document.querySelectorAll('.hedge-pnl').forEach(span => {
+    const dir   = span.dataset.dir;
+    const entry = parseFloat(span.dataset.entry);
+    const qty   = parseFloat(span.dataset.qty);
+    if (!dir || isNaN(entry) || isNaN(qty)) return;
+    const pnl  = dir === 'LONG' ? (lastPrice - entry) * qty : (entry - lastPrice) * qty;
+    const sign = pnl >= 0 ? '+' : '';
+    span.textContent = `${sign}$${pnl.toFixed(2)}`;
+    span.className   = `prv hedge-pnl ${pnl >= 0 ? 'cg' : 'cr'}`;
+    span.dataset.dir   = dir;
+    span.dataset.entry = entry;
+    span.dataset.qty   = qty;
+  });
 }
 
 // helper: position row
