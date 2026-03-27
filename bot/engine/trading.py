@@ -62,8 +62,11 @@ class TradingEngine:
         # DCA adverse pressure timer
         self._dca_pending_since: Optional[float] = None
 
-        # Adaptive risk parameters (computed from ATR each tick, price %)
+        # Adaptive risk parameters — two copies:
+        #   _adaptive      : refreshed every tick (current market conditions)
+        #   _entry_adaptive: locked at trade entry, used for ALL SL/TP decisions
         self._adaptive: Dict[str, float] = {}
+        self._entry_adaptive: Dict[str, float] = {}
 
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
@@ -77,11 +80,13 @@ class TradingEngine:
     def _push_session(self) -> None:
         """Push current session + hedges + trade-level prices to all WS clients."""
         tp_price = sl_price = None
-        if self._session and self._adaptive:
+        # Always use the LOCKED entry adaptive so displayed levels never drift
+        ref = self._entry_adaptive or self._adaptive
+        if self._session and ref:
             avg = self._session["avg_price"]
             d   = self._session["direction"]
-            tp  = self._adaptive["tp_pct"]
-            sl  = self._adaptive["hard_stop_pct"]
+            tp  = ref["tp_pct"]
+            sl  = ref["hard_stop_pct"]
             if d == "LONG":
                 tp_price = avg * (1 + tp / 100)
                 sl_price = avg * (1 - sl / 100)
@@ -111,12 +116,12 @@ class TradingEngine:
         """
         atr_pct = (atr / price * 100) if price > 0 else 1.0
         return {
-            "tp_pct":            max(atr_pct * 2.0, 0.5),   # TP: 2× ATR
-            "trail_pct":         max(atr_pct * 0.8, 0.15),  # trail: 0.8× ATR
-            "min_profit_pct":    max(atr_pct * 0.3, 0.05),  # min to close: 0.3× ATR
-            "dca_step_pct":      max(atr_pct * 1.5, 0.3),   # DCA: 1.5× ATR
-            "hedge_trigger_pct": max(atr_pct * 3.5, 0.8),   # hedge: 3.5× ATR
-            "hard_stop_pct":     max(atr_pct * 7.0, 2.0),   # stop: 7× ATR
+            "tp_pct":            max(atr_pct * 2.5, 0.8),   # TP: 2.5× ATR, min 0.8%
+            "trail_pct":         max(atr_pct * 1.0, 0.25),  # trail: 1.0× ATR, min 0.25%
+            "min_profit_pct":    max(atr_pct * 0.3, 0.10),  # min to close: 0.3× ATR, min 0.10%
+            "dca_step_pct":      max(atr_pct * 1.5, 0.50),  # DCA: 1.5× ATR, min 0.50%
+            "hedge_trigger_pct": max(atr_pct * 3.0, 1.00),  # hedge: 3.0× ATR, min 1.00%
+            "hard_stop_pct":     max(atr_pct * 5.0, 2.00),  # stop: 5.0× ATR, min 2.00%
         }
 
     # ------------------------------------------------------------------
@@ -188,6 +193,19 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
+        # Validate market conditions before committing to a trade
+        if atr_val <= 0:
+            logger.info("TradingEngine: skipping entry — ATR unavailable")
+            return
+        entry_adaptive = self._compute_adaptive(atr_val, price)
+        if entry_adaptive["tp_pct"] < 0.4:
+            logger.info(
+                "TradingEngine: skipping entry — TP too tight (%.3f%% < 0.40%%)",
+                entry_adaptive["tp_pct"],
+            )
+            await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
+            return
+
         qty = self._rest.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
@@ -214,6 +232,7 @@ class TradingEngine:
         self._trail_activated = False
         self._trail_price = None
         self._dca_pending_since = None
+        self._entry_adaptive = entry_adaptive  # locked for life of this trade
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
 
@@ -255,10 +274,23 @@ class TradingEngine:
         dca_count   = sess["dca_count"]
         hedge_count = sess["hedge_count"]
 
-        # Update adaptive params from current ATR
+        # Refresh _adaptive with current ATR for informational purposes
         if atr_val > 0 and price > 0:
             self._adaptive = self._compute_adaptive(atr_val, price)
-        p = self._adaptive or self._compute_adaptive(price * 0.005, price)
+
+        # _entry_adaptive is locked at entry; if missing (e.g. after a restart),
+        # initialise from current ATR once and keep it fixed from here on.
+        if not self._entry_adaptive:
+            self._entry_adaptive = self._adaptive or self._compute_adaptive(price * 0.005, price)
+            logger.info(
+                "TradingEngine: entry_adaptive initialised from current ATR "
+                "(tp=%.3f%% sl=%.3f%%)",
+                self._entry_adaptive["tp_pct"],
+                self._entry_adaptive["hard_stop_pct"],
+            )
+
+        # ALL risk decisions use the locked entry levels — never the live ATR
+        p = self._entry_adaptive
 
         # Un-leveraged price movement (positive = favourable for direction)
         if direction == "LONG":
@@ -577,6 +609,7 @@ class TradingEngine:
         self._trail_activated = False
         self._trail_price = None
         self._dca_pending_since = None
+        self._entry_adaptive = {}
         self._push_session()
 
     async def _emergency_close(
