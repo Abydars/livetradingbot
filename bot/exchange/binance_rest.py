@@ -9,6 +9,7 @@ Paper-mode: order placement/cancellation returns a simulated response at the
 current mark price without touching Binance.
 """
 import asyncio
+import base64
 import hashlib
 import hmac
 import logging
@@ -22,6 +23,36 @@ logger = logging.getLogger(__name__)
 
 _BASE = "https://fapi.binance.com"
 _RECV_WINDOW = 5000
+
+# Ed25519 signing (requires: pip install cryptography)
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    _ED25519_AVAILABLE = True
+except ImportError:
+    _ED25519_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Key-type resolution helper
+# ---------------------------------------------------------------------------
+
+def _resolve_key_type(api_secret: str, key_type: str):
+    """Return (resolved_key_type, ed25519_key_or_None)."""
+    if key_type == "ed25519":
+        if not _ED25519_AVAILABLE:
+            raise ImportError("cryptography package required for Ed25519 keys")
+        key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(api_secret))
+        return "ed25519", key
+    if key_type == "hmac":
+        return "hmac", None
+    # "auto" — try Ed25519 first, fall back to HMAC
+    if _ED25519_AVAILABLE and api_secret:
+        try:
+            key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(api_secret))
+            return "ed25519", key
+        except Exception:
+            pass
+    return "hmac", None
 
 
 # ---------------------------------------------------------------------------
@@ -80,21 +111,54 @@ class BinanceRestClient:
         await client.close()
     """
 
-    def __init__(self, api_key: str, api_secret: str, paper_mode: bool = True) -> None:
-        self._key = api_key
-        self._secret = api_secret
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        paper_mode: bool = True,
+        key_type: str = "auto",
+    ) -> None:
         self.paper_mode = paper_mode
+        self._order_limiter = _RateLimiter(5)
+        self._market_limiter = _RateLimiter(20)
+        # symbol → SymbolInfo, populated by init()
+        self.symbol_info: Dict[str, SymbolInfo] = {}
+        # httpx client + signing — initialised via set_credentials
+        self._client: Optional[httpx.AsyncClient] = None
+        self._key = ""
+        self._secret = ""
+        self._key_type = "hmac"
+        self._ed25519_key = None
+        self._set_credentials_sync(api_key, api_secret, key_type)
 
-        self._client = httpx.AsyncClient(
+    def _set_credentials_sync(self, api_key: str, api_secret: str, key_type: str) -> None:
+        """Set signing credentials and (re)create the httpx client."""
+        self._key    = api_key
+        self._secret = api_secret
+        self._key_type, self._ed25519_key = _resolve_key_type(api_secret, key_type)
+        new_client = httpx.AsyncClient(
             base_url=_BASE,
             headers={"X-MBX-APIKEY": api_key},
             timeout=10.0,
         )
-        self._order_limiter = _RateLimiter(5)
-        self._market_limiter = _RateLimiter(20)
+        old_client = self._client
+        self._client = new_client
+        if old_client is not None:
+            # Schedule close of old client without blocking
+            asyncio.get_event_loop().call_soon(
+                lambda: asyncio.ensure_future(old_client.aclose())
+            )
+        logger.info(
+            "BinanceRestClient credentials updated | key_type=%s paper=%s",
+            self._key_type, self.paper_mode,
+        )
 
-        # symbol → SymbolInfo, populated by init()
-        self.symbol_info: Dict[str, SymbolInfo] = {}
+    async def set_credentials(
+        self, api_key: str, api_secret: str, paper_mode: bool, key_type: str = "auto"
+    ) -> None:
+        """Update credentials after a mode change (symbol_info cache preserved)."""
+        self.paper_mode = paper_mode
+        self._set_credentials_sync(api_key, api_secret, key_type)
 
     async def init(self) -> None:
         """Fetch exchange info and populate symbol metadata."""
@@ -111,11 +175,14 @@ class BinanceRestClient:
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = _RECV_WINDOW
         query = urllib.parse.urlencode(params)
-        sig = hmac.new(
-            self._secret.encode(),
-            query.encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        if self._key_type == "ed25519":
+            sig = base64.b64encode(self._ed25519_key.sign(query.encode())).decode()
+        else:
+            sig = hmac.new(
+                self._secret.encode(),
+                query.encode(),
+                hashlib.sha256,
+            ).hexdigest()
         params["signature"] = sig
         return params
 
