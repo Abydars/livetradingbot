@@ -201,11 +201,12 @@ class WSConnection:
         and >= 12 (ClientConnection, no .closed attribute)
     """
 
-    def __init__(self, url: str, name: str = "ws"):
+    def __init__(self, url: str, name: str = "ws", on_error: Callable = None):
         self.url = url
         self.name = name
         self._ws = None   # WebSocketClientProtocol or ClientConnection
         self._handlers: List[Callable] = []
+        self._on_error = on_error
         self._running = False
         self._ready = asyncio.Event()
 
@@ -280,11 +281,17 @@ class WSConnection:
                 if not self._running:
                     break
                 self._ready.clear()
-                logger.warning("[%s] Disconnected (%s). Reconnecting in %ds...", self.name, e, backoff)
+                msg = f"[{self.name}] Disconnected: {e}. Reconnecting in {backoff}s…"
+                logger.warning(msg)
+                if self._on_error:
+                    self._on_error(msg)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:
-                logger.error("[%s] Unexpected error: %s", self.name, e)
+                msg = f"[{self.name}] Unexpected error: {e}"
+                logger.error(msg)
+                if self._on_error:
+                    self._on_error(msg)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -321,6 +328,7 @@ class BinanceClient:
         market: str = "futures",   # "futures" or "spot"
         recv_window: int = 5000,
         key_type: str = "auto",    # "auto" | "hmac" | "ed25519"
+        on_error: Callable = None,  # optional callback(msg: str) for WS errors
         # Rate limits (Binance default: 1200 weight/min, 300 orders/10s)
         order_rate_capacity: int = 300,
         order_rate_refill: float = 30.0,   # tokens/sec → 300/10s
@@ -366,6 +374,7 @@ class BinanceClient:
 
         # REST session (persistent, connection pooling)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._on_error = on_error
 
         # WebSocket API connection (order placement)
         self._ws_api: Optional[WSConnection] = None
@@ -612,7 +621,7 @@ class BinanceClient:
         if not self._ws_api_url:
             logger.info("WS API not available in %s mode — orders will use REST", self.mode.value)
             return
-        self._ws_api = WSConnection(self._ws_api_url, name="ws-api")
+        self._ws_api = WSConnection(self._ws_api_url, name="ws-api", on_error=self._on_error)
         self._ws_api.add_handler(self._on_ws_api_message)
         await self._ws_api.start()
 
@@ -1136,7 +1145,7 @@ class BinanceClient:
     async def _subscribe_stream(self, stream_name: str, callback: Callable):
         if stream_name not in self._streams:
             url = f"{self._ws_stream_url}/ws/{stream_name}"
-            ws = WSConnection(url, name=stream_name)
+            ws = WSConnection(url, name=stream_name, on_error=self._on_error)
             self._stream_handlers[stream_name] = []
             ws.add_handler(self._make_stream_handler(stream_name))
             self._streams[stream_name] = ws
@@ -1159,7 +1168,7 @@ class BinanceClient:
         logger.info("User data stream listenKey obtained")
 
         url = f"{self._ws_stream_url}/ws/{self._listen_key}"
-        self._user_stream_ws = WSConnection(url, name="user-data-stream")
+        self._user_stream_ws = WSConnection(url, name="user-data-stream", on_error=self._on_error)
         self._user_stream_ws.add_handler(self._on_user_data)
         await self._user_stream_ws.start()
 
