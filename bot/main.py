@@ -26,18 +26,22 @@ from database import (
     delete_all_sessions,
     delete_session,
     get_config,
+    get_open_session,
+    get_open_hedges,
     get_performance,
     get_sessions,
     get_signal_log,
     init_db,
     set_config,
     set_config_bulk,
+    update_session,
 )
 from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
 from engine.trading import TradingEngine
 from exchange.binance_rest import BinanceRestClient
 from exchange.binance_ws import BinanceWebSocket
+from exchange.order_executor import OrderExecutor
 from notifications import notify
 
 logging.basicConfig(
@@ -55,6 +59,8 @@ _rest: Optional[BinanceRestClient] = None
 _ws:   Optional[BinanceWebSocket]  = None
 _flow  = OrderFlowAnalyzer(window_seconds=30, depth_levels=5)
 _engine: Optional[TradingEngine]   = None
+_executor: Optional[OrderExecutor] = None
+_binance_client = None  # BinanceClient instance (demo/live only)
 
 # Connected WebSocket clients
 _clients: Set[WebSocket] = set()
@@ -244,9 +250,9 @@ async def _scan_symbols(cfg) -> None:
             "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
         })
         await notify(cfg.discord_webhook, "AUTO_SWITCH", {
-            "old_symbol": cfg.symbol,
-            "new_symbol": new_sym,
-            "paper":      cfg.paper_mode,
+            "old_symbol":   cfg.symbol,
+            "new_symbol":   new_sym,
+            "trading_mode": cfg.trading_mode,
         })
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
@@ -282,12 +288,47 @@ def _on_depth(event: Dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# User data stream callback (fill price sync)
+# ---------------------------------------------------------------------------
+
+async def _on_user_data(event: dict) -> None:
+    """
+    Sync actual fill prices from Binance user data stream.
+    ORDER_TRADE_UPDATE fires on every order state change.
+    When status=FILLED, ap=average fill price, z=cumulative filled qty.
+    """
+    if event.get("e") != "ORDER_TRADE_UPDATE":
+        return
+    o = event.get("o", {})
+    if o.get("X") != "FILLED":
+        return
+    avg_price  = float(o.get("ap", 0))
+    filled_qty = float(o.get("z", 0))
+    symbol     = o.get("s", "")
+    order_id   = o.get("i")
+    logger.info(
+        "Fill: orderId=%s %s avgPrice=%.4f qty=%.4f",
+        order_id, symbol, avg_price, filled_qty,
+    )
+    # If engine has an open session and fill price differs, update DB
+    if _engine and _engine._session and avg_price > 0:
+        sess = _engine._session
+        if abs(sess["avg_price"] - avg_price) > 0.001 * avg_price:
+            await update_session(sess["id"], avg_price=avg_price)
+            _engine._session = await get_open_session()
+            logger.info(
+                "Fill sync: updated session avg_price %.4f → %.4f",
+                sess["avg_price"], avg_price,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _rest, _ws, _engine, _trading_active
+    global _rest, _ws, _engine, _executor, _binance_client, _trading_active
 
     logger.info("=== Bot starting ===")
     await init_db()
@@ -297,10 +338,13 @@ async def lifespan(app: FastAPI):
     ta_val = await get_config("trading_active")
     _trading_active = (ta_val == "1")
     logger.info("Trading active on startup: %s", _trading_active)
+    logger.info("Trading mode: %s", cfg.trading_mode.upper())
 
     if cfg.paper_mode:
         logger.info("*** PAPER MODE ACTIVE — no real orders will be placed ***")
 
+    # REST client for: klines, exchange info, top movers, qty rounding
+    # Always uses production endpoints for market data
     _rest = BinanceRestClient(
         api_key=cfg.api_key,
         api_secret=cfg.api_secret,
@@ -308,10 +352,30 @@ async def lifespan(app: FastAPI):
     )
     await _rest.init()
 
-    _engine = TradingEngine(_rest, _flow, _broadcast)
+    # BinanceClient for order placement (demo/live only)
+    _binance_client = None
+    if cfg.trading_mode in ("demo", "live"):
+        from binance_client import BinanceClient, BinanceMode
+        mode = BinanceMode.DEMO if cfg.trading_mode == "demo" else BinanceMode.LIVE
+        _binance_client = BinanceClient(
+            api_key=cfg.api_key,
+            api_secret=cfg.api_secret,
+            mode=mode,
+            market="futures",
+            key_type=cfg.key_type,
+        )
+        await _binance_client.start()
+        await _binance_client.subscribe_user_data(_on_user_data)
+
+    _executor = OrderExecutor(_binance_client, _rest, cfg.trading_mode)
+    await _executor.init()
+
+    _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
 
-    _ws = BinanceWebSocket(cfg.symbol, on_trade=_on_trade, on_depth=_on_depth)
+    _ws = BinanceWebSocket(
+        cfg.symbol, cfg.trading_mode, on_trade=_on_trade, on_depth=_on_depth
+    )
     await _ws.start()
 
     ticker_task = asyncio.create_task(_ticker_loop())
@@ -336,6 +400,8 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await _ws.stop()
+    if _binance_client:
+        await _binance_client.stop()
     await _rest.close()
     logger.info("=== Bot stopped ===")
 
@@ -431,13 +497,13 @@ async def ws_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps({
             "type":           "init",
             "paper_mode":     cfg.paper_mode,
+            "trading_mode":   cfg.trading_mode,
             "symbol":         cfg.symbol,
             "timeframe":      cfg.timeframe,
             "trading_active": _trading_active,
         }))
 
         # Send open session state if any
-        from database import get_open_session, get_open_hedges
         sess = await get_open_session()
         if sess:
             hedges = await get_open_hedges(sess["id"])
@@ -502,7 +568,6 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         limit = int(msg.get("limit", 100))
         sessions = await get_sessions(limit)
         hedges_map: Dict[int, list] = {}
-        from database import get_open_hedges
         for s in sessions:
             if s["status"] == "open":
                 hedges_map[s["id"]] = await get_open_hedges(s["id"])
@@ -566,8 +631,9 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 
     elif mtype == "set_config":
-        global _last_candles_fetch
+        global _last_candles_fetch, _binance_client, _executor, _ws
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
+
         # Block symbol/timeframe changes while trading is active
         if _trading_active and ("symbol" in updates or "timeframe" in updates):
             await ws.send_text(json.dumps({
@@ -575,16 +641,66 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 "error": "Stop trading before changing symbol or timeframe",
             }))
             return
+
+        # Block mode change while a session is open
+        if "trading_mode" in updates and _engine and _engine._session:
+            await ws.send_text(json.dumps({
+                "type": "config_saved", "ok": False,
+                "error": "Close the open position before changing mode",
+            }))
+            return
+
         await set_config_bulk(updates)
+
+        # Handle trading_mode change — rebuild BinanceClient + executor + WS
+        if "trading_mode" in updates:
+            new_mode = updates["trading_mode"]
+            cfg2 = await load_config()
+            logger.info("Mode change → %s", new_mode.upper())
+
+            # Tear down old BinanceClient if present
+            if _binance_client:
+                await _binance_client.stop()
+                _binance_client = None
+
+            if new_mode in ("demo", "live"):
+                from binance_client import BinanceClient, BinanceMode
+                bc_mode = BinanceMode.DEMO if new_mode == "demo" else BinanceMode.LIVE
+                _binance_client = BinanceClient(
+                    api_key=cfg2.api_key,
+                    api_secret=cfg2.api_secret,
+                    mode=bc_mode,
+                    market="futures",
+                    key_type=cfg2.key_type,
+                )
+                await _binance_client.start()
+                await _binance_client.subscribe_user_data(_on_user_data)
+
+            _executor = OrderExecutor(_binance_client, _rest, new_mode)
+            await _executor.init()
+            _engine._executor = _executor
+
+            # Reconnect WS to correct stream URL for the new mode
+            await _ws.stop()
+            _ws = BinanceWebSocket(
+                cfg2.symbol, new_mode, on_trade=_on_trade, on_depth=_on_depth
+            )
+            await _ws.start()
+            _last_candles_fetch = 0.0
+
+            await _do_broadcast({"type": "mode_changed", "trading_mode": new_mode})
+
         # Reload WS subscription if symbol changed
         if "symbol" in updates:
             new_sym = updates["symbol"]
             await _ws.switch_symbol(new_sym)
             _last_candles_fetch = 0.0
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
-        # Reset candle fetch if timeframe changed so next tick fetches fresh candles
+
+        # Reset candle fetch if timeframe changed
         if "timeframe" in updates:
             _last_candles_fetch = 0.0
+
         await ws.send_text(json.dumps({"type": "config_saved", "ok": True}))
 
     elif mtype == "get_config":

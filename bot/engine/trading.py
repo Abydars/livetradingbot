@@ -28,10 +28,16 @@ from database import (
 from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
 from engine.signal import SignalEngine
-from exchange.binance_rest import BinanceRestClient
+from exchange.order_executor import OrderExecutor
 from notifications import notify
 
 logger = logging.getLogger(__name__)
+
+_MODE_PREFIXES = {"paper": "[PAPER] ", "demo": "[DEMO] ", "live": "[LIVE] "}
+
+
+def _mode_prefix(trading_mode: str) -> str:
+    return _MODE_PREFIXES.get(trading_mode, "")
 
 
 class TradingEngine:
@@ -42,11 +48,11 @@ class TradingEngine:
 
     def __init__(
         self,
-        rest: BinanceRestClient,
+        executor: OrderExecutor,
         flow: OrderFlowAnalyzer,
         broadcast: Callable[[Dict], None],
     ) -> None:
-        self._rest = rest
+        self._executor = executor
         self._flow = flow
         self._broadcast = broadcast
         self._signal_engine = SignalEngine()
@@ -229,13 +235,13 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
-        qty = self._rest.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
+        qty = self._executor.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
         side = "BUY" if direction == "LONG" else "SELL"
-        order = await self._rest.place_market_order(
+        order = await self._executor.place_market_order(
             cfg.symbol, side, qty, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
@@ -260,7 +266,7 @@ class TradingEngine:
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
 
         msg = (
-            f"{'[PAPER] ' if cfg.paper_mode else ''}"
+            f"{_mode_prefix(cfg.trading_mode)}"
             f"OPEN {direction} @ {fill_price:.4f}  "
             f"qty={qty}  margin={cfg.margin_usdt}  strength={strength:.2f}"
         )
@@ -274,7 +280,7 @@ class TradingEngine:
             "price":     fill_price,
             "margin":    cfg.margin_usdt,
             "strength":  strength,
-            "paper":     cfg.paper_mode,
+            "trading_mode": cfg.trading_mode,
         })
 
     # ------------------------------------------------------------------
@@ -461,9 +467,9 @@ class TradingEngine:
 
         self._dca_pending_since = None
 
-        new_qty = self._rest.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
+        new_qty = self._executor.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
         side = "BUY" if direction == "LONG" else "SELL"
-        order = await self._rest.place_market_order(
+        order = await self._executor.place_market_order(
             cfg.symbol, side, new_qty, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
@@ -481,7 +487,7 @@ class TradingEngine:
         self._session = await get_open_session()
 
         msg = (
-            f"{'[PAPER] ' if cfg.paper_mode else ''}"
+            f"{_mode_prefix(cfg.trading_mode)}"
             f"DCA #{dca_count+1} {direction} @ {fill_price:.4f}  "
             f"new_avg={new_avg:.4f}  total_qty={total_qty:.4f}"
         )
@@ -497,7 +503,7 @@ class TradingEngine:
             "price":     fill_price,
             "new_avg":   new_avg,
             "total_margin": self._session["margin"],
-            "paper": cfg.paper_mode,
+            "trading_mode": cfg.trading_mode,
         })
 
     # ------------------------------------------------------------------
@@ -517,7 +523,7 @@ class TradingEngine:
         # Using main_qty directly ensures full exposure is offset, not just 1×margin.
         hedge_qty  = main_qty
 
-        order = await self._rest.place_market_order(
+        order = await self._executor.place_market_order(
             cfg.symbol, hedge_side, hedge_qty, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
@@ -537,7 +543,7 @@ class TradingEngine:
         self._hedges = await get_open_hedges(self._session["id"])
 
         msg = (
-            f"{'[PAPER] ' if cfg.paper_mode else ''}"
+            f"{_mode_prefix(cfg.trading_mode)}"
             f"HEDGE #{self._session['hedge_count']} {hedge_dir} @ {fill_price:.4f}  qty={hedge_qty}"
         )
         logger.info("TradingEngine: %s", msg)
@@ -550,7 +556,7 @@ class TradingEngine:
             "direction": hedge_dir,
             "price":     fill_price,
             "qty":       hedge_qty,
-            "paper":     cfg.paper_mode,
+            "trading_mode": cfg.trading_mode,
         })
 
     async def _manage_hedges(
@@ -579,7 +585,7 @@ class TradingEngine:
             # ── Hedge TP: market kept going adverse for main ──────────────
             if h_price_pct >= p["tp_pct"]:
                 side = "SELL" if h_dir == "LONG" else "BUY"
-                order = await self._rest.place_market_order(
+                order = await self._executor.place_market_order(
                     cfg.symbol, side, h_qty, reduce_only=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
@@ -587,7 +593,7 @@ class TradingEngine:
                 await close_hedge(hedge["id"], h_pnl)
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
-                msg = f"{'[PAPER] ' if cfg.paper_mode else ''}HEDGE CLOSED (TP) @ {fill_price:.6f}"
+                msg = f"{_mode_prefix(cfg.trading_mode)}HEDGE CLOSED (TP) @ {fill_price:.6f}"
                 logger.info("TradingEngine: %s", msg)
                 self._broadcast({"type": "notification", "text": msg})
                 self._push_session()
@@ -601,7 +607,7 @@ class TradingEngine:
             # main is no longer losing, stop the hedge from bleeding further.
             elif main_price_pct >= 0:
                 side = "SELL" if h_dir == "LONG" else "BUY"
-                order = await self._rest.place_market_order(
+                order = await self._executor.place_market_order(
                     cfg.symbol, side, h_qty, reduce_only=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
@@ -610,7 +616,7 @@ class TradingEngine:
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
                 msg = (
-                    f"{'[PAPER] ' if cfg.paper_mode else ''}"
+                    f"{_mode_prefix(cfg.trading_mode)}"
                     f"HEDGE CLOSED (recovery) @ {fill_price:.6f}  "
                     f"hedge_pnl={h_pnl:+.4f}"
                 )
@@ -638,7 +644,7 @@ class TradingEngine:
         total_hedge_pnl = 0.0
         for hedge in list(self._hedges):
             h_side = "SELL" if hedge["direction"] == "LONG" else "BUY"
-            order = await self._rest.place_market_order(
+            order = await self._executor.place_market_order(
                 cfg.symbol, h_side, hedge["qty"],
                 reduce_only=True, current_price=price,
             )
@@ -654,7 +660,7 @@ class TradingEngine:
 
         # Close main
         side = "SELL" if direction == "LONG" else "BUY"
-        order = await self._rest.place_market_order(
+        order = await self._executor.place_market_order(
             cfg.symbol, side, qty, reduce_only=True, current_price=price
         )
         fill_price = float(order.get("avgPrice") or price)
@@ -664,7 +670,7 @@ class TradingEngine:
         await close_session(sess["id"], round(realized_pnl, 4), reason)
 
         msg = (
-            f"{'[PAPER] ' if cfg.paper_mode else ''}"
+            f"{_mode_prefix(cfg.trading_mode)}"
             f"CLOSE {direction} @ {fill_price:.4f}  "
             f"pnl={realized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)  reason={reason}"
         )
@@ -679,7 +685,7 @@ class TradingEngine:
             "pnl":       realized_pnl,
             "pnl_pct":   pnl_pct,
             "reason":    reason,
-            "paper":     cfg.paper_mode,
+            "trading_mode": cfg.trading_mode,
         })
 
         self._session         = None

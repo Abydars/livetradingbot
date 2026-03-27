@@ -19,8 +19,11 @@ class BotConfig:
     max_re_hedge: int
     min_signal_strength: float
 
-    # Mode
-    paper_mode: bool
+    # Trading mode: "paper" | "demo" | "live"
+    trading_mode: str
+
+    # Key type for BinanceClient: "auto" | "hmac" | "ed25519"
+    key_type: str
 
     # Notifications
     discord_webhook: str
@@ -36,6 +39,10 @@ class BotConfig:
     # Exchange secrets (env-only, never in DB)
     api_key: str
     api_secret: str
+
+    @property
+    def paper_mode(self) -> bool:
+        return self.trading_mode == "paper"
 
 
 async def load_config() -> BotConfig:
@@ -55,6 +62,19 @@ async def load_config() -> BotConfig:
     def _s(key: str, default: str = "") -> str:
         return str(cfg.get(key, default)).strip()
 
+    trading_mode = _s("trading_mode", "paper")
+
+    if trading_mode == "live":
+        api_key    = os.environ.get("BINANCE_LIVE_KEY", "")
+        api_secret = os.environ.get("BINANCE_LIVE_SECRET", "")
+        key_type   = os.environ.get("BINANCE_LIVE_KEY_TYPE", "auto")
+    elif trading_mode == "demo":
+        api_key    = os.environ.get("BINANCE_DEMO_KEY", "")
+        api_secret = os.environ.get("BINANCE_DEMO_SECRET", "")
+        key_type   = "hmac"
+    else:
+        api_key = api_secret = key_type = ""
+
     return BotConfig(
         symbol=_s("symbol", "BTCUSDT"),
         leverage=_i("leverage", 10),
@@ -63,12 +83,12 @@ async def load_config() -> BotConfig:
         max_re_hedge=_i("max_re_hedge", 3),
         min_signal_strength=_f("min_signal_strength", 0.25),
         timeframe=_s("timeframe", "1m"),
-        paper_mode=_b("paper_mode", True),
+        trading_mode=trading_mode,
+        key_type=key_type,
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 30),
         switch_threshold=_f("switch_threshold", 1.1),
-        # Secrets from environment only
-        api_key=os.environ.get("BINANCE_API_KEY", ""),
-        api_secret=os.environ.get("BINANCE_SECRET", ""),
+        api_key=api_key,
+        api_secret=api_secret,
     )

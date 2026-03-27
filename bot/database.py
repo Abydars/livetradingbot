@@ -73,7 +73,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "max_dca":             "3",
     "max_re_hedge":        "3",
     "min_signal_strength": "0.25",
-    "paper_mode":          "1",
+    "trading_mode":        "paper",
     "discord_webhook":     "",
     "auto_switch":         "1",
     "scan_interval_s":     "30",

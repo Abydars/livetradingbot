@@ -5,6 +5,10 @@ Subscribes to:
   - {symbol}@aggTrade       — real-time trades (price, qty, buyer_maker)
   - {symbol}@depth20@100ms  — top-20 order book depth
 
+Stream URL is selected by trading_mode:
+  - paper / live : wss://fstream.binance.com/ws/   (production)
+  - demo         : wss://fstream.binancefuture.com/ws/  (testnet)
+
 Reconnects with exponential backoff on disconnect.
 """
 import asyncio
@@ -18,7 +22,12 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
-_WS_BASE = "wss://fstream.binance.com/ws/"
+_WS_STREAM_URLS = {
+    "paper": "wss://fstream.binance.com/ws/",
+    "live":  "wss://fstream.binance.com/ws/",
+    "demo":  "wss://fstream.binancefuture.com/ws/",
+}
+
 _KEEPALIVE_INTERVAL = 20   # seconds between application-level pings
 _BACKOFF_BASE = 2          # initial reconnect delay (seconds)
 _BACKOFF_CAP = 30          # max reconnect delay (seconds)
@@ -33,12 +42,14 @@ class BinanceWebSocket:
     def __init__(
         self,
         symbol: str,
+        trading_mode: str,
         on_trade: Callable[[Dict], None],
         on_depth: Callable[[Dict], None],
     ) -> None:
         self.symbol = symbol.lower()
         self.on_trade = on_trade
         self.on_depth = on_depth
+        self._base_url = _WS_STREAM_URLS.get(trading_mode, _WS_STREAM_URLS["live"])
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -103,7 +114,7 @@ class BinanceWebSocket:
             f"{self.symbol}@aggTrade"
             f"/{self.symbol}@depth20@100ms"
         )
-        url = f"{_WS_BASE}{streams}"
+        url = f"{self._base_url}{streams}"
         logger.info("BinanceWebSocket: connecting to %s", url)
 
         async with websockets.connect(

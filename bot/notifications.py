@@ -75,7 +75,8 @@ async def notify(webhook_url: str, event: str, data: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_embed(event: str, data: Dict) -> Dict:
-    paper_tag = " [PAPER]" if data.get("paper") else ""
+    _mode = data.get("trading_mode", "")
+    paper_tag = f" [{_mode.upper()}]" if _mode else ""
     symbol    = data.get("symbol", "")
 
     if event == "TRADE_OPEN":

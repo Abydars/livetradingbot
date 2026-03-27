@@ -191,7 +191,7 @@ class BinanceRestClient:
         """Return available USDT wallet balance."""
         await self._market_limiter.acquire()
         params = self._sign({})
-        resp = await self._client.get("/fapi/v2/balance", params=params)
+        resp = await self._client.get("/fapi/v3/balance", params=params)
         resp.raise_for_status()
         for asset in resp.json():
             if asset.get("asset") == "USDT":
@@ -202,7 +202,7 @@ class BinanceRestClient:
         """Return current position risk for a symbol, or None if flat."""
         await self._market_limiter.acquire()
         params = self._sign({"symbol": symbol})
-        resp = await self._client.get("/fapi/v2/positionRisk", params=params)
+        resp = await self._client.get("/fapi/v3/positionRisk", params=params)
         resp.raise_for_status()
         for pos in resp.json():
             if pos["symbol"] == symbol and float(pos["positionAmt"]) != 0:
