@@ -1065,6 +1065,11 @@ class BinanceClient:
         assert self.market == "futures"
         return await self.post("/fapi/v1/leverage", {"symbol": symbol.upper(), "leverage": leverage})
 
+    async def get_order(self, symbol: str, order_id: int) -> dict:
+        """Fetch a single order by ID — used to retrieve fill price after MARKET placement."""
+        endpoint = "/fapi/v1/order" if self.market == "futures" else "/api/v3/order"
+        return await self.get(endpoint, {"symbol": symbol.upper(), "orderId": order_id}, signed=True)
+
     async def change_margin_type(self, symbol: str, margin_type: MarginType) -> dict:
         assert self.market == "futures"
         return await self.post("/fapi/v1/marginType", {
