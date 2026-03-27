@@ -358,7 +358,16 @@ class TradingEngine:
 
         # ---- DCA ------------------------------------------------------------
         if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"]:
-            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count)
+            opposite = "SHORT" if direction == "LONG" else "LONG"
+            if signal["direction"] == opposite and signal["filters_passed"]:
+                logger.info(
+                    "TradingEngine: DCA skipped — signal disagrees (%s vs main %s)",
+                    signal["direction"], direction,
+                )
+                self._broadcast({"type": "notification",
+                                 "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
+            else:
+                await self._try_dca(cfg, price, direction, avg_price, qty, dca_count)
 
     # ------------------------------------------------------------------
     # Take-profit logic (trailing + fixed floor)
