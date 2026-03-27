@@ -107,7 +107,7 @@ async def _do_broadcast(msg: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open
+    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn
     cfg = await load_config()
 
     while True:
@@ -163,7 +163,6 @@ async def _ticker_loop() -> None:
             if _trading_active:
                 if _executor and not _executor.is_ready:
                     if now - _last_client_warn >= _CLIENT_WARN_INTERVAL:
-                        global _last_client_warn
                         _last_client_warn = now
                         err = _exchange_error or "Exchange client unavailable — check API keys"
                         _on_exchange_error(err)
