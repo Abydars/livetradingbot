@@ -351,6 +351,51 @@
     }
     #btn-cfg:hover { color: var(--text); border-color: var(--muted); }
 
+    /* start/stop trading button */
+    #btn-trade {
+      background: none;
+      border: 1px solid var(--green);
+      color: var(--green);
+      font-family: var(--font);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      cursor: pointer;
+      letter-spacing: .05em;
+      transition: background .15s, color .15s;
+    }
+    #btn-trade:hover { background: rgba(63,185,80,.12); }
+    #btn-trade.active {
+      border-color: var(--red);
+      color: var(--red);
+    }
+    #btn-trade.active:hover { background: rgba(248,81,73,.12); }
+
+    /* delete buttons in trade history */
+    .btn-del {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-family: var(--font);
+      font-size: 10px;
+      padding: 1px 5px;
+      cursor: pointer;
+      line-height: 1.4;
+    }
+    .btn-del:hover { border-color: var(--red); color: var(--red); }
+
+    #btn-del-all {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-family: var(--font);
+      font-size: 10px;
+      padding: 2px 8px;
+      cursor: pointer;
+      margin-left: auto;
+    }
+    #btn-del-all:hover { border-color: var(--red); color: var(--red); }
+
     .cs-title {
       font-size: 10px;
       font-weight: 600;
@@ -768,7 +813,7 @@
 
       /* touch-friendly tap targets */
       .tbtn { padding: 8px 12px; }
-      #btn-cfg { padding: 5px 10px; }
+      #btn-cfg, #btn-trade { padding: 5px 10px; }
       #symbol-select, #tf-select { padding: 5px 7px; }
     }
   </style>
@@ -795,6 +840,7 @@
   <span id="live-price">——</span>
   <span id="paper-badge">PAPER</span>
   <div class="hspacer"></div>
+  <button id="btn-trade" onclick="toggleTrading()">▶ START</button>
   <button id="btn-cfg" onclick="openCfgModal()">⚙ CONFIG</button>
   <div class="hdiv"></div>
   <div id="ws-status">
@@ -850,6 +896,7 @@
             <span class="pi"><span class="pl">Win Rate</span><span class="pv" id="p-wr">--</span></span>
             <span class="pi"><span class="pl">Total PnL</span><span class="pv" id="p-pnl">--</span></span>
             <span class="pi"><span class="pl">Trades</span><span class="pv" id="p-cnt">--</span></span>
+            <button id="btn-del-all" onclick="deleteAllTrades()">✕ DELETE ALL</button>
           </div>
           <div class="tbl-scroll">
             <table id="tbl-history">
@@ -857,11 +904,11 @@
                 <tr>
                   <th>TIME</th><th>SYM</th><th>DIR</th><th>ENTRY</th>
                   <th>QTY</th><th>PNL</th><th>DCA</th><th>HDG</th>
-                  <th>STRENGTH</th><th>ENTRY REASON</th><th>EXIT REASON</th><th>DURATION</th>
+                  <th>STRENGTH</th><th>ENTRY REASON</th><th>EXIT REASON</th><th>DURATION</th><th></th>
                 </tr>
               </thead>
               <tbody id="tbody-history">
-                <tr><td colspan="12" class="empty">No closed trades yet</td></tr>
+                <tr><td colspan="13" class="empty">No closed trades yet</td></tr>
               </tbody>
             </table>
           </div>
@@ -983,6 +1030,7 @@ let lastPrice     = null;
 let currentSymbol  = 'BTCUSDT';
 let currentTf      = '1m';
 let isPaperMode    = true;
+let tradingActive  = false;
 let curSession     = null;
 let curHedges      = [];
 let curTrailPrice  = null;
@@ -1115,12 +1163,20 @@ function dispatch(msg) {
       isPaperMode   = !!msg.paper_mode;
       currentSymbol = msg.symbol || 'BTCUSDT';
       currentTf     = msg.timeframe || '1m';
+      tradingActive = !!msg.trading_active;
       updatePaperBadge();
+      updateTradeBtn();
       setSymbolSelect(currentSymbol);
       setTfSelect(currentTf);
       hideSymLoader();
       wsSend({ type: 'get_candles' });
       wsSend({ type: 'get_top_movers' });
+      break;
+
+    case 'trading_status':
+      tradingActive = !!msg.active;
+      updateTradeBtn();
+      showToast(tradingActive ? 'Trading started' : 'Trading stopped', tradingActive ? 'ok' : '');
       break;
 
     case 'top_movers':
@@ -1217,7 +1273,11 @@ function dispatch(msg) {
       break;
 
     case 'config_saved':
-      showToast('Config saved', 'info');
+      if (msg.ok) {
+        showToast('Config saved', 'info');
+      } else {
+        showToast(msg.error || 'Config save failed', 'err');
+      }
       break;
   }
 }
@@ -1720,7 +1780,7 @@ function updateHistoryTable(sessions) {
   const closed = sessions.filter(s => s.status === 'closed');
 
   if (!closed.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">No closed trades yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">No closed trades yet</td></tr>';
     return;
   }
 
@@ -1745,6 +1805,7 @@ function updateHistoryTable(sessions) {
       <td class="cm">${s.entry_reason || '--'}</td>
       <td class="cm">${s.exit_reason  || '--'}</td>
       <td class="cm">${fmtDur(dur)}</td>
+      <td><button class="btn-del" onclick="deleteTrade(${s.id})">✕</button></td>
     </tr>`;
   }).join('');
 }
@@ -1936,6 +1997,11 @@ function setTfSelect(tf) {
 }
 
 function changeTf(tf) {
+  if (tradingActive) {
+    showToast('Stop trading before changing timeframe', 'warn');
+    setTfSelect(currentTf);  // revert the select
+    return;
+  }
   currentTf = tf;
   _liveCandle = null;   // reset live candle so it seeds from the new timeframe data
   showSymLoader(tf);    // reuse the same loader overlay
@@ -1958,6 +2024,11 @@ function hideSymLoader() {
 }
 
 function changeSymbol(sym) {
+  if (tradingActive) {
+    showToast('Stop trading before changing symbol', 'warn');
+    setSymbolSelect(currentSymbol);  // revert the select
+    return;
+  }
   currentSymbol = sym;
   showSymLoader(sym);
   wsSend({ type: 'set_config', config: { symbol: sym } });
@@ -1986,6 +2057,34 @@ function initTabs() {
       }
     });
   });
+}
+
+// Start/Stop trading
+function toggleTrading() {
+  wsSend({ type: 'set_trading_active', active: !tradingActive });
+}
+
+function updateTradeBtn() {
+  const btn = document.getElementById('btn-trade');
+  if (!btn) return;
+  if (tradingActive) {
+    btn.textContent = '■ STOP';
+    btn.classList.add('active');
+  } else {
+    btn.textContent = '▶ START';
+    btn.classList.remove('active');
+  }
+}
+
+// Trade history deletion
+function deleteTrade(id) {
+  if (!confirm('Delete this trade record?')) return;
+  wsSend({ type: 'delete_session', id });
+}
+
+function deleteAllTrades() {
+  if (!confirm('Delete ALL trade history? This cannot be undone.')) return;
+  wsSend({ type: 'delete_all_sessions' });
 }
 
 // Config modal

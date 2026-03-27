@@ -23,10 +23,14 @@ from fastapi.staticfiles import StaticFiles
 
 from config import load_config
 from database import (
+    delete_all_sessions,
+    delete_session,
+    get_config,
     get_performance,
     get_sessions,
     get_signal_log,
     init_db,
+    set_config,
     set_config_bulk,
 )
 from engine.indicators import compute_all
@@ -61,6 +65,7 @@ _last_candles_fetch: float = 0.0
 _last_symbol_scan: float = 0.0
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
+_trading_active: bool = False          # persisted in config.trading_active
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 
@@ -144,8 +149,9 @@ async def _ticker_loop() -> None:
                 "symbol": cfg.symbol,
             })
 
-            # Run trading tick
-            await _engine.tick(cfg, price)
+            # Run trading tick (only when trading is enabled)
+            if _trading_active:
+                await _engine.tick(cfg, price)
 
             # Symbol scan — always runs for sidebar; auto-switch is conditional
             if now - _last_symbol_scan >= cfg.scan_interval_s:
@@ -269,11 +275,16 @@ def _on_depth(event: Dict) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _rest, _ws, _engine
+    global _rest, _ws, _engine, _trading_active
 
     logger.info("=== Bot starting ===")
     await init_db()
     cfg = await load_config()
+
+    # Restore trading_active flag from DB
+    ta_val = await get_config("trading_active")
+    _trading_active = (ta_val == "1")
+    logger.info("Trading active on startup: %s", _trading_active)
 
     if cfg.paper_mode:
         logger.info("*** PAPER MODE ACTIVE — no real orders will be placed ***")
@@ -406,10 +417,11 @@ async def ws_endpoint(websocket: WebSocket):
     # Send initial state
     try:
         await websocket.send_text(json.dumps({
-            "type":       "init",
-            "paper_mode": cfg.paper_mode,
-            "symbol":     cfg.symbol,
-            "timeframe":  cfg.timeframe,
+            "type":           "init",
+            "paper_mode":     cfg.paper_mode,
+            "symbol":         cfg.symbol,
+            "timeframe":      cfg.timeframe,
+            "trading_active": _trading_active,
         }))
 
         # Send open session state if any
@@ -503,9 +515,44 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             "data": perf,
         }))
 
+    elif mtype == "set_trading_active":
+        global _trading_active
+        active = bool(msg.get("active", False))
+        _trading_active = active
+        await set_config("trading_active", "1" if active else "0")
+        logger.info("Trading %s by user", "started" if active else "stopped")
+        await _do_broadcast({"type": "trading_status", "active": active})
+
+    elif mtype == "delete_session":
+        sid = msg.get("id")
+        if sid is not None:
+            await delete_session(int(sid))
+            sessions = await get_sessions(200)
+            perf = await get_performance()
+            await ws.send_text(json.dumps({
+                "type": "sessions", "sessions": sessions, "hedges": {}
+            }))
+            await ws.send_text(json.dumps({"type": "performance", "data": perf}))
+
+    elif mtype == "delete_all_sessions":
+        await delete_all_sessions()
+        sessions = await get_sessions(200)
+        perf = await get_performance()
+        await ws.send_text(json.dumps({
+            "type": "sessions", "sessions": sessions, "hedges": {}
+        }))
+        await ws.send_text(json.dumps({"type": "performance", "data": perf}))
+
     elif mtype == "set_config":
         global _last_candles_fetch
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
+        # Block symbol/timeframe changes while trading is active
+        if _trading_active and ("symbol" in updates or "timeframe" in updates):
+            await ws.send_text(json.dumps({
+                "type": "config_saved", "ok": False,
+                "error": "Stop trading before changing symbol or timeframe",
+            }))
+            return
         await set_config_bulk(updates)
         # Reload WS subscription if symbol changed
         if "symbol" in updates:

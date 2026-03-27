@@ -78,6 +78,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "auto_switch":         "1",
     "scan_interval_s":     "30",
     "timeframe":           "1m",
+    "trading_active":      "0",
 }
 
 
@@ -318,6 +319,25 @@ async def get_signal_log(limit: int = 100) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Performance stats
 # ---------------------------------------------------------------------------
+
+async def delete_session(session_id: int) -> None:
+    """Delete a single closed session (and its hedge positions) by id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM hedge_positions WHERE session_id=?", (session_id,))
+        await db.execute("DELETE FROM sessions WHERE id=? AND status='closed'", (session_id,))
+        await db.commit()
+
+
+async def delete_all_sessions() -> None:
+    """Delete all closed sessions and their hedge positions."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM hedge_positions WHERE session_id IN "
+            "(SELECT id FROM sessions WHERE status='closed')"
+        )
+        await db.execute("DELETE FROM sessions WHERE status='closed'")
+        await db.commit()
+
 
 async def get_performance() -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
