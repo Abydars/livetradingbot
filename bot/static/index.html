@@ -798,6 +798,18 @@ let configData    = {};
 // chart handles
 let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S;
 
+// live candle (updated on every trade tick)
+let _liveCandle = null;
+
+// trade-level price lines on chart
+let _entryLine = null;
+let _tpLine    = null;
+let _slLine    = null;
+let _trailLine = null;
+
+// entry/exit markers [ {time, position, color, shape, text} ]
+let _markers = [];
+
 /* ═══════════════════════════════════════════════════════
    CHART — Step 3
 ═══════════════════════════════════════════════════════ */
@@ -824,6 +836,7 @@ function initChart() {
     },
     rightPriceScale: { borderColor: '#21262d' },
     timeScale:       { borderColor: '#21262d', timeVisible: true, secondsVisible: false },
+    localization:    { priceFormatter: p => fmtPrice(p) },
   });
 
   // Candlestick
@@ -914,9 +927,14 @@ function dispatch(msg) {
       updatePrice(msg.price);
       break;
 
+    case 'trade':
+      updateLiveCandle(msg.price);
+      break;
+
     case 'symbol_ready':
       setSymbolSelect(msg.symbol);
-      // candles will follow immediately; loader hides on first candle
+      _markers = [];
+      clearTradeLevels();
       document.getElementById('sym-loader-text').textContent =
         `Loading ${msg.symbol} data…`;
       break;
@@ -938,11 +956,15 @@ function dispatch(msg) {
       if (msg.data) updateSignalPanel(msg.data);
       break;
 
-    case 'session':
+    case 'session': {
+      const prevOpen = curSession?.status === 'open';
+      const nowOpen  = msg.session?.status === 'open';
       curSession = msg.session;
       curHedges  = msg.hedges || [];
       updatePositionPanel();
+      updateTradeLevels(msg.session, msg.trail_price, msg.trail_active, prevOpen, nowOpen);
       break;
+    }
 
     case 'depth':
       if (msg.bids && msg.asks) updateOrderBook(msg.bids, msg.asks);
@@ -1045,6 +1067,13 @@ function processCandleUpdate(candles) {
     time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
   })));
 
+  // Seed live candle from the last (current open) candle returned by server
+  const last = candles[candles.length - 1];
+  if (last) _liveCandle = { time: last.time, open: last.open, high: last.high, low: last.low, close: last.close };
+
+  // Re-apply markers (setData clears them)
+  if (_markers.length) csSeries.setMarkers(_markers);
+
   const closes = candles.map(c => c.close);
   const times  = candles.map(c => c.time);
 
@@ -1079,6 +1108,137 @@ function computeBBOverlay(closes, times, period, sd) {
     lower.push({ time: times[i], value: mid - sd * std });
   }
   return { upper, lower };
+}
+
+/* ═══════════════════════════════════════════════════════
+   LIVE CANDLE UPDATE
+═══════════════════════════════════════════════════════ */
+function updateLiveCandle(price) {
+  if (!csSeries || !price) return;
+  const candleTime = Math.floor(Date.now() / 1000 / 60) * 60;  // floor to current minute
+
+  if (!_liveCandle || _liveCandle.time < candleTime) {
+    // New minute — start fresh candle
+    _liveCandle = { time: candleTime, open: price, high: price, low: price, close: price };
+  } else {
+    _liveCandle.high  = Math.max(_liveCandle.high,  price);
+    _liveCandle.low   = Math.min(_liveCandle.low,   price);
+    _liveCandle.close = price;
+  }
+  csSeries.update(_liveCandle);
+}
+
+/* ═══════════════════════════════════════════════════════
+   TRADE LEVELS — entry/TP/SL/trailing lines + markers
+═══════════════════════════════════════════════════════ */
+function computeTPPrice(session) {
+  const tpPct    = parseFloat(configData.tp_pct     ?? 0.8);
+  const lev      = session.leverage || 10;
+  const move     = session.avg_price * tpPct / (100 * lev);
+  return session.direction === 'LONG' ? session.avg_price + move : session.avg_price - move;
+}
+
+function computeSLPrice(session) {
+  const trigPct  = parseFloat(configData.hedge_trigger_pct ?? 1.0) * 4;
+  const lev      = session.leverage || 10;
+  const move     = session.avg_price * trigPct / (100 * lev);
+  return session.direction === 'LONG' ? session.avg_price - move : session.avg_price + move;
+}
+
+function _removeLine(ref) {
+  try { if (ref) csSeries.removePriceLine(ref); } catch {}
+  return null;
+}
+
+function clearTradeLevels() {
+  _entryLine = _removeLine(_entryLine);
+  _tpLine    = _removeLine(_tpLine);
+  _slLine    = _removeLine(_slLine);
+  _trailLine = _removeLine(_trailLine);
+}
+
+function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
+  if (!csSeries) return;
+
+  if (!session || session.status !== 'open') {
+    // Position just closed — add exit marker then clear lines
+    if (prevOpen && lastPrice) {
+      const t = Math.floor(Date.now() / 1000 / 60) * 60;
+      _markers.push({
+        time:     t,
+        position: 'aboveBar',
+        color:    '#f85149',
+        shape:    'circle',
+        text:     'EXIT',
+        size:     1,
+      });
+      csSeries.setMarkers(_markers);
+    }
+    clearTradeLevels();
+    return;
+  }
+
+  const isLong = session.direction === 'LONG';
+
+  // Entry marker (only on new open)
+  if (!prevOpen && nowOpen) {
+    const t = Math.floor((session.open_time || Date.now() / 1000) / 60) * 60;
+    _markers.push({
+      time:     t,
+      position: isLong ? 'belowBar' : 'aboveBar',
+      color:    isLong ? '#3fb950'  : '#f85149',
+      shape:    isLong ? 'arrowUp'  : 'arrowDown',
+      text:     isLong ? 'L'        : 'S',
+      size:     1,
+    });
+    csSeries.setMarkers(_markers);
+  }
+
+  // Entry avg price line (yellow dashed)
+  _entryLine = _removeLine(_entryLine);
+  _entryLine = csSeries.createPriceLine({
+    price:            session.avg_price,
+    color:            '#f0b429',
+    lineWidth:        1,
+    lineStyle:        LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title:            'Entry',
+  });
+
+  // TP line (green dashed)
+  _tpLine = _removeLine(_tpLine);
+  _tpLine = csSeries.createPriceLine({
+    price:            computeTPPrice(session),
+    color:            '#3fb950',
+    lineWidth:        1,
+    lineStyle:        LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title:            'TP',
+  });
+
+  // Hard-stop line (red dashed)
+  _slLine = _removeLine(_slLine);
+  _slLine = csSeries.createPriceLine({
+    price:            computeSLPrice(session),
+    color:            '#f85149',
+    lineWidth:        1,
+    lineStyle:        LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title:            'SL',
+  });
+
+  // Trailing stop line (orange dotted, only when active)
+  _trailLine = _removeLine(_trailLine);
+  if (trailActive && trailPrice) {
+    _trailLine = csSeries.createPriceLine({
+      price:            trailPrice,
+      color:            '#ff9800',
+      lineWidth:        1,
+      lineStyle:        LightweightCharts.LineStyle.Dotted,
+      axisLabelVisible: true,
+      title:            'Trail',
+    });
+  }
 }
 
 /* ═══════════════════════════════════════════════════════

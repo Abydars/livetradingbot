@@ -72,11 +72,13 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     def _push_session(self) -> None:
-        """Push current session + hedges state to all connected WS clients."""
+        """Push current session + hedges + trade-level prices to all WS clients."""
         self._broadcast({
-            "type":    "session",
-            "session": self._session,
-            "hedges":  self._hedges,
+            "type":        "session",
+            "session":     self._session,
+            "hedges":      self._hedges,
+            "trail_price": self._trail_price,
+            "trail_active": self._trail_activated,
         })
 
     # ------------------------------------------------------------------

@@ -373,9 +373,11 @@ async def ws_endpoint(websocket: WebSocket):
         if sess:
             hedges = await get_open_hedges(sess["id"])
             await websocket.send_text(json.dumps({
-                "type":    "session",
-                "session": sess,
-                "hedges":  hedges,
+                "type":        "session",
+                "session":     sess,
+                "hedges":      hedges,
+                "trail_price": _engine._trail_price if _engine else None,
+                "trail_active": _engine._trail_activated if _engine else False,
             }))
 
         # Send recent signal + indicators
