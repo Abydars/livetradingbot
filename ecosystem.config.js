@@ -9,7 +9,7 @@ module.exports = {
       watch: false,
       max_memory_restart: "512M",
       restart_delay: 3000,
-      interpreter: "../venv/bin/python",
+      interpreter: __dirname + "/venv/bin/python",
       cwd: __dirname + "/bot",
       env: {
         NODE_ENV: "production",
