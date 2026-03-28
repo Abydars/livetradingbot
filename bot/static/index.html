@@ -403,6 +403,23 @@
     }
     .btn-del:hover { border-color: var(--red); color: var(--red); }
 
+    /* level adjustment arrows in position panel */
+    .level-row { display: flex; align-items: center; gap: 4px; }
+    .btn-adj {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      width: 15px; height: 15px;
+      font-size: 8px;
+      padding: 0; line-height: 1;
+      cursor: pointer;
+      border-radius: 2px;
+      display: inline-flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .btn-adj:hover { border-color: var(--text); color: var(--text); }
+    .level-pnl { font-size: 10px; min-width: 46px; text-align: right; }
+
     .row-hedge td { opacity: 0.82; }
     .row-hedge { border-left: 2px solid var(--muted); }
     .badge-hdg {
@@ -1128,6 +1145,59 @@ let curTpPrice  = null;
 let curSlPrice  = null;
 let configData     = {};
 
+// Manual level overrides — set by arrow buttons, cleared on position change
+let _overrideTpPrice = null;
+let _overrideSlPrice = null;
+
+// Step size: ~0.05% of price rounded to 1 sig-fig
+function _levelStep(basePrice) {
+  if (!basePrice || basePrice <= 0) return 1;
+  const raw = basePrice * 0.0005;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  return Math.round(raw / mag) * mag;
+}
+
+// USDT PnL if price reaches targetPrice (uses main position qty + avg)
+function levelPnL(targetPrice) {
+  if (!curSession || !targetPrice) return null;
+  const qty = curSession.qty;
+  const avg = curSession.avg_price;
+  return curSession.direction === 'LONG'
+    ? (targetPrice - avg) * qty
+    : (avg - targetPrice) * qty;
+}
+
+function adjustLevel(type, dir) {
+  if (!curSession) return;
+  const base = (lastPrice || curSession.avg_price);
+  const step = _levelStep(base);
+  if (type === 'tp') {
+    const cur = _overrideTpPrice ?? curTpPrice ?? computeTPPrice(curSession);
+    _overrideTpPrice = cur + dir * step;
+    // Update chart line immediately
+    if (csSeries && _tpLine !== undefined) {
+      _tpLine = _removeLine(_tpLine);
+      _tpLine = csSeries.createPriceLine({
+        price: _overrideTpPrice, color: '#3fb950', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true, title: 'TRAIL ARM',
+      });
+    }
+  } else {
+    const cur = _overrideSlPrice ?? curSlPrice ?? computeSLPrice(curSession);
+    _overrideSlPrice = cur + dir * step;
+    if (csSeries && _slLine !== undefined) {
+      _slLine = _removeLine(_slLine);
+      _slLine = csSeries.createPriceLine({
+        price: _overrideSlPrice, color: '#f85149', lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true, title: 'HARD STOP',
+      });
+    }
+  }
+  updatePositionPanel();
+}
+
 // chart handles
 let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S;
 
@@ -1582,8 +1652,10 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
   if (!csSeries) return;
 
   if (!session || session.status !== 'open') {
-    // Position just closed — add exit marker then clear lines
+    // Position just closed — reset overrides, add exit marker, clear lines
     if (prevOpen && lastPrice) {
+      _overrideTpPrice = null;
+      _overrideSlPrice = null;
       const periodSec = TF_SECONDS[currentTf] || 60;
       const t = Math.floor(Date.now() / 1000 / periodSec) * periodSec;
       _markers.push({
@@ -1601,6 +1673,12 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
   }
 
   const isLong = session.direction === 'LONG';
+
+  // New position opened — reset any stale overrides from previous trade
+  if (!prevOpen && nowOpen) {
+    _overrideTpPrice = null;
+    _overrideSlPrice = null;
+  }
 
   // Entry marker (only on new open)
   if (!prevOpen && nowOpen) {
@@ -1629,27 +1707,31 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     title:            'Entry',
   });
 
-  // Trail-arm line (green dashed) — price must reach here to activate trailing
-  _tpLine = _removeLine(_tpLine);
-  _tpLine = csSeries.createPriceLine({
-    price:            curTpPrice || computeTPPrice(session),
-    color:            '#3fb950',
-    lineWidth:        1,
-    lineStyle:        LightweightCharts.LineStyle.Dashed,
-    axisLabelVisible: true,
-    title:            'TRAIL ARM',
-  });
+  // Trail-arm line — use manual override if set, otherwise server value
+  if (!_overrideTpPrice) {
+    _tpLine = _removeLine(_tpLine);
+    _tpLine = csSeries.createPriceLine({
+      price:            curTpPrice || computeTPPrice(session),
+      color:            '#3fb950',
+      lineWidth:        1,
+      lineStyle:        LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title:            'TRAIL ARM',
+    });
+  }
 
-  // Hard-stop line (red dashed)
-  _slLine = _removeLine(_slLine);
-  _slLine = csSeries.createPriceLine({
-    price:            curSlPrice || computeSLPrice(session),
-    color:            '#f85149',
-    lineWidth:        1,
-    lineStyle:        LightweightCharts.LineStyle.Dashed,
-    axisLabelVisible: true,
-    title:            'HARD STOP',
-  });
+  // Hard-stop line — use manual override if set, otherwise server value
+  if (!_overrideSlPrice) {
+    _slLine = _removeLine(_slLine);
+    _slLine = csSeries.createPriceLine({
+      price:            curSlPrice || computeSLPrice(session),
+      color:            '#f85149',
+      lineWidth:        1,
+      lineStyle:        LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title:            'HARD STOP',
+    });
+  }
 
   // Trailing stop line (orange dotted, only when active)
   _trailLine = _removeLine(_trailLine);
@@ -1784,11 +1866,37 @@ function updatePositionPanel() {
   const dir = s.direction === 'LONG' ? 'long' : 'short';
   const elapsed = s.open_time ? (Date.now() / 1000 - s.open_time) : 0;
 
-  const tpPrice  = curTpPrice  || computeTPPrice(s);
-  const slPrice  = curSlPrice  || computeSLPrice(s);
+  const tpPrice  = _overrideTpPrice ?? curTpPrice  ?? computeTPPrice(s);
+  const slPrice  = _overrideSlPrice ?? curSlPrice  ?? computeSLPrice(s);
   const trailRow = curTrailActive && curTrailPrice
     ? pr('Trail Stop', `<span class="prv" style="color:#ff9800">${fmtPrice(curTrailPrice)}</span>`)
     : '';
+
+  // PnL at each level
+  const tpPnl  = levelPnL(tpPrice);
+  const slPnl  = levelPnL(slPrice);
+  const fmtLvlPnl = (pnl, cls) =>
+    pnl !== null ? `<span class="level-pnl ${pnl >= 0 ? 'cg' : 'cr'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}</span>` : '';
+
+  const tpRow = `<div class="pr">
+    <span class="prk">Trail Arm</span>
+    <span class="level-row">
+      <button class="btn-adj" onclick="adjustLevel('tp',-1)">▼</button>
+      <span style="color:var(--green)">${fmtPrice(tpPrice)}</span>
+      ${fmtLvlPnl(tpPnl)}
+      <button class="btn-adj" onclick="adjustLevel('tp',+1)">▲</button>
+    </span>
+  </div>`;
+
+  const slRow = `<div class="pr">
+    <span class="prk">Hard Stop</span>
+    <span class="level-row">
+      <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
+      <span style="color:var(--red)">${fmtPrice(slPrice)}</span>
+      ${fmtLvlPnl(slPnl)}
+      <button class="btn-adj" onclick="adjustLevel('sl',+1)">▲</button>
+    </span>
+  </div>`;
 
   posEl.innerHTML = `
     ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
@@ -1796,8 +1904,8 @@ function updatePositionPanel() {
     ${s.signal_price ? pr('Signal Price', fmtPrice(s.signal_price)) : ''}
     ${pr('Entry Price',  fmtPrice(s.entry_price))}
     ${pr('Avg Price',    fmtPrice(s.avg_price))}
-    ${pr('Trail Arm', `<span class="prv" style="color:var(--green)">${fmtPrice(tpPrice)}</span>`)}
-    ${pr('Hard Stop', `<span class="prv" style="color:var(--red)">${fmtPrice(slPrice)}</span>`)}
+    ${tpRow}
+    ${slRow}
     ${trailRow}
     ${pr('Qty',       s.qty)}
     ${pr('Margin',    '$' + s.margin.toFixed(2))}
