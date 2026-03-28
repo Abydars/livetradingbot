@@ -92,7 +92,7 @@ _CLIENT_WARN_INTERVAL = 60.0  # re-broadcast "client unavailable" at most once p
 
 def _broadcast(msg: Dict) -> None:
     """Enqueue a message to all connected clients (fire-and-forget)."""
-    asyncio.get_event_loop().call_soon(
+    asyncio.get_running_loop().call_soon(
         lambda: asyncio.ensure_future(_do_broadcast(msg))
     )
 
@@ -357,7 +357,7 @@ def _on_trade(event: Dict) -> None:
     global _last_price
     _last_price = event["price"]
     _flow.on_trade(event)
-    asyncio.get_event_loop().call_soon(
+    asyncio.get_running_loop().call_soon(
         lambda: asyncio.ensure_future(_do_broadcast({
             "type":  "trade",
             "price": event["price"],
@@ -369,7 +369,7 @@ def _on_trade(event: Dict) -> None:
 
 def _on_depth(event: Dict) -> None:
     _flow.on_depth(event)
-    asyncio.get_event_loop().call_soon(
+    asyncio.get_running_loop().call_soon(
         lambda: asyncio.ensure_future(_do_broadcast({
             "type": "depth",
             "bids": event["bids"][:10],
@@ -426,7 +426,6 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     _engine._hedges          = []
     _engine._trail_activated = False
     _engine._trail_price     = None
-    _engine._dca_pending_since = None
     _engine._entry_adaptive  = {}
     _engine._pending_fills.clear()
     _engine._push_session()
@@ -712,7 +711,7 @@ async def lifespan(app: FastAPI):
     ticker_task = asyncio.create_task(_ticker_loop())
 
     # Graceful shutdown on SIGTERM
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _shutdown(sig, frame):
         logger.info("Received %s — shutting down…", sig)

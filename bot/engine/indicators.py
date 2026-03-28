@@ -195,12 +195,27 @@ def stoch_rsi(
     if len(prices) < min_len:
         return None
 
-    # Build RSI series
+    # Build full RSI series in a single O(n) pass using Wilder smoothing.
+    # Equivalent to calling rsi(prices[:i]) for every i, but without the O(n²) loop.
+    deltas = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+
+    avg_gain = sum(gains[:rsi_period]) / rsi_period
+    avg_loss = sum(losses[:rsi_period]) / rsi_period
     rsi_vals: List[float] = []
-    for i in range(rsi_period, len(prices) + 1):
-        r = rsi(prices[:i], rsi_period)
-        if r is not None:
-            rsi_vals.append(r)
+    # First RSI value uses the seed averages
+    if avg_loss == 0:
+        rsi_vals.append(100.0)
+    else:
+        rsi_vals.append(100.0 - 100.0 / (1 + avg_gain / avg_loss))
+    for i in range(rsi_period, len(deltas)):
+        avg_gain = (avg_gain * (rsi_period - 1) + gains[i]) / rsi_period
+        avg_loss = (avg_loss * (rsi_period - 1) + losses[i]) / rsi_period
+        if avg_loss == 0:
+            rsi_vals.append(100.0)
+        else:
+            rsi_vals.append(100.0 - 100.0 / (1 + avg_gain / avg_loss))
 
     if len(rsi_vals) < stoch_period + k_smooth + d_smooth:
         return None
