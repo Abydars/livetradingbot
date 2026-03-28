@@ -81,6 +81,16 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "timeframe":           "1m",
     "trading_active":      "0",
     "switch_threshold":    "1.1",
+    "cooldown_after_stop_s": "300",
+    "max_daily_loss_usdt":   "0",
+    "dca_multiplier":        "1.0",
+    "partial_tp":            "0",
+    "partial_tp_ratio":      "0.5",
+    "taker_fee_pct":         "0.04",
+    "paper_slippage_pct":    "0.05",
+    "strength_sizing":       "1",
+    "strength_size_min":     "0.5",
+    "stoch_signal":          "1",
 }
 
 
@@ -431,3 +441,19 @@ async def get_performance() -> Dict[str, Any]:
         "max_drawdown": round(max_dd, 4),
         "total_pnl": round(sum(pnls), 4),
     }
+
+
+async def get_today_pnl() -> float:
+    """Sum of realized PnL for all sessions closed today (UTC midnight)."""
+    import calendar
+    t = time.gmtime()
+    midnight_utc = float(calendar.timegm((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, 0)))
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(pnl), 0.0) AS total FROM sessions "
+            "WHERE status='closed' AND close_time >= ?",
+            (midnight_utc,),
+        )
+        row = await cursor.fetchone()
+        return float(row["total"]) if row else 0.0
