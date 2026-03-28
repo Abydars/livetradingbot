@@ -15,12 +15,13 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Component weights
-_W_FLOW     = 0.30
-_W_TREND    = 0.25
-_W_MOMENTUM = 0.20
-_W_MEAN_REV = 0.15
+# Component weights (must sum to 1.0)
+_W_FLOW     = 0.28
+_W_TREND    = 0.23
+_W_MOMENTUM = 0.19
+_W_MEAN_REV = 0.13
 _W_RSI      = 0.10
+_W_STOCH    = 0.07
 
 # Decision thresholds
 _ENTRY_THRESHOLD = 0.20   # composite must exceed ±0.20 for a directional signal
@@ -36,8 +37,11 @@ def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
 
 class SignalEngine:
     """
-    Stateless signal computation.  Call compute() each cycle.
+    Signal computation.  Call compute() each cycle.
     """
+
+    def __init__(self) -> None:
+        self._stoch_enabled: bool = True
 
     def compute(
         self,
@@ -73,6 +77,7 @@ class SignalEngine:
             + components["momentum"] * _W_MOMENTUM
             + components["mean_rev"] * _W_MEAN_REV
             + components["rsi"]      * _W_RSI
+            + components["stoch"]    * _W_STOCH
         )
 
         # Preliminary direction from composite
@@ -118,6 +123,7 @@ class SignalEngine:
             "momentum": self._score_momentum(ind),
             "mean_rev": self._score_mean_reversion(ind),
             "rsi":      self._score_rsi(ind),
+            "stoch":    self._score_stoch_rsi(ind),
         }
 
     def _score_flow(self, flow: Dict) -> float:
@@ -221,6 +227,30 @@ class SignalEngine:
             # Hard oversold — filter will block SHORT entries anyway
             score = 0.5
 
+        return _clamp(score)
+
+    def _score_stoch_rsi(self, ind: Dict) -> float:
+        """
+        Stochastic RSI k-line based score.
+        k > 80 → overbought → short signal (fade toward -1)
+        k < 20 → oversold  → long signal  (fade toward +1)
+        Returns 0.0 when stoch_signal is disabled or indicator unavailable.
+        """
+        if not self._stoch_enabled:
+            return 0.0
+        sr = ind.get("stoch_rsi")
+        if sr is None:
+            return 0.0
+        k = float(sr.get("k", 50.0))
+        if k >= 80:
+            # -0.5 at k=80, approaching -1.0 at k=100
+            score = -0.5 - 0.5 * (k - 80) / 20.0
+        elif k <= 20:
+            # +0.5 at k=20, approaching +1.0 at k=0
+            score = 0.5 + 0.5 * (20 - k) / 20.0
+        else:
+            # Linear ±0.5 across the neutral zone
+            score = (50.0 - k) / 60.0
         return _clamp(score)
 
     # ------------------------------------------------------------------

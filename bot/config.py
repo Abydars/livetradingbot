@@ -27,6 +27,16 @@ class BotConfig:
     max_dca: int
     max_re_hedge: int
     min_signal_strength: float
+    cooldown_after_stop_s: int
+    max_daily_loss_usdt: float
+    dca_multiplier: float
+    partial_tp: bool
+    partial_tp_ratio: float
+    taker_fee_pct: float
+    paper_slippage_pct: float
+    strength_sizing: bool
+    strength_size_min: float
+    stoch_signal: bool
 
     # Trading mode: "paper" | "demo" | "live"
     trading_mode: str
@@ -96,6 +106,16 @@ async def load_config() -> BotConfig:
         max_dca=_i("max_dca", 3),
         max_re_hedge=_i("max_re_hedge", 3),
         min_signal_strength=_f("min_signal_strength", 0.25),
+        cooldown_after_stop_s=_i("cooldown_after_stop_s", 300),
+        max_daily_loss_usdt=_f("max_daily_loss_usdt", 0.0),
+        dca_multiplier=_f("dca_multiplier", 1.0),
+        partial_tp=_b("partial_tp", False),
+        partial_tp_ratio=_f("partial_tp_ratio", 0.5),
+        taker_fee_pct=_f("taker_fee_pct", 0.04),
+        paper_slippage_pct=_f("paper_slippage_pct", 0.05),
+        strength_sizing=_b("strength_sizing", True),
+        strength_size_min=_f("strength_size_min", 0.5),
+        stoch_signal=_b("stoch_signal", True),
         timeframe=_s("timeframe", "1m"),
         trading_mode=trading_mode,
         key_type=key_type,

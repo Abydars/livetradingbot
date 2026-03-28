@@ -61,7 +61,7 @@ logger = logging.getLogger("main")
 
 _rest: Optional[BinanceRestClient] = None
 _ws:   Optional[BinanceWebSocket]  = None
-_flow  = OrderFlowAnalyzer(window_seconds=30, depth_levels=5)
+_flow: Optional[OrderFlowAnalyzer] = None
 _engine: Optional[TradingEngine]   = None
 _executor: Optional[OrderExecutor] = None
 _binance_client = None  # BinanceClient instance (demo/live only)
@@ -131,6 +131,21 @@ async def _do_broadcast(msg: Dict) -> None:
             _clients.difference_update(disc2)
         except Exception as exc:
             logger.debug("sessions auto-push after close failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Order flow helpers
+# ---------------------------------------------------------------------------
+
+def _flow_window_for_timeframe(tf: str) -> int:
+    """Return order-flow window in seconds as ~50% of the candle period."""
+    _TF_SECONDS = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+        "8h": 28800, "12h": 43200, "1d": 86400,
+    }
+    period = _TF_SECONDS.get(tf, 60)
+    return max(30, period // 2)
 
 
 # ---------------------------------------------------------------------------
@@ -272,15 +287,18 @@ def _safe_ind(ind: Dict) -> Dict:
 
 def _format_movers(top: list) -> list:
     """Convert raw get_top_movers rows to a lean, JSON-safe list for the UI."""
-    import math
     out = []
     for t in top:
         out.append({
-            "symbol": t["symbol"],
-            "score":  round(t["_score"], 1),
-            "change": round(float(t.get("priceChangePercent", 0)), 2),
-            "volume": round(float(t.get("quoteVolume", 0))),
-            "price":  float(t.get("lastPrice", 0)),
+            "symbol":    t["symbol"],
+            "score":     round(t["_score"], 2),
+            "change":    round(float(t.get("priceChangePercent", 0)), 2),
+            "volume":    round(float(t.get("quoteVolume", 0))),
+            "price":     float(t.get("lastPrice", 0)),
+            "bias":      t.get("_bias", ""),
+            "vol_surge": t.get("_vol_surge", 1.0),
+            "momentum":  t.get("_momentum", 0.0),
+            "atr_pct":   t.get("_atr_pct", 0.0),
         })
     return out
 
@@ -289,7 +307,7 @@ async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
     global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
     try:
-        top = await _rest.get_top_movers(n=10)
+        top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
             return
 
@@ -634,7 +652,7 @@ async def _on_user_data(event: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _rest, _ws, _engine, _executor, _binance_client, _trading_active
+    global _rest, _ws, _flow, _engine, _executor, _binance_client, _trading_active
 
     logger.info("=== Bot starting ===")
     await init_db()
@@ -699,7 +717,11 @@ async def lifespan(app: FastAPI):
                         pass
                 _binance_client = None
 
-    _executor = OrderExecutor(_binance_client, _rest, cfg.trading_mode)
+    _flow = OrderFlowAnalyzer(
+        window_seconds=_flow_window_for_timeframe(cfg.timeframe), depth_levels=5
+    )
+    _executor = OrderExecutor(_binance_client, _rest, cfg.trading_mode,
+                              paper_slippage_pct=cfg.paper_slippage_pct)
     await _executor.init()
     await _executor.prepare_symbol(cfg.symbol, cfg.leverage)
 
@@ -1089,7 +1111,7 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 
     elif mtype == "set_config":
-        global _last_candles_fetch, _binance_client, _executor, _ws
+        global _last_candles_fetch, _binance_client, _executor, _ws, _flow
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
 
         # Block symbol/timeframe changes while trading is active
@@ -1164,7 +1186,9 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 cfg2.api_key, cfg2.api_secret, cfg2.paper_mode, cfg2.key_type
             )
 
-            _executor = OrderExecutor(_binance_client, _rest, new_mode)
+            cfg2b = await load_config()
+            _executor = OrderExecutor(_binance_client, _rest, new_mode,
+                                      paper_slippage_pct=cfg2b.paper_slippage_pct)
             await _executor.init()
             _engine._executor = _executor
 
@@ -1193,9 +1217,15 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             cfg2 = await load_config()
             await _executor.prepare_symbol(cfg2.symbol, cfg2.leverage)
 
-        # Reset candle fetch if timeframe changed
+        # Reset candle fetch and re-create flow analyser if timeframe changed
         if "timeframe" in updates:
             _last_candles_fetch = 0.0
+            new_tf  = updates["timeframe"]
+            new_win = _flow_window_for_timeframe(new_tf)
+            _flow   = OrderFlowAnalyzer(window_seconds=new_win, depth_levels=5)
+            if _engine:
+                _engine._flow = _flow
+            logger.info("Order-flow window updated for %s tf: %ds", new_tf, new_win)
 
         await ws.send_text(json.dumps({"type": "config_saved", "ok": True}))
 
@@ -1220,7 +1250,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         else:
             # Cold start — fetch immediately for this client
             try:
-                top = await _rest.get_top_movers(n=10)
+                cfg_cold = await load_config()
+                top = await _rest.get_top_movers(n=10, timeframe=cfg_cold.timeframe)
                 movers = _format_movers(top)
                 await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
             except Exception:

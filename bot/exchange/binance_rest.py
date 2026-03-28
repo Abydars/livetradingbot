@@ -22,6 +22,55 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _BASE = "https://fapi.binance.com"
+
+# ---------------------------------------------------------------------------
+# Lightweight indicator helpers — used by get_top_movers() only
+# ---------------------------------------------------------------------------
+
+def _scan_ema(prices: list, period: int) -> float:
+    """Single EMA value from a price list."""
+    if len(prices) < period:
+        return prices[-1] if prices else 0.0
+    k = 2.0 / (period + 1)
+    val = sum(prices[:period]) / period
+    for p in prices[period:]:
+        val = p * k + val * (1 - k)
+    return val
+
+
+def _scan_rsi(closes: list, period: int = 14) -> float:
+    """Wilder RSI. Returns 50.0 if insufficient data."""
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i + 1] - closes[i] for i in range(len(closes) - 1)]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_g  = sum(gains[:period]) / period
+    avg_l  = sum(losses[:period]) / period
+    for i in range(period, len(deltas)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1 + avg_g / avg_l)
+
+
+def _scan_atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
+    """Wilder ATR. Returns 0.0 if insufficient data."""
+    if len(closes) < period + 1:
+        return 0.0
+    trs = [
+        max(highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]))
+        for i in range(1, len(closes))
+    ]
+    if len(trs) < period:
+        return 0.0
+    val = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        val = (val * (period - 1) + tr) / period
+    return val
 _RECV_WINDOW = 5000
 
 # Ed25519 signing (requires: pip install cryptography)
@@ -244,6 +293,32 @@ class BinanceRestClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_klines_batch(
+        self,
+        symbols: List[str],
+        interval: str = "1m",
+        limit: int = 25,
+    ) -> Dict[str, List]:
+        """
+        Fetch klines for multiple symbols concurrently.
+        Returns {symbol: klines_list}. Symbols that fail are omitted silently.
+        Rate limiter serialises requests at 20/s — 20 symbols ≈ 1 second total.
+        """
+        async def _fetch_one(sym: str):
+            try:
+                await self._market_limiter.acquire()
+                resp = await self._client.get(
+                    "/fapi/v1/klines",
+                    params={"symbol": sym, "interval": interval, "limit": limit},
+                )
+                resp.raise_for_status()
+                return sym, resp.json()
+            except Exception:
+                return sym, None
+
+        results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
+        return {sym: data for sym, data in results if data}
+
     async def get_depth(self, symbol: str, limit: int = 20) -> Dict:
         """Return order-book snapshot {"bids": [...], "asks": [...]}."""
         await self._market_limiter.acquire()
@@ -449,26 +524,47 @@ class BinanceRestClient:
     # Top movers for auto-switch
     # ------------------------------------------------------------------
 
-    async def get_top_movers(self, n: int = 5, min_quote_volume: float = 20_000_000.0) -> List[Dict]:
+    async def get_top_movers(
+        self,
+        n: int = 5,
+        min_quote_volume: float = 20_000_000.0,
+        timeframe: str = "1m",
+    ) -> List[Dict]:
         """
-        Return top-n USDT perpetual symbols ranked by current momentum spike.
+        Return top-n USDT perpetual symbols ranked for fast trading quality.
 
-        Sorting by raw quoteVolume always returns BTC/ETH regardless of what is
-        actually moving right now.  Instead we score each symbol by:
+        Two-phase scoring:
 
-            score = abs(priceChangePercent) * log10(quoteVolume)
+        Phase 1 — Ticker filter (free, no extra calls):
+          Reduces 200+ symbols to top-25 candidates using:
+          - abs(priceChangePercent): raw 24h move size
+          - (high-low)/price: 24h volatility proxy
+          - Position in 24h range aligned with trend: freshness signal
+          - log10(quoteVolume): liquidity gate
 
-        This rewards symbols with a large *relative* price move that also have
-        enough liquidity to trade.  A minimum 24-hr quoteVolume filter removes
-        illiquid micro-caps.
+        Phase 2 — Kline deep score (25 concurrent kline requests, ~1s):
+          For each candidate computes on the bot's actual timeframe:
+          - volume_surge: last-3-candle avg / 10-candle baseline avg
+          - momentum_pct: abs price change over last 5 candles
+          - atr_pct: 14-period ATR as % of price
+          - trend_aligned: EMA9 > EMA21 and price above/below correctly
+          - rsi: RSI(14) — symbols outside 20–80 are penalised
+          - bias: "LONG" if bullish setup, "SHORT" if bearish
+
+        Final score:
+          volume_surge×0.35 + momentum_pct×0.30 + atr_pct×0.20 + trend_bonus×0.15
+
+        Symbols with RSI > 80 or < 20 receive a 50% score penalty.
         """
         import math
-        tickers    = await self.get_ticker_24hr()
-        # Only include USDT perpetual symbols that are actively trading
+
+        # ── Phase 1: ticker quick-filter ───────────────────────────────
+        tickers   = await self.get_ticker_24hr()
         usdt_perps = {
             s for s, info in self.symbol_info.items()
             if info.status == "TRADING"
         }
+
         candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
@@ -476,11 +572,123 @@ class BinanceRestClient:
                 continue
             if sym not in usdt_perps:
                 continue
-            qv  = float(t.get("quoteVolume", 0))
-            pcp = abs(float(t.get("priceChangePercent", 0)))
-            if qv < min_quote_volume:          # skip illiquid symbols
+            qv = float(t.get("quoteVolume", 0))
+            if qv < min_quote_volume:
                 continue
-            score = pcp * math.log10(max(qv, 1))
-            candidates.append({**t, "_score": score})
-        candidates.sort(key=lambda t: t["_score"], reverse=True)
-        return candidates[:n]
+
+            price = float(t.get("lastPrice", 0))
+            high  = float(t.get("highPrice", 0))
+            low   = float(t.get("lowPrice", 0))
+            pcp   = float(t.get("priceChangePercent", 0))
+
+            if price <= 0:
+                continue
+
+            # 24h range as % of price — volatility proxy
+            rng     = high - low
+            vol_pct = rng / price if price > 0 else 0
+
+            # Position in 24h range (0=at low, 1=at high)
+            # Aligned with trend direction = fresh move (not exhausted)
+            range_pos   = (price - low) / rng if rng > 0 else 0.5
+            trend_fresh = range_pos if pcp > 0 else (1 - range_pos)
+
+            p1_score = (
+                abs(pcp)
+                * vol_pct
+                * math.log10(max(qv, 1))
+                * (0.4 + trend_fresh * 0.6)
+            )
+
+            candidates.append({
+                **t,
+                "_p1_score":  p1_score,
+                "_score":     p1_score,   # will be replaced in phase 2
+                "_bias":      "LONG" if pcp >= 0 else "SHORT",
+                "_vol_surge": 1.0,
+                "_momentum":  abs(pcp),
+                "_atr_pct":   vol_pct * 100,
+            })
+
+        # Keep top 25 for phase 2 (sorted by phase-1 score)
+        candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
+        phase2_pool = candidates[:25]
+
+        # ── Phase 2: kline deep score ──────────────────────────────────
+        pool_syms  = [c["symbol"] for c in phase2_pool]
+        klines_map = await self.get_klines_batch(
+            pool_syms, interval=timeframe, limit=25
+        )
+
+        for c in phase2_pool:
+            sym  = c["symbol"]
+            data = klines_map.get(sym)
+            if not data or len(data) < 15:
+                continue
+
+            # Parse klines: [open_time, open, high, low, close, volume, ...]
+            highs  = [float(k[2]) for k in data]
+            lows   = [float(k[3]) for k in data]
+            closes = [float(k[4]) for k in data]
+            vols   = [float(k[5]) for k in data]
+
+            price = closes[-1]
+            if price <= 0:
+                continue
+
+            # Volume surge: last-3-candle avg vs 10-candle baseline
+            if len(vols) >= 13:
+                recent_vol   = sum(vols[-3:]) / 3
+                baseline_vol = sum(vols[-13:-3]) / 10
+                vol_surge = recent_vol / baseline_vol if baseline_vol > 0 else 1.0
+            else:
+                vol_surge = 1.0
+
+            # Short-term momentum: abs price change over last 5 candles
+            if len(closes) >= 6:
+                momentum_pct = abs(closes[-1] - closes[-6]) / closes[-6] * 100
+            else:
+                momentum_pct = 0.0
+
+            # ATR volatility
+            atr     = _scan_atr(highs, lows, closes, 14)
+            atr_pct = (atr / price * 100) if price > 0 else 0.0
+
+            # RSI — penalise exhausted symbols
+            rsi_val     = _scan_rsi(closes, 14)
+            rsi_penalty = 0.5 if (rsi_val > 80 or rsi_val < 20) else 1.0
+
+            # Trend alignment: EMA9 and EMA21 both point same direction as move
+            ema9  = _scan_ema(closes, 9)
+            ema21 = _scan_ema(closes, 21)
+            bullish_setup = ema9 > ema21 and closes[-1] > ema21
+            bearish_setup = ema9 < ema21 and closes[-1] < ema21
+            trend_aligned = bullish_setup or bearish_setup
+            trend_bonus   = 0.15 if trend_aligned else 0.0
+
+            # Direction bias from EMA alignment, fall back to 24h direction
+            if bullish_setup:
+                bias = "LONG"
+            elif bearish_setup:
+                bias = "SHORT"
+            else:
+                bias = c["_bias"]
+
+            # Final composite score
+            base_score  = (
+                vol_surge    * 0.35
+                + momentum_pct * 0.30
+                + atr_pct      * 0.20
+                + trend_bonus
+            )
+            final_score = base_score * rsi_penalty
+
+            c["_score"]     = final_score
+            c["_bias"]      = bias
+            c["_vol_surge"] = round(vol_surge, 2)
+            c["_momentum"]  = round(momentum_pct, 3)
+            c["_atr_pct"]   = round(atr_pct, 3)
+
+        # Re-sort by final score and return top n
+        phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
+        return phase2_pool[:n]

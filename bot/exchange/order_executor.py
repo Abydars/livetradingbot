@@ -34,12 +34,13 @@ class OrderExecutor:
         trading_mode: "paper" | "demo" | "live"
     """
 
-    def __init__(self, client, rest, trading_mode: str) -> None:
+    def __init__(self, client, rest, trading_mode: str, paper_slippage_pct: float = 0.0) -> None:
         self._client = client
         self._rest = rest
         self.trading_mode = trading_mode
         self.paper_mode = trading_mode == "paper"
         self._hedge_mode = False  # set by init() after querying Binance
+        self._paper_slippage_pct = paper_slippage_pct
 
     @property
     def is_ready(self) -> bool:
@@ -144,12 +145,18 @@ class OrderExecutor:
         )
 
         if self.paper_mode:
+            # Simulate taker slippage: BUY fills slightly above mark, SELL slightly below
+            if self._paper_slippage_pct > 0:
+                slip = self._paper_slippage_pct / 100
+                fill_price = current_price * (1 + slip) if side == "BUY" else current_price * (1 - slip)
+            else:
+                fill_price = current_price
             return {
                 "orderId":    int(time.time() * 1000),
                 "symbol":     symbol,
                 "side":       side,
                 "origQty":    str(qty),
-                "avgPrice":   str(current_price),
+                "avgPrice":   str(fill_price),
                 "executedQty": str(qty),
                 "status":     "FILLED",
                 "paper":      True,

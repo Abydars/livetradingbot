@@ -22,6 +22,7 @@ from database import (
     create_session,
     get_open_hedges,
     get_open_session,
+    get_today_pnl,
     log_signal,
     update_session,
 )
@@ -88,6 +89,12 @@ class TradingEngine:
         # Cleared automatically when DCA fires, a hedge opens, or position closes.
         self._override_tp_price: Optional[float] = None
         self._override_sl_price: Optional[float] = None
+
+        # Stop cooldown: set to time.time() after hard stop, cleared on normal close.
+        self._last_stop_time: Optional[float] = None
+
+        # Partial TP: True once we have closed the first fraction; reset on full close.
+        self._partial_tp_done: bool = False
 
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
@@ -160,6 +167,12 @@ class TradingEngine:
             "hard_stop_pct":     max(atr_pct * 5.0, 2.00),  # stop: 5.0× ATR, min 2.00%
         }
 
+    @staticmethod
+    def _estimate_fees(qty: float, price: float, taker_fee_pct: float) -> float:
+        """Estimate round-trip taker fees (entry + exit) for a position."""
+        notional = qty * price
+        return notional * (taker_fee_pct / 100) * 2
+
     # ------------------------------------------------------------------
     # Level prices helper (used by WS initial-state and _push_session)
     # ------------------------------------------------------------------
@@ -222,6 +235,7 @@ class TradingEngine:
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True) -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
+        self._signal_engine._stoch_enabled = cfg.stoch_signal
         signal = self._signal_engine.compute(self.candles, flow_summary, ind)
         self.last_signal = signal
 
@@ -261,6 +275,26 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
+        # Stop cooldown: block re-entry for N seconds after a hard stop
+        if self._last_stop_time is not None:
+            elapsed = time.time() - self._last_stop_time
+            if elapsed < cfg.cooldown_after_stop_s:
+                logger.debug(
+                    "TradingEngine: entry blocked — stop cooldown %.0fs remaining",
+                    cfg.cooldown_after_stop_s - elapsed,
+                )
+                return
+
+        # Daily loss circuit breaker
+        if cfg.max_daily_loss_usdt > 0:
+            today_pnl = await get_today_pnl()
+            if today_pnl < -cfg.max_daily_loss_usdt:
+                logger.warning(
+                    "TradingEngine: entry blocked — daily loss limit "
+                    "(today=%.4f, limit=-%.4f)", today_pnl, cfg.max_daily_loss_usdt,
+                )
+                return
+
         # Validate market conditions before committing to a trade
         if atr_val <= 0:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
@@ -274,7 +308,13 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
-        qty = self._executor.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
+        # Strength-based sizing: scale margin by signal strength (floored at strength_size_min)
+        if cfg.strength_sizing:
+            scale = max(strength, cfg.strength_size_min)
+            effective_margin = cfg.margin_usdt * scale
+        else:
+            effective_margin = cfg.margin_usdt
+        qty = self._executor.calc_qty(cfg.symbol, effective_margin, cfg.leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
@@ -525,12 +565,49 @@ class TradingEngine:
                 (direction == "LONG"  and price <= self._trail_price)
                 or (direction == "SHORT" and price >= self._trail_price)
             )
-            # Close unconditionally when trail is hit — the hard stop at
-            # hard_stop_pct is the only other exit and it's worse.
-            # The old min_pct guard was removed because a large single-tick
-            # adverse move could drop price through the trail AND below
-            # min_pct in the same tick, leaving the trail permanently ignored.
             if trail_hit:
+                # Partial TP: close partial_tp_ratio fraction, keep the rest running
+                if cfg.partial_tp and not self._partial_tp_done:
+                    sess      = self._session
+                    qty       = sess["qty"]
+                    close_qty = self._executor.round_qty(
+                        cfg.symbol, qty * cfg.partial_tp_ratio
+                    )
+                    if 0 < close_qty < qty:
+                        side = "SELL" if direction == "LONG" else "BUY"
+                        order = await self._executor.place_market_order(
+                            cfg.symbol, side, close_qty, reduce_only=True, current_price=price
+                        )
+                        fill_price = float(order.get("avgPrice") or price)
+                        remain_qty    = qty - close_qty
+                        remain_margin = sess["margin"] * (remain_qty / qty)
+                        partial_realized = pnl_pct / 100 * (sess["margin"] * cfg.partial_tp_ratio)
+                        await update_session(
+                            self._session["id"],
+                            qty=remain_qty,
+                            margin=remain_margin,
+                        )
+                        self._session = await get_open_session()
+                        self._partial_tp_done = True
+                        # Disarm trail so it re-arms on the next TP touch
+                        self._trail_activated = False
+                        self._trail_price     = None
+                        await update_session(self._session["id"], trail_active=0, trail_price=None)
+                        msg = (
+                            f"{_mode_prefix(cfg.trading_mode)}"
+                            f"PARTIAL TP {direction} @ {fill_price:.4f}  "
+                            f"pnl={partial_realized:+.4f}  remain={remain_qty:.6f}"
+                        )
+                        logger.info("TradingEngine: %s", msg)
+                        self._broadcast({"type": "notification", "text": msg})
+                        self._pos_log(
+                            "partial_tp", direction=direction, price=fill_price,
+                            pnl=round(partial_realized, 4),
+                            symbol=cfg.symbol, mode=cfg.trading_mode,
+                        )
+                        self._push_session()
+                        return False
+
                 await self._close_position(cfg, price, pnl_pct, "trailing_tp")
                 return True
 
@@ -556,7 +633,9 @@ class TradingEngine:
             logger.debug("TradingEngine: DCA pending — adverse pressure not confirmed yet")
             return
 
-        new_qty = self._executor.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
+        # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
+        dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
+        new_qty = self._executor.calc_qty(cfg.symbol, dca_margin, cfg.leverage, price)
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(
             cfg.symbol, side, new_qty, current_price=price
@@ -832,7 +911,9 @@ class TradingEngine:
 
         # Session PnL = main position only. Hedge PnL is recorded independently
         # in hedge_positions.pnl so each shows as a separate trade in history.
-        realized_pnl = pnl_pct / 100 * margin
+        # Deduct round-trip taker fees from realized PnL.
+        fees = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
+        realized_pnl = pnl_pct / 100 * margin - fees
         await close_session(sess["id"], round(realized_pnl, 4), reason)
 
         msg = (
@@ -864,6 +945,8 @@ class TradingEngine:
         self._entry_adaptive    = {}
         self._override_tp_price = None
         self._override_sl_price = None
+        self._partial_tp_done   = False
+        self._last_stop_time    = None   # clear cooldown on normal close
         self._push_session()
 
     async def _emergency_close(
@@ -920,6 +1003,10 @@ class TradingEngine:
             "paper":   cfg.paper_mode,
         })
 
+        # Arm stop cooldown — prevents immediate re-entry after a hard stop.
+        # Cleared by _close_position_inner on the next normal TP close.
+        self._last_stop_time = time.time()
+
     async def _hard_stop_promote_hedge(
         self,
         cfg: BotConfig,
@@ -959,7 +1046,8 @@ class TradingEngine:
                 cfg.symbol, side, qty, reduce_only=True, current_price=price
             )
             fill_price   = float(order.get("avgPrice") or price)
-            realized_pnl = pnl_pct / 100 * margin
+            fees         = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
+            realized_pnl = pnl_pct / 100 * margin - fees
 
             # ── 2. Close main DB session ────────────────────────────────
             await close_session(sess["id"], round(realized_pnl, 4), "hard_stop")
