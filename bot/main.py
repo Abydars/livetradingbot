@@ -287,15 +287,18 @@ def _safe_ind(ind: Dict) -> Dict:
 
 def _format_movers(top: list) -> list:
     """Convert raw get_top_movers rows to a lean, JSON-safe list for the UI."""
-    import math
     out = []
     for t in top:
         out.append({
-            "symbol": t["symbol"],
-            "score":  round(t["_score"], 1),
-            "change": round(float(t.get("priceChangePercent", 0)), 2),
-            "volume": round(float(t.get("quoteVolume", 0))),
-            "price":  float(t.get("lastPrice", 0)),
+            "symbol":    t["symbol"],
+            "score":     round(t["_score"], 2),
+            "change":    round(float(t.get("priceChangePercent", 0)), 2),
+            "volume":    round(float(t.get("quoteVolume", 0))),
+            "price":     float(t.get("lastPrice", 0)),
+            "bias":      t.get("_bias", ""),
+            "vol_surge": t.get("_vol_surge", 1.0),
+            "momentum":  t.get("_momentum", 0.0),
+            "atr_pct":   t.get("_atr_pct", 0.0),
         })
     return out
 
@@ -304,7 +307,7 @@ async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
     global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
     try:
-        top = await _rest.get_top_movers(n=10)
+        top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
             return
 
@@ -1247,7 +1250,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         else:
             # Cold start — fetch immediately for this client
             try:
-                top = await _rest.get_top_movers(n=10)
+                cfg_cold = await load_config()
+                top = await _rest.get_top_movers(n=10, timeframe=cfg_cold.timeframe)
                 movers = _format_movers(top)
                 await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
             except Exception:
