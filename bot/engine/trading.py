@@ -780,7 +780,35 @@ class TradingEngine:
             "paper":   cfg.paper_mode,
         })
         if self._hedges:
-            await self._hard_stop_promote_hedge(cfg, price, pnl_pct)
+            hedge_dir = self._hedges[0]["direction"]
+            sig       = self.last_signal
+
+            # Condition A: signal actively confirms hedge direction
+            signal_confirms = (
+                sig.get("direction") == hedge_dir
+                and sig.get("strength", 0.0) >= cfg.min_signal_strength
+                and sig.get("filters_passed", False)
+            )
+            # Condition B: main exhausted its full DCA budget before stopping out
+            all_dcas_used = self._session["dca_count"] >= cfg.max_dca
+
+            if signal_confirms and all_dcas_used:
+                await self._hard_stop_promote_hedge(cfg, price, pnl_pct)
+            else:
+                if not signal_confirms:
+                    logger.info(
+                        "TradingEngine: hedge promotion skipped — "
+                        "signal=%s str=%.2f (need %s @ min %.2f)",
+                        sig.get("direction", "?"), sig.get("strength", 0.0),
+                        hedge_dir, cfg.min_signal_strength,
+                    )
+                if not all_dcas_used:
+                    logger.info(
+                        "TradingEngine: hedge promotion skipped — "
+                        "DCAs not exhausted (%d of %d used)",
+                        self._session["dca_count"], cfg.max_dca,
+                    )
+                await self._close_position(cfg, price, pnl_pct, "hard_stop")
         else:
             await self._close_position(cfg, price, pnl_pct, "hard_stop")
 
