@@ -26,7 +26,9 @@ from database import (
     close_hedge,
     close_session,
     delete_all_sessions,
+    delete_closed_hedge,
     delete_session,
+    get_all_closed_hedges,
     get_config,
     get_open_session,
     get_open_hedges,
@@ -810,10 +812,12 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         for s in sessions:
             if s["status"] == "open":
                 hedges_map[s["id"]] = await get_open_hedges(s["id"])
+        hedge_trades = await get_all_closed_hedges(limit)
         await ws.send_text(json.dumps({
-            "type":     "sessions",
-            "sessions": sessions,
-            "hedges":   hedges_map,
+            "type":         "sessions",
+            "sessions":     sessions,
+            "hedges":       hedges_map,
+            "hedge_trades": hedge_trades,
         }))
 
     elif mtype == "get_signal_log":
@@ -844,9 +848,24 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         if sid is not None:
             await delete_session(int(sid))
             sessions = await get_sessions(200)
+            hedge_trades = await get_all_closed_hedges(200)
             perf = await get_performance()
             await ws.send_text(json.dumps({
-                "type": "sessions", "sessions": sessions, "hedges": {}
+                "type": "sessions", "sessions": sessions,
+                "hedges": {}, "hedge_trades": hedge_trades,
+            }))
+            await ws.send_text(json.dumps({"type": "performance", "data": perf}))
+
+    elif mtype == "delete_hedge":
+        hid = msg.get("id")
+        if hid is not None:
+            await delete_closed_hedge(int(hid))
+            sessions = await get_sessions(200)
+            hedge_trades = await get_all_closed_hedges(200)
+            perf = await get_performance()
+            await ws.send_text(json.dumps({
+                "type": "sessions", "sessions": sessions,
+                "hedges": {}, "hedge_trades": hedge_trades,
             }))
             await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 
@@ -863,9 +882,11 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
     elif mtype == "delete_all_sessions":
         await delete_all_sessions()
         sessions = await get_sessions(200)
+        hedge_trades = await get_all_closed_hedges(200)
         perf = await get_performance()
         await ws.send_text(json.dumps({
-            "type": "sessions", "sessions": sessions, "hedges": {}
+            "type": "sessions", "sessions": sessions,
+            "hedges": {}, "hedge_trades": hedge_trades,
         }))
         await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 

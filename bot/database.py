@@ -265,6 +265,32 @@ async def get_open_hedges(session_id: int) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+async def get_all_closed_hedges(limit: int = 200) -> List[Dict[str, Any]]:
+    """Return closed hedge positions joined with their parent session's symbol."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT h.*, s.symbol, s.leverage
+               FROM hedge_positions h
+               JOIN sessions s ON h.session_id = s.id
+               WHERE h.status = 'closed'
+               ORDER BY h.open_time DESC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def delete_closed_hedge(hedge_id: int) -> None:
+    """Delete a single closed hedge position by id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM hedge_positions WHERE id=? AND status='closed'",
+            (hedge_id,),
+        )
+        await db.commit()
+
+
 async def close_hedge(hedge_id: int, pnl: float) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -351,7 +377,14 @@ async def get_performance() -> Dict[str, Any]:
         cursor = await db.execute(
             "SELECT pnl, open_time, close_time FROM sessions WHERE status='closed'"
         )
-        rows = await cursor.fetchall()
+        session_rows = await cursor.fetchall()
+
+        cursor2 = await db.execute(
+            "SELECT pnl, open_time, close_time FROM hedge_positions WHERE status='closed'"
+        )
+        hedge_rows = await cursor2.fetchall()
+
+    rows = list(session_rows) + list(hedge_rows)
 
     if not rows:
         return {

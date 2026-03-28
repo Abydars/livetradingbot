@@ -750,8 +750,9 @@ class TradingEngine:
         )
         fill_price = float(order.get("avgPrice") or price)
 
-        # Include hedge PnL in the session total so history shows true net result
-        realized_pnl = pnl_pct / 100 * margin + total_hedge_pnl
+        # Session PnL = main position only. Hedge PnL is recorded independently
+        # in hedge_positions.pnl so each shows as a separate trade in history.
+        realized_pnl = pnl_pct / 100 * margin
         await close_session(sess["id"], round(realized_pnl, 4), reason)
 
         msg = (

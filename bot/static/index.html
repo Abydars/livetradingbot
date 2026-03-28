@@ -403,6 +403,18 @@
     }
     .btn-del:hover { border-color: var(--red); color: var(--red); }
 
+    .row-hedge td { opacity: 0.82; }
+    .row-hedge { border-left: 2px solid var(--muted); }
+    .badge-hdg {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: rgba(255,255,255,.08);
+      color: var(--muted);
+      vertical-align: middle;
+      letter-spacing: .04em;
+    }
+
     #btn-del-all {
       background: none;
       border: 1px solid var(--border);
@@ -1340,7 +1352,7 @@ function dispatch(msg) {
       break;
 
     case 'sessions':
-      updateHistoryTable(msg.sessions || []);
+      updateHistoryTable(msg.sessions || [], msg.hedge_trades || []);
       break;
 
     case 'signal_log':
@@ -1993,23 +2005,49 @@ function obRow(side, px, qty, maxQty) {
 /* ═══════════════════════════════════════════════════════
    TRADE HISTORY — Step 10
 ═══════════════════════════════════════════════════════ */
-function updateHistoryTable(sessions) {
+function updateHistoryTable(sessions, hedgeTrades = []) {
   const tbody  = document.getElementById('tbody-history');
-  const closed = sessions.filter(s => s.status === 'closed');
 
-  if (!closed.length) {
+  const closed = sessions.filter(s => s.status === 'closed')
+                         .map(s => ({ ...s, _type: 'main' }));
+  const hedges = hedgeTrades.map(h => ({ ...h, _type: 'hedge' }));
+  const all    = [...closed, ...hedges].sort((a, b) => b.open_time - a.open_time);
+
+  if (!all.length) {
     tbody.innerHTML = '<tr><td colspan="15" class="empty">No closed trades yet</td></tr>';
     return;
   }
 
-  tbody.innerHTML = closed.map(s => {
-    const dir     = s.direction === 'LONG' ? 'cg' : 'cr';
-    const pnl     = s.pnl ?? null;
-    const pnlCls  = pnl === null ? '' : pnl >= 0 ? 'cg' : 'cr';
-    const pnlTxt  = pnl === null ? '--' : (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-    const dur     = (s.open_time && s.close_time) ? (s.close_time - s.open_time) : null;
-    const str     = s.signal_strength != null
-                      ? (s.signal_strength * 100).toFixed(1) + '%' : '--';
+  tbody.innerHTML = all.map(s => {
+    const dir    = s.direction === 'LONG' ? 'cg' : 'cr';
+    const pnl    = s.pnl ?? null;
+    const pnlCls = pnl === null ? '' : pnl >= 0 ? 'cg' : 'cr';
+    const pnlTxt = pnl === null ? '--' : (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    const dur    = (s.open_time && s.close_time) ? (s.close_time - s.open_time) : null;
+
+    if (s._type === 'hedge') {
+      const dirCell = `<span class="${dir}">${s.direction}</span> <span class="badge-hdg">HDG</span>`;
+      return `<tr class="row-hedge">
+        <td class="cm">${fmtTime(s.open_time)}</td>
+        <td>${s.symbol || currentSymbol}</td>
+        <td>${dirCell}</td>
+        <td class="cm">--</td>
+        <td>${fmtPrice(s.entry_price)}</td>
+        <td>${fmtPrice(s.entry_price)}</td>
+        <td>${s.qty}</td>
+        <td class="${pnlCls}">${pnlTxt}</td>
+        <td class="cm">--</td>
+        <td class="cm">--</td>
+        <td class="cm">--</td>
+        <td class="cm">hedge</td>
+        <td class="cm">--</td>
+        <td class="cm">${fmtDur(dur)}</td>
+        <td><button class="btn-del" onclick="deleteHedgeTrade(${s.id})">✕</button></td>
+      </tr>`;
+    }
+
+    const str = s.signal_strength != null
+                  ? (s.signal_strength * 100).toFixed(1) + '%' : '--';
     return `<tr>
       <td class="cm">${fmtTime(s.open_time)}</td>
       <td>${s.symbol || currentSymbol}</td>
@@ -2028,6 +2066,10 @@ function updateHistoryTable(sessions) {
       <td><button class="btn-del" onclick="deleteTrade(${s.id})">✕</button></td>
     </tr>`;
   }).join('');
+}
+
+function deleteHedgeTrade(id) {
+  wsSend({ type: 'delete_hedge', id });
 }
 
 function updatePerf(data) {
