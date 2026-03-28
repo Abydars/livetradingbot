@@ -419,16 +419,29 @@ class TradingEngine:
             and price_pct <= -p["hedge_trigger_pct"]
             and hedge_count < cfg.max_re_hedge
         ):
-            if signal["direction"] == direction and signal["filters_passed"]:
-                logger.info("TradingEngine: hedge skipped — signal agrees with main (%s)", direction)
+            # Force hedge open if price has moved 1.5× the hedge trigger regardless
+            # of signal — at this depth the loss is significant enough that protection
+            # takes priority over signal conviction.
+            force_hedge = price_pct <= -(p["hedge_trigger_pct"] * 1.5)
+
+            if signal["direction"] == direction and signal["filters_passed"] and not force_hedge:
+                logger.info(
+                    "TradingEngine: hedge skipped — signal agrees with main (%s)", direction
+                )
                 self._broadcast({"type": "notification",
                                  "text": f"Hedge skipped: signal agrees with {direction}"})
             else:
+                if force_hedge and signal["direction"] == direction:
+                    logger.warning(
+                        "TradingEngine: hedge force-opened at %.2f%% adverse "
+                        "(signal agrees but threshold 1.5× exceeded)",
+                        abs(price_pct),
+                    )
                 await self._open_hedge(cfg, price, direction, qty)
             return
 
         # ---- DCA ------------------------------------------------------------
-        if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"]:
+        if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"] and not self._hedges:
             opposite = "SHORT" if direction == "LONG" else "LONG"
             if signal["direction"] == opposite and signal["filters_passed"]:
                 logger.info(
@@ -722,10 +735,23 @@ class TradingEngine:
                     await self._close_position(cfg, price, main_pnl_pct, "hedge_tp_close")
                     return
 
-            # ── Recovery close: main has recovered to breakeven ───────────
-            # The hedge was protecting against further losses. Now that the
-            # main is no longer losing, stop the hedge from bleeding further.
-            elif main_price_pct >= 0:
+            # ── Recovery close: main has recovered past fee-breakeven ────
+            # Use min_profit_pct (≥0.10%) rather than 0% so the main has
+            # genuinely covered fees before protection is removed.
+            elif main_price_pct >= p["min_profit_pct"]:
+                # If signal still strongly confirms the hedge direction, defer one
+                # tick — the recovery may be a wick, not a genuine reversal.
+                if (
+                    signal.get("direction") == h_dir
+                    and signal.get("filters_passed", False)
+                    and signal.get("strength", 0.0) >= 0.3
+                ):
+                    logger.debug(
+                        "TradingEngine: recovery close deferred — signal still %s (hedge dir)",
+                        h_dir,
+                    )
+                    continue
+
                 side = "SELL" if h_dir == "LONG" else "BUY"
                 order = await self._executor.place_market_order(
                     cfg.symbol, side, h_qty, close_hedge=True, current_price=price
@@ -853,12 +879,6 @@ class TradingEngine:
             "type": "notification",
             "text": f"⚠ HARD STOP triggered @ {price:.4f}  pnl={pnl_pct:+.2f}%",
         })
-        await notify(cfg.discord_webhook, "HARD_STOP", {
-            "symbol":  cfg.symbol,
-            "price":   price,
-            "pnl_pct": pnl_pct,
-            "paper":   cfg.paper_mode,
-        })
         if self._hedges:
             hedge_dir = self._hedges[0]["direction"]
             sig       = self.last_signal
@@ -891,6 +911,14 @@ class TradingEngine:
                 await self._close_position(cfg, price, pnl_pct, "hard_stop")
         else:
             await self._close_position(cfg, price, pnl_pct, "hard_stop")
+
+        # Discord fires AFTER close — only notify if close actually completed
+        await notify(cfg.discord_webhook, "HARD_STOP", {
+            "symbol":  cfg.symbol,
+            "price":   price,
+            "pnl_pct": pnl_pct,
+            "paper":   cfg.paper_mode,
+        })
 
     async def _hard_stop_promote_hedge(
         self,
@@ -1023,6 +1051,7 @@ class TradingEngine:
             self._entry_adaptive    = self._adaptive or {}
             self._override_tp_price = None
             self._override_sl_price = None
+            self._pending_fills.clear()  # orphaned fill trackers from old main session
 
             partial_note = f"50% closed @ {price:.4f}" if half_qty > 0 else "100% promoted (min qty)"
             msg = (
