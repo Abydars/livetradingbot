@@ -454,8 +454,21 @@ async def _on_user_data(event: dict) -> None:
         if o.get("X") != "FILLED":
             return
 
-        fill_price = float(o.get("ap", 0))
-        fill_qty   = float(o.get("z", 0))
+        # Compute fill price from raw cumulative fields for maximum accuracy.
+        # Z = Cumulative Quote Asset Transacted Quantity (total USDT)
+        # z = Order Filled Accumulated Quantity (total contracts)
+        # Z/z = true VWAP of the order, more precise than pre-computed "ap".
+        # Fallback chain: Z/z → ap (Binance average) → L (last fill price).
+        cum_quote_z = float(o.get("Z", 0))
+        cum_qty_z   = float(o.get("z", 0))
+        fill_qty    = cum_qty_z
+
+        if cum_quote_z > 0 and cum_qty_z > 0:
+            fill_price = cum_quote_z / cum_qty_z          # most accurate
+        elif float(o.get("ap", 0)) > 0:
+            fill_price = float(o.get("ap", 0))            # Binance-computed avg
+        else:
+            fill_price = float(o.get("L", 0))             # last fill price
         symbol     = o.get("s", "")
         order_id   = o.get("i")
         # "o" = current Order Type (per docs: "LIQUIDATION" for forced closes)
@@ -521,24 +534,49 @@ async def _on_user_data(event: dict) -> None:
             return  # close/hedge/external order — don't touch avg_price
 
         sess = _engine._session
+
         if pending["type"] == "entry":
             new_avg = fill_price
+            # At entry, avg_price and entry_price must both equal the true fill
+            # price. entry_price was set from the order response which may have
+            # used the mark price as fallback — always correct both fields.
+            # No threshold: ORDER_TRADE_UPDATE data is authoritative.
+            old_entry = sess["entry_price"]
+            old_avg   = sess["avg_price"]
+            await update_session(
+                sess["id"],
+                avg_price=new_avg,
+                entry_price=new_avg,
+            )
+            _engine._session = await get_open_session()
+            logger.info(
+                "Fill sync (entry): entry_price %.6f → %.6f, "
+                "avg_price %.6f → %.6f  (true fill=%.6f)",
+                old_entry, new_avg, old_avg, new_avg, fill_price,
+            )
+            _engine._push_session()
+
         else:
+            # DCA: recompute blended average using the true fill price.
             prior_qty = pending["prior_qty"]
             prior_avg = pending["prior_avg"]
             new_qty   = pending.get("new_qty", fill_qty)
             total_qty = prior_qty + new_qty
             new_avg   = (prior_avg * prior_qty + fill_price * new_qty) / total_qty
 
-        if abs(sess["avg_price"] - new_avg) > 0.001 * new_avg:
+            # Always apply the correction — no threshold. The true fill price
+            # from ORDER_TRADE_UPDATE is more accurate than the order response
+            # avgPrice which may have been the mark price fallback.
             old_avg = sess["avg_price"]
             await update_session(sess["id"], avg_price=new_avg)
             _engine._session = await get_open_session()
             logger.info(
-                "Fill sync (%s): avg_price %.6f → %.6f (fill=%.6f)",
-                pending["type"], old_avg, new_avg, fill_price,
+                "Fill sync (dca): avg_price %.6f → %.6f  "
+                "(true_fill=%.6f  prior_avg=%.6f  prior_qty=%.6f  new_qty=%.6f)",
+                old_avg, new_avg, fill_price, prior_avg, prior_qty, new_qty,
             )
             _engine._push_session()
+
         return
 
     # ── ACCOUNT_UPDATE ────────────────────────────────────────────────────
