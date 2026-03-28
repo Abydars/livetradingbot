@@ -920,12 +920,132 @@
       .tbtn { padding: 8px 12px; }
       #symbol-select, #tf-select { padding: 5px 7px; }
     }
+
+    /* ═══════════════════════════════ DRAWERS (mobile only) ══ */
+
+    /* Backdrop overlay */
+    #drawer-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.55);
+      z-index: 200;
+      backdrop-filter: blur(2px);
+    }
+    #drawer-overlay.active { display: block; }
+
+    /* Mobile-only header buttons — hidden on desktop */
+    .mob-drawer-btn {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 15px;
+      padding: 3px 7px;
+      cursor: pointer;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .mob-drawer-btn:hover { background: rgba(255,255,255,.08); }
+
+    /* Sidebar close button — hidden on desktop */
+    .drawer-close-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      padding: 0 2px;
+      line-height: 1;
+      margin-left: auto;
+    }
+    .drawer-close-btn:hover { color: var(--text); }
+
+    /* Right-col close strip — hidden on desktop */
+    #right-drawer-close {
+      display: none;
+      justify-content: flex-end;
+      align-items: center;
+      padding: 6px 12px;
+      font-size: 11px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      flex-shrink: 0;
+      user-select: none;
+    }
+    #right-drawer-close:hover { color: var(--text); }
+
+    @media (max-width: 767px) {
+
+      /* Show mobile-only controls */
+      .mob-drawer-btn    { display: flex; }
+      .drawer-close-btn  { display: inline-flex; }
+      #right-drawer-close { display: flex; }
+
+      /* ── Left drawer: watchlist ── */
+      #sym-sidebar {
+        display: flex !important;   /* override display:none */
+        position: fixed;
+        top: 0; left: 0;
+        height: 100%;
+        width: 200px;
+        flex-direction: column;
+        background: var(--bg1);
+        border-right: 1px solid var(--border);
+        box-shadow: 4px 0 24px rgba(0,0,0,.45);
+        transform: translateX(-100%);
+        transition: transform .25s cubic-bezier(.4,0,.2,1);
+        z-index: 201;
+      }
+      #sym-sidebar.drawer-open { transform: translateX(0); }
+
+      /* Watchlist header: label + close button side by side */
+      #sym-sidebar-head {
+        display: flex;
+        align-items: center;
+      }
+
+      /* ── Right drawer: signal / position panel ── */
+      #right-col {
+        position: fixed !important;
+        top: 0; right: 0;
+        height: 100%;
+        width: 85vw;
+        max-width: 320px;
+        display: flex !important;
+        flex-direction: column !important;
+        grid-template-columns: unset !important;
+        background: var(--bg1);
+        border-left: 1px solid var(--border) !important;
+        border-top: none !important;
+        box-shadow: -4px 0 24px rgba(0,0,0,.45);
+        overflow-y: auto;
+        transform: translateX(105%);
+        transition: transform .25s cubic-bezier(.4,0,.2,1);
+        z-index: 201;
+      }
+      #right-col.drawer-open { transform: translateX(0); }
+
+      /* Cards stack vertically inside the right drawer */
+      #right-col .rcard { flex-shrink: 0; }
+      #card-hedge,
+      #card-ob { grid-column: auto !important; }
+    }
   </style>
 </head>
 <body>
 
+<!-- Drawer backdrop (mobile only) -->
+<div id="drawer-overlay" onclick="closeDrawers()"></div>
+
 <!-- ═══════════════════════════════════════════ HEADER ══ -->
 <header id="header">
+  <button class="mob-drawer-btn" id="btn-drawer-watch" onclick="openDrawer('left')" title="Watchlist">☰</button>
   <span class="logo">DCA+HEDGE BOT</span>
   <div class="hdiv"></div>
   <select id="symbol-select" onchange="changeSymbol(this.value)">
@@ -946,6 +1066,7 @@
   <div class="hspacer"></div>
   <button id="btn-trade" onclick="toggleTrading()">▶ START</button>
   <button id="btn-cfg" onclick="openCfgModal()">⚙ CONFIG</button>
+  <button class="mob-drawer-btn" id="btn-drawer-panel" onclick="openDrawer('right')" title="Panel">⊞</button>
   <div class="hdiv"></div>
   <div id="ws-status">
     <span id="ws-dot"></span>
@@ -958,7 +1079,10 @@
 
   <!-- ── SYMBOL SIDEBAR ── -->
   <div id="sym-sidebar">
-    <div id="sym-sidebar-head">WATCHLIST</div>
+    <div id="sym-sidebar-head">
+      WATCHLIST
+      <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
+    </div>
     <div id="sym-list"></div>
   </div>
 
@@ -1042,6 +1166,9 @@
 
   <!-- ── RIGHT COLUMN ── -->
   <div id="right-col">
+
+    <!-- Mobile drawer close strip -->
+    <div id="right-drawer-close" onclick="closeDrawers()">✕ close</div>
 
     <!-- Signal panel -->
     <section class="rcard" id="card-signal">
@@ -2417,6 +2544,33 @@ function setTfSelect(tf) {
   const sel = document.getElementById('tf-select');
   if (sel) sel.value = tf;
 }
+
+/* ── Mobile drawers ── */
+function openDrawer(side) {
+  closeDrawers();
+  if (side === 'left')  document.getElementById('sym-sidebar').classList.add('drawer-open');
+  if (side === 'right') document.getElementById('right-col').classList.add('drawer-open');
+  document.getElementById('drawer-overlay').classList.add('active');
+}
+function closeDrawers() {
+  document.getElementById('sym-sidebar').classList.remove('drawer-open');
+  document.getElementById('right-col').classList.remove('drawer-open');
+  document.getElementById('drawer-overlay').classList.remove('active');
+}
+
+// Swipe gestures: right-swipe opens watchlist, left-swipe opens panel, either swipe closes open drawer
+let _swipeX = 0;
+document.addEventListener('touchstart', e => { _swipeX = e.touches[0].clientX; }, { passive: true });
+document.addEventListener('touchend', e => {
+  if (window.innerWidth > 767) return;
+  const dx = e.changedTouches[0].clientX - _swipeX;
+  const leftOpen  = document.getElementById('sym-sidebar').classList.contains('drawer-open');
+  const rightOpen = document.getElementById('right-col').classList.contains('drawer-open');
+  if (Math.abs(dx) < 40) return;  // ignore small swipes
+  if (leftOpen || rightOpen) { closeDrawers(); return; }
+  if (dx >  40) openDrawer('left');
+  if (dx < -40) openDrawer('right');
+}, { passive: true });
 
 function changeTf(tf) {
   if (tradingActive) {
