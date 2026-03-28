@@ -122,41 +122,48 @@ class SignalEngine:
 
     def _score_flow(self, flow: Dict) -> float:
         """
-        Combine volume delta score and book imbalance.
-        Each in [-1, +1]; average them.
+        Combine three order-flow signals, each naturally in [-1, +1]:
+          score      — taker buy/sell notional delta over rolling window
+          imbalance  — qty-weighted bid/ask book imbalance (top N levels)
+          ba_ratio   — notional-weighted bid/ask book imbalance (large orders)
+        Average all three equally and clamp.
         """
         score     = float(flow.get("score", 0.0))
         imbalance = float(flow.get("imbalance", 0.0))
-        combined = (score + imbalance) / 2.0
+        # bid_ask_ratio is in [0, 1]; map to [-1, +1]
+        ba_ratio  = (float(flow.get("bid_ask_ratio", 0.5)) - 0.5) * 2.0
+        combined  = (score + imbalance + ba_ratio) / 3.0
         return _clamp(combined)
 
     def _score_trend(self, ind: Dict) -> float:
         """
         EMA21 vs EMA50 cross.
         +1 = EMA21 strongly above EMA50, -1 = strongly below.
-        Normalised by 0.5% of EMA50 to produce a ±1 score.
+        Normalised by ATR% so score magnitude is regime-independent.
         """
         ema21: Optional[float] = ind.get("ema21")
         ema50: Optional[float] = ind.get("ema50")
         if ema21 is None or ema50 is None or ema50 == 0:
             return 0.0
-        diff_pct = (ema21 - ema50) / ema50  # e.g. +0.003 = +0.3%
-        # Scale so that 0.5% diff → ±1
-        scaled = diff_pct / 0.005
+        diff_pct = (ema21 - ema50) / ema50
+        atr_val = ind.get("atr")
+        atr_pct = (atr_val / ema50) if (atr_val and ema50 and ema50 > 0) else 0.005
+        scaled = diff_pct / max(atr_pct, 1e-6)
         return _clamp(scaled)
 
     def _score_momentum(self, ind: Dict) -> float:
         """
         MACD histogram direction and magnitude.
-        Scale histogram relative to price magnitude (0.1% of price ≈ ±1).
+        1 ATR of histogram movement relative to price = ±1 score.
         """
         macd_data = ind.get("macd")
         if macd_data is None:
             return 0.0
-        hist = macd_data["hist"]
-        # Normalise: use ema50 as price proxy
+        hist  = macd_data["hist"]
         ema50 = ind.get("ema50") or 1.0
-        norm = (hist / ema50) / 0.001   # 0.1% of price → ±1
+        atr_val = ind.get("atr")
+        atr_pct = (atr_val / ema50) if (atr_val and ema50 and ema50 > 0) else 0.001
+        norm = (hist / ema50) / max(atr_pct, 1e-6)
         return _clamp(norm)
 
     def _score_mean_reversion(self, ind: Dict) -> float:
@@ -178,14 +185,43 @@ class SignalEngine:
 
     def _score_rsi(self, ind: Dict) -> float:
         """
-        RSI scaled: 30 → -1, 70 → +1 (linear).
+        Zone-based RSI scoring that aligns with _apply_filters():
+          > 75        → -0.5  hard overbought penalty (filter blocks LONG here)
+          70–75       → fade -0.1 → -0.5  approaching filter block
+          60–70       → fade +0.5 → 0.0   weakening bullish momentum
+          40–60       → linear -0.5 → +0.5 confirmation zone
+          30–40       → fade 0.0 → -0.5   weakening bearish momentum
+          25–30       → fade +0.1 → +0.5  approaching oversold block
+          < 25        → +0.5  hard oversold penalty (filter blocks SHORT here)
         """
         rsi_val = ind.get("rsi")
         if rsi_val is None:
             return 0.0
-        # Map [30, 70] → [-1, +1]
-        scaled = (rsi_val - 50.0) / 20.0
-        return _clamp(scaled)
+
+        if rsi_val > 75:
+            # Hard overbought — filter will block LONG entries anyway
+            score = -0.5
+        elif rsi_val >= 70:
+            # Fade from -0.1 (at 75) to -0.5 is wrong direction; fade -0.1 → -0.5
+            # as RSI climbs from 70 toward 75
+            score = -0.1 - 0.4 * (rsi_val - 70) / 5.0
+        elif rsi_val >= 60:
+            # Momentum weakening: fade +0.5 → 0.0 as RSI climbs 60→70
+            score = 0.5 * (70 - rsi_val) / 10.0
+        elif rsi_val >= 40:
+            # Confirmation zone: linear -0.5 → +0.5
+            score = (rsi_val - 50.0) / 20.0
+        elif rsi_val >= 30:
+            # Momentum weakening bearish: fade 0.0 → -0.5 as RSI falls 40→30
+            score = -0.5 * (40 - rsi_val) / 10.0
+        elif rsi_val >= 25:
+            # Approaching oversold block: fade +0.1 → +0.5 as RSI falls 30→25
+            score = 0.1 + 0.4 * (30 - rsi_val) / 5.0
+        else:
+            # Hard oversold — filter will block SHORT entries anyway
+            score = 0.5
+
+        return _clamp(score)
 
     # ------------------------------------------------------------------
     # Entry filters

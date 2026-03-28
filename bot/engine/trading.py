@@ -73,9 +73,6 @@ class TradingEngine:
         self._trail_activated: bool = False
         self._trail_price: Optional[float] = None
 
-        # DCA adverse pressure timer
-        self._dca_pending_since: Optional[float] = None
-
         # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
         # Used by _on_user_data in main.py to compute correct blended average from true fill price.
         self._pending_fills: Dict[int, Dict] = {}
@@ -313,7 +310,6 @@ class TradingEngine:
         self._hedges = []
         self._trail_activated = False
         self._trail_price = None
-        self._dca_pending_since = None
         self._entry_adaptive = entry_adaptive  # locked for life of this trade
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
@@ -544,12 +540,8 @@ class TradingEngine:
         """DCA with 5-second adverse pressure confirmation."""
         confirmed = self._flow.check_adverse_pressure(direction, required_seconds=5.0)
         if not confirmed:
-            if self._dca_pending_since is None:
-                self._dca_pending_since = time.time()
-                logger.debug("TradingEngine: DCA pending — waiting for adverse pressure")
+            logger.debug("TradingEngine: DCA pending — adverse pressure not confirmed yet")
             return
-
-        self._dca_pending_since = None
 
         new_qty = self._executor.calc_qty(cfg.symbol, cfg.margin_usdt, cfg.leverage, price)
         side = "BUY" if direction == "LONG" else "SELL"
@@ -582,9 +574,14 @@ class TradingEngine:
 
         # Recalculate risk thresholds from current ATR at DCA time.
         # Market volatility may have changed since entry; refreshing here keeps
-        # SL/TP percentages aligned with actual conditions after each capital add.
+        # SL/dca/hedge thresholds aligned with actual conditions after each capital add.
+        # tp_pct is preserved: the TP arm is anchored to entry_price and must not
+        # drift when DCA lowers avg_price.
         if atr_val > 0 and price > 0:
+            old_tp_pct = self._entry_adaptive.get("tp_pct")
             self._entry_adaptive = self._compute_adaptive(atr_val, price)
+            if old_tp_pct is not None:
+                self._entry_adaptive["tp_pct"] = old_tp_pct
             logger.info(
                 "TradingEngine: entry_adaptive recalculated at DCA #%d "
                 "(tp=%.3f%% sl=%.3f%%)",
@@ -838,7 +835,6 @@ class TradingEngine:
         self._hedges            = []
         self._trail_activated   = False
         self._trail_price       = None
-        self._dca_pending_since = None
         self._entry_adaptive    = {}
         self._override_tp_price = None
         self._override_sl_price = None
@@ -1023,7 +1019,6 @@ class TradingEngine:
             self._hedges          = []
             self._trail_activated = False
             self._trail_price     = None
-            self._dca_pending_since = None
             # Seed entry_adaptive from current ATR so TP/SL are immediately active
             self._entry_adaptive    = self._adaptive or {}
             self._override_tp_price = None

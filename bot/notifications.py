@@ -38,13 +38,14 @@ def _fmt_qty(q: float) -> str:
 
 # Discord embed colours (decimal)
 _COLOUR = {
-    "TRADE_OPEN":  0x00C853,   # green
-    "TRADE_DCA":   0x1565C0,   # blue
-    "HEDGE_OPEN":  0x6A1B9A,   # purple
+    "TRADE_OPEN":      0x00C853,   # green
+    "TRADE_DCA":       0x1565C0,   # blue
+    "HEDGE_OPEN":      0x6A1B9A,   # purple
+    "HEDGE_PROMOTED":  0xFF6D00,   # orange
     "TRADE_CLOSE_WIN": 0x00C853,
     "TRADE_CLOSE_LOSS": 0xD32F2F,
-    "HARD_STOP":   0xD32F2F,   # red
-    "AUTO_SWITCH": 0xF9A825,   # gold
+    "HARD_STOP":       0xD32F2F,   # red
+    "AUTO_SWITCH":     0xF9A825,   # gold
 }
 
 
@@ -141,6 +142,20 @@ def _build_embed(event: str, data: Dict) -> Dict:
                 {"name": "Symbol",  "value": symbol,                              "inline": True},
                 {"name": "Price",   "value": _fmt_p(data.get('price', 0)),         "inline": True},
                 {"name": "PnL %",   "value": f"{data.get('pnl_pct', 0):+.2f}%",  "inline": True},
+            ],
+        }
+
+    if event == "HEDGE_PROMOTED":
+        return {
+            "title": f"♻ HEDGE PROMOTED → MAIN{paper_tag}",
+            "color": _COLOUR["HEDGE_PROMOTED"],
+            "fields": [
+                {"name": "Symbol",            "value": symbol,                                        "inline": True},
+                {"name": "Direction",         "value": data.get("direction", ""),                     "inline": True},
+                {"name": "Entry Price",       "value": _fmt_p(data.get("price", 0)),                  "inline": True},
+                {"name": "Qty",               "value": _fmt_qty(data.get("qty", 0)),                  "inline": True},
+                {"name": "Margin",            "value": f"{data.get('margin', 0)} USDT",               "inline": True},
+                {"name": "Partial Close Qty", "value": _fmt_qty(data.get("partial_close_qty", 0)),    "inline": True},
             ],
         }
 
