@@ -741,13 +741,15 @@ async def ws_endpoint(websocket: WebSocket):
             hedges = await get_open_hedges(sess["id"])
             tp_price, sl_price = _engine.get_level_prices() if _engine else (None, None)
             await websocket.send_text(json.dumps({
-                "type":        "session",
-                "session":     sess,
-                "hedges":      hedges,
-                "trail_price": _engine._trail_price if _engine else None,
-                "trail_active": _engine._trail_activated if _engine else False,
-                "tp_price":    tp_price,
-                "sl_price":    sl_price,
+                "type":               "session",
+                "session":            sess,
+                "hedges":             hedges,
+                "trail_price":        _engine._trail_price     if _engine else None,
+                "trail_active":       _engine._trail_activated if _engine else False,
+                "tp_price":           tp_price,
+                "sl_price":           sl_price,
+                "override_tp_price":  _engine._override_tp_price if _engine else None,
+                "override_sl_price":  _engine._override_sl_price if _engine else None,
             }))
 
         # Surface any stored exchange startup error immediately
