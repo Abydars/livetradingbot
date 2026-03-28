@@ -705,8 +705,11 @@ class TradingEngine:
                     cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
-                # PnL = price_change × qty (futures identity; margin/leverage cancel)
-                h_pnl = h_price_pct / 100 * h_qty * h_price
+                # PnL = (exit - entry) × qty (futures identity; margin/leverage cancel)
+                if h_dir == "LONG":
+                    h_pnl = (fill_price - h_price) * h_qty
+                else:
+                    h_pnl = (h_price - fill_price) * h_qty
                 await close_hedge(hedge["id"], round(h_pnl, 4))
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
@@ -731,7 +734,10 @@ class TradingEngine:
                     cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
-                h_pnl = h_price_pct / 100 * h_qty * h_price
+                if h_dir == "LONG":
+                    h_pnl = (fill_price - h_price) * h_qty
+                else:
+                    h_pnl = (h_price - fill_price) * h_qty
                 await close_hedge(hedge["id"], round(h_pnl, 4))
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 

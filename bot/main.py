@@ -407,6 +407,16 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     _engine._pending_fills.clear()
     _engine._push_session()
 
+    # Push updated trade history to all clients immediately — don't rely on
+    # the frontend's prevOpen→!nowOpen transition to trigger a get_sessions
+    # (it may be False if the client just connected or reconnected).
+    sessions     = await get_sessions(200)
+    hedge_trades = await get_all_closed_hedges(200)
+    perf         = await get_performance()
+    _broadcast({"type": "sessions", "sessions": sessions,
+                "hedges": {}, "hedge_trades": hedge_trades})
+    _broadcast({"type": "performance", "data": perf})
+
 
 async def _on_user_data(event: dict) -> None:
     """
