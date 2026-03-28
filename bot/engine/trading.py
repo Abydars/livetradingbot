@@ -779,7 +779,133 @@ class TradingEngine:
             "pnl_pct": pnl_pct,
             "paper":   cfg.paper_mode,
         })
-        await self._close_position(cfg, price, pnl_pct, "hard_stop")
+        if self._hedges:
+            await self._hard_stop_promote_hedge(cfg, price, pnl_pct)
+        else:
+            await self._close_position(cfg, price, pnl_pct, "hard_stop")
+
+    async def _hard_stop_promote_hedge(
+        self,
+        cfg: BotConfig,
+        price: float,
+        pnl_pct: float,
+    ) -> None:
+        """
+        Main position hit hard stop while a hedge is open.
+        Instead of closing everything, close only the main and promote the
+        hedge to a new main session with DCA locked at max so no additional
+        capital is added to an already-large position.
+
+        Example:
+          Main LONG $10 → 2×DCA → $30 total → hedge SHORT $30 opened
+          Main hits hard SL → close main, keep SHORT as new MAIN
+          New session: dca_count = max_dca → no further DCAs
+        """
+        self._closing = True
+        try:
+            sess      = self._session
+            direction = sess["direction"]
+            qty       = sess["qty"]
+            margin    = sess["margin"]
+
+            # ── 1. Close main Binance position ─────────────────────────
+            side  = "SELL" if direction == "LONG" else "BUY"
+            order = await self._executor.place_market_order(
+                cfg.symbol, side, qty, reduce_only=True, current_price=price
+            )
+            fill_price  = float(order.get("avgPrice") or price)
+            realized_pnl = pnl_pct / 100 * margin
+
+            # ── 2. Close main DB session ────────────────────────────────
+            await close_session(sess["id"], round(realized_pnl, 4), "hard_stop")
+            logger.info(
+                "TradingEngine: HARD STOP main CLOSE %s @ %.4f  pnl=%+.4f",
+                direction, fill_price, realized_pnl,
+            )
+            await notify(cfg.discord_webhook, "TRADE_CLOSE", {
+                "symbol":    cfg.symbol,
+                "direction": direction,
+                "price":     fill_price,
+                "pnl":       realized_pnl,
+                "pnl_pct":   pnl_pct,
+                "reason":    "hard_stop",
+                "trading_mode": cfg.trading_mode,
+            })
+
+            # Take the primary hedge; close any extras on Binance (shouldn't happen)
+            primary_hedge = self._hedges[0]
+            for extra in self._hedges[1:]:
+                h_side = "SELL" if extra["direction"] == "LONG" else "BUY"
+                await self._executor.place_market_order(
+                    cfg.symbol, h_side, extra["qty"],
+                    close_hedge=True, current_price=price,
+                )
+                await close_hedge(extra["id"], 0.0)
+
+            # ── 3. Mark hedge DB record closed (Binance position stays open) ──
+            h_dir = primary_hedge["direction"]
+            if h_dir == "LONG":
+                h_pnl_pct = (price - primary_hedge["entry_price"]) / primary_hedge["entry_price"] * 100
+            else:
+                h_pnl_pct = (primary_hedge["entry_price"] - price) / primary_hedge["entry_price"] * 100
+            h_pnl = h_pnl_pct / 100 * sess["leverage"] * primary_hedge["margin"]
+            await close_hedge(primary_hedge["id"], round(h_pnl, 4))
+
+            # ── 4. Create new main session for the (now-promoted) hedge ──
+            new_session_id = await create_session(
+                symbol=cfg.symbol,
+                direction=h_dir,
+                entry_price=primary_hedge["entry_price"],
+                qty=primary_hedge["qty"],
+                margin=primary_hedge["margin"],
+                leverage=sess["leverage"],
+                entry_reason="hedge_promoted",
+                signal_strength=0.0,
+                signal_price=primary_hedge["entry_price"],
+            )
+            # Lock DCA at max so no further capital is added on top of the
+            # already-accumulated position size.
+            await update_session(new_session_id, dca_count=cfg.max_dca)
+
+            # ── 5. Update engine state ──────────────────────────────────
+            self._session         = await get_open_session()
+            self._hedges          = []
+            self._trail_activated = False
+            self._trail_price     = None
+            self._dca_pending_since = None
+            # Seed entry_adaptive from current market ATR so TP/SL are live
+            self._entry_adaptive  = self._adaptive or {}
+
+            msg = (
+                f"{_mode_prefix(cfg.trading_mode)}"
+                f"HEDGE PROMOTED → MAIN {h_dir} @ {primary_hedge['entry_price']:.4f}  "
+                f"qty={primary_hedge['qty']}  margin={primary_hedge['margin']}  "
+                f"DCA locked (max={cfg.max_dca})"
+            )
+            logger.info("TradingEngine: %s", msg)
+            self._broadcast({"type": "notification", "text": msg})
+            self._pos_log(
+                "hedge_promoted",
+                direction=h_dir,
+                price=primary_hedge["entry_price"],
+                qty=primary_hedge["qty"],
+                symbol=cfg.symbol,
+                mode=cfg.trading_mode,
+            )
+            self._push_session()
+
+            await log_signal(cfg.symbol, h_dir, 0.0, {}, "hedge_promoted")
+            await notify(cfg.discord_webhook, "HEDGE_PROMOTED", {
+                "symbol":       cfg.symbol,
+                "direction":    h_dir,
+                "price":        primary_hedge["entry_price"],
+                "qty":          primary_hedge["qty"],
+                "margin":       primary_hedge["margin"],
+                "dca_locked":   cfg.max_dca,
+                "trading_mode": cfg.trading_mode,
+            })
+        finally:
+            self._closing = False
 
     # ------------------------------------------------------------------
     # Forced close (API-level reset)
