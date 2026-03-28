@@ -445,6 +445,7 @@ async def _on_user_data(event: dict) -> None:
       - If position for the tracked symbol goes to zero, the position was
         closed externally (manual close, liquidation, another bot).
     """
+    global _last_external_fill_price
     etype = event.get("e")
 
     # ── ORDER_TRADE_UPDATE ────────────────────────────────────────────────
@@ -498,7 +499,6 @@ async def _on_user_data(event: dict) -> None:
             # Not the bot's order. Check if this is a manual/external close
             # of the tracked position so we can capture the real fill price
             # before ACCOUNT_UPDATE fires with no price information.
-            global _last_external_fill_price
             if (
                 _engine and _engine._session
                 and not _engine._closing
@@ -571,7 +571,6 @@ async def _on_user_data(event: dict) -> None:
                 # Use fill price captured from ORDER_TRADE_UPDATE if available.
                 # ORDER_TRADE_UPDATE fires before ACCOUNT_UPDATE so the price
                 # should already be stored. Consume and clear it in one step.
-                global _last_external_fill_price
                 close_price = _last_external_fill_price
                 _last_external_fill_price = 0.0
                 if close_price > 0:
