@@ -210,3 +210,7 @@ class OrderExecutor:
     ) -> float:
         """Delegate qty calculation to BinanceRestClient (handles step-size rounding)."""
         return self._rest.calc_qty(symbol, margin_usdt, leverage, price)
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        """Round an arbitrary qty to the symbol's exchange step size."""
+        return self._rest._round_qty(symbol, qty)
