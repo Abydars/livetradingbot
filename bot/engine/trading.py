@@ -655,8 +655,9 @@ class TradingEngine:
                     cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
-                h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
-                await close_hedge(hedge["id"], h_pnl)
+                # PnL = price_change × qty (futures identity; margin/leverage cancel)
+                h_pnl = h_price_pct / 100 * h_qty * h_price
+                await close_hedge(hedge["id"], round(h_pnl, 4))
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
                 msg = f"{_mode_prefix(cfg.trading_mode)}HEDGE CLOSED (TP) @ {fill_price:.6f}"
@@ -680,8 +681,8 @@ class TradingEngine:
                     cfg.symbol, side, h_qty, close_hedge=True, current_price=price
                 )
                 fill_price = float(order.get("avgPrice") or price)
-                h_pnl = h_price_pct / 100 * sess["leverage"] * hedge["margin"]
-                await close_hedge(hedge["id"], h_pnl)
+                h_pnl = h_price_pct / 100 * h_qty * h_price
+                await close_hedge(hedge["id"], round(h_pnl, 4))
                 self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
 
                 msg = (
@@ -736,10 +737,10 @@ class TradingEngine:
             fill = float(order.get("avgPrice") or price)
             h_dir = hedge["direction"]
             if h_dir == "LONG":
-                h_pnl = (fill - hedge["entry_price"]) / hedge["entry_price"] * hedge["margin"] * sess["leverage"]
+                h_pnl = (fill - hedge["entry_price"]) * hedge["qty"]
             else:
-                h_pnl = (hedge["entry_price"] - fill) / hedge["entry_price"] * hedge["margin"] * sess["leverage"]
-            await close_hedge(hedge["id"], h_pnl)
+                h_pnl = (hedge["entry_price"] - fill) * hedge["qty"]
+            await close_hedge(hedge["id"], round(h_pnl, 4))
             total_hedge_pnl += h_pnl
         self._hedges = []
 
@@ -926,7 +927,7 @@ class TradingEngine:
                     cfg.symbol, h_close_side, half_qty,
                     close_hedge=True, current_price=price,
                 )
-                half_pnl = h_pnl_pct / 100 * sess["leverage"] * (h_margin * half_qty / h_qty)
+                half_pnl = h_pnl_pct / 100 * half_qty * h_entry
                 logger.info(
                     "TradingEngine: hedge partial close 50%% qty=%.6f  pnl=%+.4f",
                     half_qty, half_pnl,
@@ -940,7 +941,7 @@ class TradingEngine:
 
             # ── 4. Mark hedge DB record closed ──────────────────────────
             # Full PnL attributed here; ongoing position tracked by new session.
-            full_h_pnl = h_pnl_pct / 100 * sess["leverage"] * h_margin
+            full_h_pnl = h_pnl_pct / 100 * h_qty * h_entry
             await close_hedge(primary_hedge["id"], round(full_h_pnl, 4))
 
             # ── 5. Create new main session for the promoted half ────────
