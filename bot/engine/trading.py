@@ -572,7 +572,7 @@ class TradingEngine:
             direction=hedge_dir,
             entry_price=fill_price,
             qty=hedge_qty,
-            margin=cfg.margin_usdt,
+            margin=self._session["margin"],  # full accumulated margin incl. DCA
         )
         await update_session(
             self._session["id"],
