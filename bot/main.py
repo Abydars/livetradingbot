@@ -611,6 +611,48 @@ async def lifespan(app: FastAPI):
     _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
 
+    # ── Startup position sync (live/demo only) ────────────────────────────
+    # If the DB has an open session but Binance shows the position is already
+    # gone (closed while the bot was stopped), record it as closed so it
+    # appears in trade history.
+    if _engine._session and not cfg.paper_mode:
+        try:
+            pos = await _rest.get_position_risk(cfg.symbol)
+            if pos is None:
+                # Position is flat on Binance — close it in the DB
+                sess      = _engine._session
+                direction = sess["direction"]
+                avg_price = sess["avg_price"]
+                leverage  = sess["leverage"]
+                margin    = sess["margin"]
+                # Use mark price as best approximation of the exit price
+                fill_price = await _rest.get_mark_price(cfg.symbol)
+                if fill_price > 0:
+                    if direction == "LONG":
+                        pnl_pct = (fill_price - avg_price) / avg_price * 100 * leverage
+                    else:
+                        pnl_pct = (avg_price - fill_price) / avg_price * 100 * leverage
+                    realized_pnl = round(pnl_pct / 100 * margin, 4)
+                else:
+                    realized_pnl = 0.0
+
+                for hedge in list(_engine._hedges):
+                    await close_hedge(hedge["id"], 0.0)
+
+                await close_session(sess["id"], realized_pnl, "external_close")
+                logger.warning(
+                    "Startup sync: session %d was open in DB but position is flat "
+                    "on Binance — closed with pnl=%.4f (approx mark price %.6f)",
+                    sess["id"], realized_pnl, fill_price,
+                )
+                _engine._session         = None
+                _engine._hedges          = []
+                _engine._trail_activated = False
+                _engine._trail_price     = None
+                _engine._entry_adaptive  = {}
+        except Exception as exc:
+            logger.error("Startup position sync failed: %s", exc)
+
     _ws = BinanceWebSocket(
         cfg.symbol, cfg.trading_mode, on_trade=_on_trade, on_depth=_on_depth,
         on_error=_on_exchange_error,
