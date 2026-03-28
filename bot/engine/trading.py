@@ -168,7 +168,8 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     def get_level_prices(self):
-        """Return (tp_price, sl_price) for the current session, or (None, None)."""
+        """Return (tp_price, sl_price) for the current session, or (None, None).
+        Manual overrides take priority over ATR-computed values."""
         ref = self._entry_adaptive or self._adaptive
         if not self._session or not ref:
             return None, None
@@ -178,9 +179,15 @@ class TradingEngine:
         tp    = ref["tp_pct"]
         sl    = ref["hard_stop_pct"]
         if d == "LONG":
-            return entry * (1 + tp / 100), avg * (1 - sl / 100)
+            computed_tp = entry * (1 + tp / 100)
+            computed_sl = avg   * (1 - sl / 100)
         else:
-            return entry * (1 - tp / 100), avg * (1 + sl / 100)
+            computed_tp = entry * (1 - tp / 100)
+            computed_sl = avg   * (1 + sl / 100)
+        return (
+            self._override_tp_price if self._override_tp_price is not None else computed_tp,
+            self._override_sl_price if self._override_sl_price is not None else computed_sl,
+        )
 
     # ------------------------------------------------------------------
     # Startup

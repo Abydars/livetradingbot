@@ -1717,31 +1717,27 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     title:            'Entry',
   });
 
-  // Trail-arm line — use manual override if set, otherwise server value
-  if (!_overrideTpPrice) {
-    _tpLine = _removeLine(_tpLine);
-    _tpLine = csSeries.createPriceLine({
-      price:            curTpPrice || computeTPPrice(session),
-      color:            '#3fb950',
-      lineWidth:        1,
-      lineStyle:        LightweightCharts.LineStyle.Dashed,
-      axisLabelVisible: true,
-      title:            'TRAIL ARM',
-    });
-  }
+  // Trail-arm line — override takes priority; falls back to server then computed
+  _tpLine = _removeLine(_tpLine);
+  _tpLine = csSeries.createPriceLine({
+    price:            _overrideTpPrice ?? curTpPrice ?? computeTPPrice(session),
+    color:            '#3fb950',
+    lineWidth:        1,
+    lineStyle:        LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title:            'TRAIL ARM',
+  });
 
-  // Hard-stop line — use manual override if set, otherwise server value
-  if (!_overrideSlPrice) {
-    _slLine = _removeLine(_slLine);
-    _slLine = csSeries.createPriceLine({
-      price:            curSlPrice || computeSLPrice(session),
-      color:            '#f85149',
-      lineWidth:        1,
-      lineStyle:        LightweightCharts.LineStyle.Dashed,
-      axisLabelVisible: true,
-      title:            'HARD STOP',
-    });
-  }
+  // Hard-stop line — override takes priority; falls back to server then computed
+  _slLine = _removeLine(_slLine);
+  _slLine = csSeries.createPriceLine({
+    price:            _overrideSlPrice ?? curSlPrice ?? computeSLPrice(session),
+    color:            '#f85149',
+    lineWidth:        1,
+    lineStyle:        LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title:            'HARD STOP',
+  });
 
   // Trailing stop line (orange dotted, only when active)
   _trailLine = _removeLine(_trailLine);
