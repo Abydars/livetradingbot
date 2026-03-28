@@ -1174,7 +1174,6 @@ function adjustLevel(type, dir) {
   if (type === 'tp') {
     const cur = _overrideTpPrice ?? curTpPrice ?? computeTPPrice(curSession);
     _overrideTpPrice = cur + dir * step;
-    // Update chart line immediately
     if (csSeries && _tpLine !== undefined) {
       _tpLine = _removeLine(_tpLine);
       _tpLine = csSeries.createPriceLine({
@@ -1195,6 +1194,8 @@ function adjustLevel(type, dir) {
       });
     }
   }
+  // Send to backend so the engine uses these levels for real execution
+  wsSend({ type: 'set_level_override', tp_price: _overrideTpPrice, sl_price: _overrideSlPrice });
   updatePositionPanel();
 }
 
@@ -1389,6 +1390,12 @@ function dispatch(msg) {
       if (msg.data) updateSignalPanel(msg.data);
       break;
 
+    case 'level_overrides_cleared':
+      _overrideTpPrice = null;
+      _overrideSlPrice = null;
+      // Chart lines will be corrected by the session update that follows
+      break;
+
     case 'session': {
       const prevOpen = curSession?.status === 'open';
       const nowOpen  = msg.session?.status === 'open';
@@ -1399,6 +1406,9 @@ function dispatch(msg) {
       curTrailActive = !!msg.trail_active;
       curTpPrice     = msg.tp_price  ?? null;
       curSlPrice     = msg.sl_price  ?? null;
+      // Sync manual overrides from engine (keeps other tabs in sync too)
+      if (msg.override_tp_price !== undefined) _overrideTpPrice = msg.override_tp_price;
+      if (msg.override_sl_price !== undefined) _overrideSlPrice = msg.override_sl_price;
       updatePositionPanel();
       updateTradeLevels(msg.session, curTrailPrice, curTrailActive, prevOpen, nowOpen);
       // Trade just closed — refresh history immediately so it shows the new row

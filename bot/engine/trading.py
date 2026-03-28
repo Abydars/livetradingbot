@@ -82,9 +82,15 @@ class TradingEngine:
 
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
-        #   _entry_adaptive: locked at trade entry, used for ALL SL/TP decisions
+        #   _entry_adaptive: locked at trade entry, updated on each DCA
         self._adaptive: Dict[str, float] = {}
         self._entry_adaptive: Dict[str, float] = {}
+
+        # Manual level overrides set from the UI.
+        # When set, these replace the ATR-computed TP arm / hard-stop prices.
+        # Cleared automatically when DCA fires, a hedge opens, or position closes.
+        self._override_tp_price: Optional[float] = None
+        self._override_sl_price: Optional[float] = None
 
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
@@ -112,18 +118,29 @@ class TradingEngine:
                 tp_price = entry * (1 - tp / 100)
                 sl_price = avg   * (1 + sl / 100)
         self._broadcast({
-            "type":         "session",
-            "session":      self._session,
-            "hedges":       self._hedges,
-            "trail_price":  self._trail_price,
-            "trail_active": self._trail_activated,
-            "tp_price":     tp_price,
-            "sl_price":     sl_price,
+            "type":               "session",
+            "session":            self._session,
+            "hedges":             self._hedges,
+            "trail_price":        self._trail_price,
+            "trail_active":       self._trail_activated,
+            "tp_price":           tp_price,
+            "sl_price":           sl_price,
+            "override_tp_price":  self._override_tp_price,
+            "override_sl_price":  self._override_sl_price,
         })
 
     def _pos_log(self, event: str, **kw) -> None:
         """Broadcast a structured position-log entry to all connected clients."""
         self._broadcast({"type": "pos_log", "event": event, "ts": _ts(), **kw})
+
+    def _clear_level_overrides(self, reason: str = "") -> None:
+        """Clear manual TP/SL overrides and notify the UI."""
+        if self._override_tp_price is None and self._override_sl_price is None:
+            return
+        self._override_tp_price = None
+        self._override_sl_price = None
+        logger.info("TradingEngine: level overrides cleared (%s)", reason)
+        self._broadcast({"type": "level_overrides_cleared"})
 
     @staticmethod
     def _compute_adaptive(atr: float, price: float) -> Dict[str, float]:
@@ -364,11 +381,21 @@ class TradingEngine:
             entry_pct = (entry_price - price) / entry_price * 100
         pnl_pct = price_pct * leverage
 
-        # ---- Hard stop (avg-based — gives room after each DCA) ---------------
-        if price_pct <= -p["hard_stop_pct"]:
+        # ---- Hard stop (avg-based, or manual override if set) ---------------
+        if self._override_sl_price is not None:
+            sl_hit = (
+                (direction == "LONG"  and price <= self._override_sl_price) or
+                (direction == "SHORT" and price >= self._override_sl_price)
+            )
+        else:
+            sl_hit = price_pct <= -p["hard_stop_pct"]
+
+        if sl_hit:
             logger.warning(
-                "TradingEngine: HARD STOP  price_pct=%.2f%%  hard_stop=%.2f%%",
-                price_pct, p["hard_stop_pct"],
+                "TradingEngine: HARD STOP  price=%.4f  sl=%.4f (override=%s)",
+                price,
+                self._override_sl_price if self._override_sl_price else avg_price * (1 - p["hard_stop_pct"] / 100),
+                self._override_sl_price is not None,
             )
             await self._emergency_close(cfg, price, pnl_pct)
             return
@@ -432,7 +459,16 @@ class TradingEngine:
         tp_pct    = p["tp_pct"]
         trail_pct = p["trail_pct"]
 
-        if entry_pct >= tp_pct:
+        # TP arm: use manual override price if set, else entry-based %
+        if self._override_tp_price is not None:
+            tp_reached = (
+                (direction == "LONG"  and price >= self._override_tp_price) or
+                (direction == "SHORT" and price <= self._override_tp_price)
+            )
+        else:
+            tp_reached = entry_pct >= tp_pct
+
+        if tp_reached:
             if not self._trail_activated:
                 # First time price reaches the TP level — arm the trail
                 self._trail_activated = True
@@ -533,6 +569,10 @@ class TradingEngine:
         )
         self._session = await get_open_session()
 
+        # Manual overrides no longer make sense after averaging down — clear them
+        # so the engine resumes ATR-based levels for the new avg price.
+        self._clear_level_overrides("dca")
+
         # Recalculate risk thresholds from current ATR at DCA time.
         # Market volatility may have changed since entry; refreshing here keeps
         # SL/TP percentages aligned with actual conditions after each capital add.
@@ -604,6 +644,9 @@ class TradingEngine:
         )
         self._session = await get_open_session()
         self._hedges = await get_open_hedges(self._session["id"])
+
+        # Overrides are no longer valid once a hedge changes the risk picture
+        self._clear_level_overrides("hedge_open")
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
@@ -778,12 +821,14 @@ class TradingEngine:
             "trading_mode": cfg.trading_mode,
         })
 
-        self._session         = None
-        self._hedges          = []
-        self._trail_activated = False
-        self._trail_price     = None
+        self._session           = None
+        self._hedges            = []
+        self._trail_activated   = False
+        self._trail_price       = None
         self._dca_pending_since = None
-        self._entry_adaptive  = {}
+        self._entry_adaptive    = {}
+        self._override_tp_price = None
+        self._override_sl_price = None
         self._push_session()
 
     async def _emergency_close(
@@ -967,7 +1012,9 @@ class TradingEngine:
             self._trail_price     = None
             self._dca_pending_since = None
             # Seed entry_adaptive from current ATR so TP/SL are immediately active
-            self._entry_adaptive  = self._adaptive or {}
+            self._entry_adaptive    = self._adaptive or {}
+            self._override_tp_price = None
+            self._override_sl_price = None
 
             partial_note = f"50% closed @ {price:.4f}" if half_qty > 0 else "100% promoted (min qty)"
             msg = (

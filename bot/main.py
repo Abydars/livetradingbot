@@ -869,6 +869,20 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             }))
             await ws.send_text(json.dumps({"type": "performance", "data": perf}))
 
+    elif mtype == "set_level_override":
+        if _engine and _engine._session:
+            tp = msg.get("tp_price")
+            sl = msg.get("sl_price")
+            if tp is not None:
+                _engine._override_tp_price = float(tp)
+            if sl is not None:
+                _engine._override_sl_price = float(sl)
+            logger.info(
+                "Level overrides updated: tp=%s sl=%s",
+                _engine._override_tp_price, _engine._override_sl_price,
+            )
+            _engine._push_session()  # broadcast updated override state to all clients
+
     elif mtype == "manual_close":
         if _engine and _engine._session:
             cfg2 = await load_config()
