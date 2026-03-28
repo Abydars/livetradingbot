@@ -80,6 +80,7 @@ _prev_session_open: bool = False       # track trade close to trigger immediate 
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
 _last_position_check: float = 0.0     # throttle REST position sync
+_last_external_fill_price: float = 0.0   # fill price captured from ORDER_TRADE_UPDATE for external closes
 _POSITION_CHECK_S = 60.0              # check Binance position every N seconds
 _CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
@@ -494,6 +495,29 @@ async def _on_user_data(event: dict) -> None:
         order_id_int = int(order_id)
         pending = _engine._pending_fills.pop(order_id_int, None)
         if pending is None:
+            # Not the bot's order. Check if this is a manual/external close
+            # of the tracked position so we can capture the real fill price
+            # before ACCOUNT_UPDATE fires with no price information.
+            global _last_external_fill_price
+            if (
+                _engine and _engine._session
+                and not _engine._closing
+                and fill_price > 0
+                and symbol.upper() == _engine._session.get("symbol", "").upper()
+            ):
+                sess_dir   = _engine._session["direction"]
+                order_side = o.get("S", "")   # "BUY" or "SELL"
+                is_closing_side = (
+                    (sess_dir == "LONG"  and order_side == "SELL") or
+                    (sess_dir == "SHORT" and order_side == "BUY")
+                )
+                if is_closing_side:
+                    _last_external_fill_price = fill_price
+                    logger.info(
+                        "External close detected (ORDER_TRADE_UPDATE): "
+                        "symbol=%s side=%s fill=%.6f — price captured for PnL calc",
+                        symbol, order_side, fill_price,
+                    )
             return  # close/hedge/external order — don't touch avg_price
 
         sess = _engine._session
@@ -543,7 +567,27 @@ async def _on_user_data(event: dict) -> None:
                     reason = "adl_close"
                 else:
                     reason = "external_close"
-                await _handle_external_close(0.0, reason)
+
+                # Use fill price captured from ORDER_TRADE_UPDATE if available.
+                # ORDER_TRADE_UPDATE fires before ACCOUNT_UPDATE so the price
+                # should already be stored. Consume and clear it in one step.
+                global _last_external_fill_price
+                close_price = _last_external_fill_price
+                _last_external_fill_price = 0.0
+                if close_price > 0:
+                    logger.info(
+                        "External close (ACCOUNT_UPDATE): using captured fill=%.6f "
+                        "for PnL calculation",
+                        close_price,
+                    )
+                else:
+                    logger.warning(
+                        "External close (ACCOUNT_UPDATE): no fill price captured — "
+                        "PnL will be recorded as 0. ORDER_TRADE_UPDATE may have "
+                        "been missed (WS reconnect during close?)."
+                    )
+
+                await _handle_external_close(close_price, reason)
                 return
 
 
