@@ -195,9 +195,31 @@ class OrderExecutor:
         )
 
         # For MARKET orders avgPrice is the true fill price.
-        # Fall back to current_price only if avgPrice is missing or zero.
-        if not result.get("avgPrice") or float(result.get("avgPrice", 0)) == 0:
-            result["avgPrice"] = str(current_price)
+        # Binance WS responses often return avgPrice="0" for market orders
+        # because the response is sent before match-engine confirmation.
+        # Use cumQuote/executedQty instead — both are always populated on FILLED
+        # orders and give the true volume-weighted average fill price.
+        avg_price_raw = result.get("avgPrice", "0")
+        if not avg_price_raw or float(avg_price_raw) == 0:
+            cum_quote    = float(result.get("cumQuote", 0))
+            executed_qty = float(result.get("executedQty", 0))
+            if cum_quote > 0 and executed_qty > 0:
+                computed_avg = cum_quote / executed_qty
+                result["avgPrice"] = str(computed_avg)
+                logger.info(
+                    "avgPrice was 0 in order response — computed from "
+                    "cumQuote/executedQty: %.6f", computed_avg,
+                )
+            else:
+                # Last resort: cumQuote also missing (paper mode, demo quirk,
+                # or order not yet matched). Fall back to mark price and let
+                # ORDER_TRADE_UPDATE correct it via _on_user_data.
+                result["avgPrice"] = str(current_price)
+                logger.warning(
+                    "avgPrice and cumQuote both unavailable — using mark price "
+                    "%.6f as temporary fill price. ORDER_TRADE_UPDATE will correct.",
+                    current_price,
+                )
 
         return result
 
