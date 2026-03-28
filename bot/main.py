@@ -107,6 +107,30 @@ async def _do_broadcast(msg: Dict) -> None:
             disconnected.add(ws)
     _clients.difference_update(disconnected)
 
+    # Whenever a position closes (session broadcast with session=None), push the
+    # full trade history and performance to all clients.  This covers every close
+    # path (TP, hard stop, manual close, external close, hedge promotion) without
+    # relying on the frontend's prevOpen→!nowOpen transition, which fails when
+    # the client connects after the position was already open.
+    if msg.get("type") == "session" and msg.get("session") is None:
+        try:
+            sessions     = await get_sessions(200)
+            hedge_trades = await get_all_closed_hedges(200)
+            perf         = await get_performance()
+            hist_msg = json.dumps({"type": "sessions", "sessions": sessions,
+                                   "hedges": {}, "hedge_trades": hedge_trades})
+            perf_msg = json.dumps({"type": "performance", "data": perf})
+            disc2: Set[WebSocket] = set()
+            for ws in list(_clients):
+                try:
+                    await ws.send_text(hist_msg)
+                    await ws.send_text(perf_msg)
+                except Exception:
+                    disc2.add(ws)
+            _clients.difference_update(disc2)
+        except Exception as exc:
+            logger.debug("sessions auto-push after close failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Ticker loop (called from trading ticker)
@@ -406,16 +430,7 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     _engine._entry_adaptive  = {}
     _engine._pending_fills.clear()
     _engine._push_session()
-
-    # Push updated trade history to all clients immediately — don't rely on
-    # the frontend's prevOpen→!nowOpen transition to trigger a get_sessions
-    # (it may be False if the client just connected or reconnected).
-    sessions     = await get_sessions(200)
-    hedge_trades = await get_all_closed_hedges(200)
-    perf         = await get_performance()
-    _broadcast({"type": "sessions", "sessions": sessions,
-                "hedges": {}, "hedge_trades": hedge_trades})
-    _broadcast({"type": "performance", "data": perf})
+    # _do_broadcast automatically pushes sessions+performance when session=None
 
 
 async def _on_user_data(event: dict) -> None:
@@ -611,10 +626,45 @@ async def lifespan(app: FastAPI):
     _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
 
-    # ── Startup position sync (live/demo only) ────────────────────────────
-    # If the DB has an open session but Binance shows the position is already
-    # gone (closed while the bot was stopped), record it as closed so it
-    # appears in trade history.
+    # ── Startup position sync ─────────────────────────────────────────────
+    # Paper mode: if trading was already stopped when the process died and
+    # there is still an open session in the DB, close it now using the
+    # current mark price.  The session would otherwise stay "open" forever
+    # and never appear in trade history.
+    if _engine._session and cfg.paper_mode and not _trading_active:
+        try:
+            sess      = _engine._session
+            direction = sess["direction"]
+            avg_price = sess["avg_price"]
+            leverage  = sess["leverage"]
+            margin    = sess["margin"]
+            fill_price = await _rest.get_mark_price(cfg.symbol)
+            if fill_price > 0:
+                if direction == "LONG":
+                    pnl_pct = (fill_price - avg_price) / avg_price * 100 * leverage
+                else:
+                    pnl_pct = (avg_price - fill_price) / avg_price * 100 * leverage
+                realized_pnl = round(pnl_pct / 100 * margin, 4)
+            else:
+                realized_pnl = 0.0
+            for hedge in list(_engine._hedges):
+                await close_hedge(hedge["id"], 0.0)
+            await close_session(sess["id"], realized_pnl, "manual_reset")
+            logger.info(
+                "Startup sync (paper): closed orphaned session %d  pnl=%.4f",
+                sess["id"], realized_pnl,
+            )
+            _engine._session         = None
+            _engine._hedges          = []
+            _engine._trail_activated = False
+            _engine._trail_price     = None
+            _engine._entry_adaptive  = {}
+        except Exception as exc:
+            logger.error("Startup paper sync failed: %s", exc)
+
+    # Live/demo: if the DB has an open session but Binance shows the position
+    # is already gone (closed while the bot was stopped), record it as closed
+    # so it appears in trade history.
     if _engine._session and not cfg.paper_mode:
         try:
             pos = await _rest.get_position_risk(cfg.symbol)
