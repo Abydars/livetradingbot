@@ -98,19 +98,19 @@ class TradingEngine:
     def _push_session(self) -> None:
         """Push current session + hedges + trade-level prices to all WS clients."""
         tp_price = sl_price = None
-        # Always use the LOCKED entry adaptive so displayed levels never drift
         ref = self._entry_adaptive or self._adaptive
         if self._session and ref:
-            avg = self._session["avg_price"]
-            d   = self._session["direction"]
-            tp  = ref["tp_pct"]
-            sl  = ref["hard_stop_pct"]
+            entry = self._session["entry_price"]
+            avg   = self._session["avg_price"]
+            d     = self._session["direction"]
+            tp    = ref["tp_pct"]
+            sl    = ref["hard_stop_pct"]
             if d == "LONG":
-                tp_price = avg * (1 + tp / 100)
-                sl_price = avg * (1 - sl / 100)
+                tp_price = entry * (1 + tp / 100)   # TP arm: fixed at entry price
+                sl_price = avg   * (1 - sl / 100)   # SL: moves with avg after DCA
             else:
-                tp_price = avg * (1 - tp / 100)
-                sl_price = avg * (1 + sl / 100)
+                tp_price = entry * (1 - tp / 100)
+                sl_price = avg   * (1 + sl / 100)
         self._broadcast({
             "type":         "session",
             "session":      self._session,
@@ -155,14 +155,15 @@ class TradingEngine:
         ref = self._entry_adaptive or self._adaptive
         if not self._session or not ref:
             return None, None
-        avg = self._session["avg_price"]
-        d   = self._session["direction"]
-        tp  = ref["tp_pct"]
-        sl  = ref["hard_stop_pct"]
+        entry = self._session["entry_price"]
+        avg   = self._session["avg_price"]
+        d     = self._session["direction"]
+        tp    = ref["tp_pct"]
+        sl    = ref["hard_stop_pct"]
         if d == "LONG":
-            return avg * (1 + tp / 100), avg * (1 - sl / 100)
+            return entry * (1 + tp / 100), avg * (1 - sl / 100)
         else:
-            return avg * (1 - tp / 100), avg * (1 + sl / 100)
+            return entry * (1 - tp / 100), avg * (1 + sl / 100)
 
     # ------------------------------------------------------------------
     # Startup
@@ -351,15 +352,19 @@ class TradingEngine:
         # ALL risk decisions use the locked entry levels — never the live ATR
         p = self._entry_adaptive
 
-        # Un-leveraged price movement (positive = favourable for direction)
+        entry_price = sess["entry_price"]
+
+        # price_pct: movement from avg — used for hard stop, hedge trigger, DCA, PnL
+        # entry_pct: movement from original entry — used only for TP arm trigger
         if direction == "LONG":
-            price_pct = (price - avg_price) / avg_price * 100
+            price_pct = (price - avg_price)   / avg_price   * 100
+            entry_pct = (price - entry_price) / entry_price * 100
         else:
-            price_pct = (avg_price - price) / avg_price * 100
-        # Leveraged pnl — used only for dollar PnL calculations
+            price_pct = (avg_price   - price) / avg_price   * 100
+            entry_pct = (entry_price - price) / entry_price * 100
         pnl_pct = price_pct * leverage
 
-        # ---- Hard stop -------------------------------------------------------
+        # ---- Hard stop (avg-based — gives room after each DCA) ---------------
         if price_pct <= -p["hard_stop_pct"]:
             logger.warning(
                 "TradingEngine: HARD STOP  price_pct=%.2f%%  hard_stop=%.2f%%",
@@ -368,8 +373,8 @@ class TradingEngine:
             await self._emergency_close(cfg, price, pnl_pct)
             return
 
-        # ---- Take-profit / trailing TP ---------------------------------------
-        if await self._check_tp(cfg, price, price_pct, pnl_pct, direction, p):
+        # ---- Take-profit / trailing TP (entry-based — never drifts with DCA) -
+        if await self._check_tp(cfg, price, entry_pct, pnl_pct, direction, p):
             return
 
         # ---- Hedge management -----------------------------------------------
@@ -403,7 +408,7 @@ class TradingEngine:
                 self._broadcast({"type": "notification",
                                  "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
             else:
-                await self._try_dca(cfg, price, direction, avg_price, qty, dca_count)
+                await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val)
 
     # ------------------------------------------------------------------
     # Take-profit logic (trailing + fixed floor)
@@ -413,16 +418,21 @@ class TradingEngine:
         self,
         cfg: BotConfig,
         price: float,
-        price_pct: float,
+        entry_pct: float,
         pnl_pct: float,
         direction: str,
         p: Dict[str, float],
     ) -> bool:
-        """Returns True if position was closed. price_pct and thresholds are un-leveraged price %."""
+        """
+        Returns True if position was closed.
+        entry_pct: price movement from original entry price (not avg).
+        Using entry_price keeps the TP arm target fixed — it never drifts
+        downward when DCA lowers avg_price.
+        """
         tp_pct    = p["tp_pct"]
         trail_pct = p["trail_pct"]
 
-        if price_pct >= tp_pct:
+        if entry_pct >= tp_pct:
             if not self._trail_activated:
                 # First time price reaches the TP level — arm the trail
                 self._trail_activated = True
@@ -486,6 +496,7 @@ class TradingEngine:
         avg_price: float,
         qty: float,
         dca_count: int,
+        atr_val: float = 0.0,
     ) -> None:
         """DCA with 5-second adverse pressure confirmation."""
         confirmed = self._flow.check_adverse_pressure(direction, required_seconds=5.0)
@@ -521,6 +532,19 @@ class TradingEngine:
             dca_count=dca_count + 1,
         )
         self._session = await get_open_session()
+
+        # Recalculate risk thresholds from current ATR at DCA time.
+        # Market volatility may have changed since entry; refreshing here keeps
+        # SL/TP percentages aligned with actual conditions after each capital add.
+        if atr_val > 0 and price > 0:
+            self._entry_adaptive = self._compute_adaptive(atr_val, price)
+            logger.info(
+                "TradingEngine: entry_adaptive recalculated at DCA #%d "
+                "(tp=%.3f%% sl=%.3f%%)",
+                dca_count + 1,
+                self._entry_adaptive["tp_pct"],
+                self._entry_adaptive["hard_stop_pct"],
+            )
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
