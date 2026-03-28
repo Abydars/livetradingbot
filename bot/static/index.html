@@ -778,12 +778,16 @@
       border-left-color: var(--green);
     }
 
-    .sym-rank  { font-size: 9px; color: var(--muted); margin-bottom: 1px; }
+    .sym-rank  { font-size: 9px; color: var(--muted); margin-bottom: 1px; display: flex; justify-content: space-between; align-items: center; }
     .sym-name  { font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.2; }
     .sym-chg   { font-size: 10px; margin-top: 1px; }
     .sym-chg.up { color: var(--green); }
     .sym-chg.dn { color: var(--red); }
     .sym-meta  { font-size: 9px; color: var(--muted); margin-top: 1px; }
+    .sym-bias  { font-size: 8px; font-weight: 700; letter-spacing: .05em; padding: 1px 4px; border-radius: 3px; }
+    .sym-bias.long { background: rgba(63,185,80,.18); color: var(--green); }
+    .sym-bias.short { background: rgba(248,81,73,.18); color: var(--red); }
+    .sym-metrics { font-size: 9px; color: var(--muted); margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
 
     /* ═══════════════════════════════ RESPONSIVE ══ */
 
@@ -1479,15 +1483,23 @@ function updateSymSidebar(movers) {
   const list = document.getElementById('sym-list');
   if (!list) return;
   list.innerHTML = movers.map((m, i) => {
-    const active  = m.symbol === currentSymbol ? 'active' : '';
-    const chgCls  = m.change >= 0 ? 'up' : 'dn';
-    const chgSign = m.change >= 0 ? '+' : '';
-    const coin    = m.symbol.replace('USDT', '');
+    const active   = m.symbol === currentSymbol ? 'active' : '';
+    const chgCls   = m.change >= 0 ? 'up' : 'dn';
+    const chgSign  = m.change >= 0 ? '+' : '';
+    const coin     = m.symbol.replace('USDT', '');
+    const bias     = m.bias || '';
+    const biasCls  = bias === 'LONG' ? 'long' : bias === 'SHORT' ? 'short' : '';
+    const biasBadge = bias
+      ? `<span class="sym-bias ${biasCls}">${bias}</span>`
+      : '';
+    const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
+    const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
+    const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank">#${i + 1} &middot; ${m.score.toFixed(0)}pts</div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span>${biasBadge}</div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
-      <div class="sym-meta">${fmtVol(m.volume)} vol</div>
+      <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
     </div>`;
   }).join('');
 }
