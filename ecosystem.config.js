@@ -1,0 +1,22 @@
+module.exports = {
+  apps: [
+    {
+      name: "livetradingbot",
+      script: "main.py",
+      args: "",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "512M",
+      restart_delay: 3000,
+      interpreter: __dirname + "/venv/bin/python",
+      cwd: __dirname + "/bot",
+      env: {
+        NODE_ENV: "production",
+      },
+      error_file: "../logs/err.log",
+      out_file: "../logs/out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+    },
+  ],
+};
