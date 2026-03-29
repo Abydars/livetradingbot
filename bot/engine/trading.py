@@ -662,7 +662,7 @@ class TradingEngine:
         # Three-tier decision based on current signal direction and strength.
         if (
             dca_count >= cfg.max_dca
-            and price_pct >= p["min_profit_pct"]
+            and price_pct > 0
             and not self._trail_activated
             and not self._hedges
         ):
