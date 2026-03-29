@@ -93,6 +93,7 @@ class TradingEngine:
 
         # Breakeven stop — set after a DCA recovery to prevent giving back profit
         self._breakeven_stop_price: Optional[float] = None
+        self._last_resort_buffer_cache: float = 0.80  # updated each tick from cfg
 
         # Stop cooldown: set to time.time() after hard stop, cleared on normal close.
         self._last_stop_time: Optional[float] = None
@@ -114,17 +115,29 @@ class TradingEngine:
         tp_price = sl_price = None
         ref = self._entry_adaptive or self._adaptive
         if self._session and ref:
-            entry = self._session["entry_price"]
-            avg   = self._session["avg_price"]
-            d     = self._session["direction"]
-            tp    = ref["tp_pct"]
-            sl    = ref["hard_stop_pct"]
+            entry    = self._session["entry_price"]
+            avg      = self._session["avg_price"]
+            d        = self._session["direction"]
+            leverage = self._session["leverage"]
+            tp       = ref["tp_pct"]
+
+            # TP arm: fixed at original entry price
             if d == "LONG":
-                tp_price = entry * (1 + tp / 100)   # TP arm: fixed at entry price
-                sl_price = avg   * (1 - sl / 100)   # SL: moves with avg after DCA
+                tp_price = entry * (1 + tp / 100)
             else:
                 tp_price = entry * (1 - tp / 100)
-                sl_price = avg   * (1 + sl / 100)
+
+            # SL: use breakeven stop if set, else last resort SL.
+            if self._breakeven_stop_price is not None:
+                sl_price = self._breakeven_stop_price
+            else:
+                buffer  = self._last_resort_buffer_cache
+                liq_pct = (1.0 / leverage) if leverage > 0 else 0.10
+                sl_pct  = liq_pct * buffer
+                if d == "LONG":
+                    sl_price = avg * (1 - sl_pct)
+                else:
+                    sl_price = avg * (1 + sl_pct)
         self._broadcast({
             "type":                  "session",
             "session":               self._session,
@@ -524,6 +537,9 @@ class TradingEngine:
                 self._entry_adaptive["tp_pct"],
                 self._entry_adaptive["hard_stop_pct"],
             )
+
+        # Cache last_resort_sl_buffer so _push_session() can compute correct SL display
+        self._last_resort_buffer_cache = cfg.last_resort_sl_buffer
 
         # ALL risk decisions use the locked entry levels — never the live ATR
         p = self._entry_adaptive
