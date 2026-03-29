@@ -174,9 +174,13 @@ class TradingEngine:
 
     @staticmethod
     def _estimate_fees(qty: float, price: float, taker_fee_pct: float) -> float:
-        """Estimate round-trip taker fees (entry + exit) for a position."""
+        """
+        Estimate taker fee for the EXIT leg of a position.
+        Entry fees were paid at open and are not deducted here.
+        notional = qty × exit_price; fee = notional × rate.
+        """
         notional = qty * price
-        return notional * (taker_fee_pct / 100) * 2
+        return notional * (taker_fee_pct / 100)
 
     @staticmethod
     def _momentum_trail_mult(ind: Dict, direction: str) -> float:
@@ -1098,22 +1102,30 @@ class TradingEngine:
         )
         fill_price = float(order.get("avgPrice") or price)
 
-        # Session PnL = main position only. Hedge PnL is recorded independently
-        # in hedge_positions.pnl so each shows as a separate trade in history.
-        # Deduct round-trip taker fees from realized PnL.
+        # Recalculate PnL from the actual fill price, not the tick mark price.
+        # pnl_pct was computed from the last WS price tick in _manage_position();
+        # fill_price is the true exchange-confirmed execution price.
+        avg_price = sess["avg_price"]
+        if direction == "LONG":
+            actual_pnl_pct = (fill_price - avg_price) / avg_price * 100 * leverage
+        else:
+            actual_pnl_pct = (avg_price - fill_price) / avg_price * 100 * leverage
+
+        # Deduct exit taker fee from realized PnL.
         fees = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
-        realized_pnl = pnl_pct / 100 * margin - fees
-        await close_session(sess["id"], round(realized_pnl, 4), reason)
+        realized_pnl = actual_pnl_pct / 100 * margin - fees
+        await close_session(sess["id"], round(realized_pnl, 4), reason,
+                            exit_price=fill_price)
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
             f"CLOSE {direction} @ {fill_price:.4f}  "
-            f"pnl={realized_pnl:+.4f} USDT ({pnl_pct:+.2f}%)  reason={reason}"
+            f"pnl={realized_pnl:+.4f} USDT ({actual_pnl_pct:+.2f}%)  reason={reason}"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
         self._pos_log("close", direction=direction, price=fill_price,
-                      pnl=round(realized_pnl, 4), pnl_pct=round(pnl_pct, 2),
+                      pnl=round(realized_pnl, 4), pnl_pct=round(actual_pnl_pct, 2),
                       reason=reason, symbol=cfg.symbol, mode=cfg.trading_mode)
 
         await log_signal(cfg.symbol, direction, 0.0, {}, "close")
@@ -1122,7 +1134,7 @@ class TradingEngine:
             "direction": direction,
             "price":     fill_price,
             "pnl":       realized_pnl,
-            "pnl_pct":   pnl_pct,
+            "pnl_pct":   actual_pnl_pct,
             "reason":    reason,
             "trading_mode": cfg.trading_mode,
         })
@@ -1236,12 +1248,21 @@ class TradingEngine:
             order = await self._executor.place_market_order(
                 cfg.symbol, side, qty, reduce_only=True, current_price=price
             )
-            fill_price   = float(order.get("avgPrice") or price)
+            fill_price = float(order.get("avgPrice") or price)
+
+            # Recalculate from actual fill price
+            avg_p = sess["avg_price"]
+            if direction == "LONG":
+                actual_pnl_pct = (fill_price - avg_p) / avg_p * 100 * leverage
+            else:
+                actual_pnl_pct = (avg_p - fill_price) / avg_p * 100 * leverage
+
             fees         = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
-            realized_pnl = pnl_pct / 100 * margin - fees
+            realized_pnl = actual_pnl_pct / 100 * margin - fees
 
             # ── 2. Close main DB session ────────────────────────────────
-            await close_session(sess["id"], round(realized_pnl, 4), "hard_stop")
+            await close_session(sess["id"], round(realized_pnl, 4), "hard_stop",
+                                exit_price=fill_price)
             logger.info(
                 "TradingEngine: HARD STOP main CLOSE %s @ %.4f  pnl=%+.4f",
                 direction, fill_price, realized_pnl,
@@ -1251,7 +1272,7 @@ class TradingEngine:
                 "direction": direction,
                 "price":     fill_price,
                 "pnl":       realized_pnl,
-                "pnl_pct":   pnl_pct,
+                "pnl_pct":   actual_pnl_pct,
                 "reason":    "hard_stop",
                 "trading_mode": cfg.trading_mode,
             })

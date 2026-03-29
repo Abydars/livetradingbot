@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     direction        TEXT NOT NULL,
     entry_price      REAL NOT NULL,
     avg_price        REAL NOT NULL,
+    exit_price       REAL,
     qty              REAL NOT NULL,
     margin           REAL NOT NULL,
     leverage         INTEGER NOT NULL,
@@ -128,6 +129,8 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("trail_price",     "REAL"),
         # sessions columns added in v4 — signal price
         ("signal_price",    "REAL"),
+        # sessions columns added in v5 — exit fill price
+        ("exit_price",      "REAL"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
@@ -227,11 +230,18 @@ async def update_session(session_id: int, **kwargs: Any) -> None:
         await db.commit()
 
 
-async def close_session(session_id: int, pnl: float, reason: str) -> None:
+async def close_session(
+    session_id: int,
+    pnl: float,
+    reason: str,
+    exit_price: Optional[float] = None,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE sessions SET status='closed', close_time=?, pnl=?, exit_reason=? WHERE id=?",
-            (time.time(), pnl, reason, session_id),
+            "UPDATE sessions "
+            "SET status='closed', close_time=?, pnl=?, exit_reason=?, exit_price=? "
+            "WHERE id=?",
+            (time.time(), pnl, reason, exit_price, session_id),
         )
         await db.commit()
 
