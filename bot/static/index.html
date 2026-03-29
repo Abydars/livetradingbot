@@ -1592,13 +1592,23 @@ function dispatch(msg) {
       }
       break;
 
-    case 'config_saved':
+    case 'config_saved': {
+      // Restore save button regardless of outcome
+      const btn = document.querySelector('#cfg-modal-foot .cfg-btn:not(.danger)');
+      if (btn) {
+        btn.textContent = 'SAVE';
+        btn.disabled = false;
+        btn.style.opacity = '';
+      }
       if (msg.ok) {
         showToast('Config saved', 'info');
+        closeCfgModal();   // close modal on success
       } else {
         showToast(msg.error || 'Config save failed', 'err');
+        // Modal stays open so user can fix the error
       }
       break;
+    }
   }
 }
 
@@ -2420,7 +2430,6 @@ const TF_OPTIONS = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1
 
 const CFG_SCHEMA = [
   { section: 'Trading', fields: [
-    { key: 'timeframe',         label: 'Timeframe',           type: 'select', options: TF_OPTIONS },
     { key: 'leverage',          label: 'Leverage',            type: 'number' },
     { key: 'margin_usdt',       label: 'Margin (USDT)',       type: 'number' },
     { key: 'max_dca',            label: 'Max DCA',              type: 'number' },
@@ -2435,7 +2444,6 @@ const CFG_SCHEMA = [
     { key: 'min_signal_strength', label: 'Min Signal Strength', type: 'number' },
     { key: 'strength_sizing',     label: 'Strength Sizing',     type: 'toggle' },
     { key: 'strength_size_min',   label: 'Min Size Scale',      type: 'number' },
-    { key: 'stoch_signal',        label: 'StochRSI Signal',     type: 'toggle' },
   ]},
   { section: 'Risk', fields: [
     { key: 'breakeven_stop',        label: 'Breakeven Stop',         type: 'toggle' },
@@ -2506,6 +2514,16 @@ function onSelectCfg(el) {
 }
 
 function saveConfig() {
+  const btn = document.querySelector('#cfg-modal-foot .cfg-btn:not(.danger)');
+  const origText = btn ? btn.textContent : 'SAVE';
+
+  // Show saving state
+  if (btn) {
+    btn.textContent = 'SAVING…';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+  }
+
   const updates = {};
   document.querySelectorAll('#cfg-form [data-key]').forEach(el => {
     const key = el.dataset.key;
@@ -2514,6 +2532,15 @@ function saveConfig() {
     else updates[key] = el.value;
   });
   wsSend({ type: 'set_config', config: updates });
+
+  // Safety timeout: restore button if no response in 5s
+  setTimeout(() => {
+    if (btn && btn.disabled) {
+      btn.textContent = origText;
+      btn.disabled = false;
+      btn.style.opacity = '';
+    }
+  }, 5000);
 }
 
 function resetBot() {
