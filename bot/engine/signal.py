@@ -40,9 +40,6 @@ class SignalEngine:
     Signal computation.  Call compute() each cycle.
     """
 
-    def __init__(self) -> None:
-        self._stoch_enabled: bool = True
-
     def compute(
         self,
         candles: List[Dict],
@@ -234,10 +231,8 @@ class SignalEngine:
         Stochastic RSI k-line based score.
         k > 80 → overbought → short signal (fade toward -1)
         k < 20 → oversold  → long signal  (fade toward +1)
-        Returns 0.0 when stoch_signal is disabled or indicator unavailable.
+        Returns 0.0 when indicator data is unavailable.
         """
-        if not self._stoch_enabled:
-            return 0.0
         sr = ind.get("stoch_rsi")
         if sr is None:
             return 0.0
