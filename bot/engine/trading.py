@@ -640,23 +640,26 @@ class TradingEngine:
                 await self._open_hedge(cfg, price, direction, qty)
             return
 
-        # ---- Breakeven stop activation (after a DCA recovery) ---------------
+        # ---- Breakeven stop activation — only AFTER trail is armed ----------
+        # Breakeven purpose: if trail is armed and price reverses hard, ensure
+        # we exit near flat rather than giving back everything.
+        # Do NOT arm before trail — that causes immediate flat closes after DCA.
         if (
             cfg.breakeven_stop
             and dca_count > 0
             and self._breakeven_stop_price is None
-            and not self._trail_activated
+            and self._trail_activated                       # ← trail must be armed FIRST
             and price_pct >= p["min_profit_pct"]
         ):
-            fee_pct = (cfg.taker_fee_pct / 100) * 2   # round-trip, unleveraged
+            fee_pct = (cfg.taker_fee_pct / 100) * 2
             if direction == "LONG":
                 be_price = avg_price * (1 + fee_pct)
             else:
                 be_price = avg_price * (1 - fee_pct)
             self._breakeven_stop_price = be_price
             logger.info(
-                "TradingEngine: breakeven stop SET @ %.6f  (avg=%.6f  fee_pct=%.4f%%)",
-                be_price, avg_price, fee_pct * 100,
+                "TradingEngine: breakeven stop SET @ %.6f  (avg=%.6f  trail_active=True)",
+                be_price, avg_price,
             )
             self._broadcast({"type": "notification",
                              "text": f"Breakeven stop armed @ {be_price:.4f}"})
@@ -665,7 +668,7 @@ class TradingEngine:
         # ---- Signal-aware exit: all DCAs used and price has recovered --------
         # Three-tier decision based on current signal direction and strength.
         if (
-            dca_count >= cfg.max_dca
+            dca_count > 0
             and price_pct > 0
             and not self._trail_activated
             and not self._hedges
@@ -794,7 +797,22 @@ class TradingEngine:
                 (direction == "SHORT" and price <= self._override_tp_price)
             )
         else:
-            tp_reached = entry_pct >= tp_pct
+            sess      = self._session
+            dca_count = sess["dca_count"] if sess else 0
+            if dca_count > 0:
+                # After DCA, original entry is above avg. Using entry_pct means
+                # trail requires price to reach entry + tp_pct — unreachable
+                # because breakeven fires at avg + fees first.
+                # Solution: arm trail from avg after DCA.
+                avg_p = sess["avg_price"]
+                if direction == "LONG":
+                    pct_from_avg = (price - avg_p) / avg_p * 100
+                else:
+                    pct_from_avg = (avg_p - price) / avg_p * 100
+                tp_reached = pct_from_avg >= tp_pct
+            else:
+                # No DCA — use entry-based TP (original behaviour)
+                tp_reached = entry_pct >= tp_pct
 
         if tp_reached:
             if not self._trail_activated:
