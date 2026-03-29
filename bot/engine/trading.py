@@ -79,6 +79,10 @@ class TradingEngine:
         # Used by _on_user_data in main.py to compute correct blended average from true fill price.
         self._pending_fills: Dict[int, Dict] = {}
 
+        # Track IDs of bot-initiated close orders so ORDER_TRADE_UPDATE
+        # does not treat them as external closes.
+        self._bot_close_order_ids: set = set()
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -846,6 +850,9 @@ class TradingEngine:
                         order = await self._executor.place_market_order(
                             cfg.symbol, side, close_qty, reduce_only=True, current_price=price
                         )
+                        _oid = int(order.get("orderId", 0))
+                        if _oid:
+                            self._bot_close_order_ids.add(_oid)
                         fill_price = float(order.get("avgPrice") or price)
                         remain_qty    = qty - close_qty
                         remain_margin = sess["margin"] * (remain_qty / qty)
@@ -1176,6 +1183,9 @@ class TradingEngine:
         order = await self._executor.place_market_order(
             cfg.symbol, side, qty, reduce_only=True, current_price=price
         )
+        _oid = int(order.get("orderId", 0))
+        if _oid:
+            self._bot_close_order_ids.add(_oid)
         fill_price = float(order.get("avgPrice") or price)
 
         # Recalculate PnL from the actual fill price, not the tick mark price.
@@ -1226,6 +1236,7 @@ class TradingEngine:
         self._breakeven_stop_price   = None
         self._partial_tp_done        = False
         self._last_stop_time         = None   # clear cooldown on normal close
+        self._bot_close_order_ids.clear()
         self._push_session()
 
     async def _emergency_close(
@@ -1324,6 +1335,9 @@ class TradingEngine:
             order = await self._executor.place_market_order(
                 cfg.symbol, side, qty, reduce_only=True, current_price=price
             )
+            _oid = int(order.get("orderId", 0))
+            if _oid:
+                self._bot_close_order_ids.add(_oid)
             fill_price = float(order.get("avgPrice") or price)
 
             # Recalculate from actual fill price
