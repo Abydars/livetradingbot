@@ -480,6 +480,7 @@ class TradingEngine:
         self._trail_activated = False
         self._trail_price = None
         self._entry_adaptive = entry_adaptive  # locked for life of this trade
+        self._last_resort_buffer_cache = cfg.last_resort_sl_buffer  # needed by first _push_session
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
 

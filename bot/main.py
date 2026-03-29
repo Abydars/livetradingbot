@@ -164,10 +164,17 @@ async def _sync_position_rest(cfg) -> None:
         positions = await _binance_client.get_positions(cfg.symbol)
         sess_dir  = _engine._session["direction"]
         for pos in positions:
-            ps = pos.get("positionSide", "")
+            ps = pos.get("positionSide", "BOTH")
             pa = float(pos.get("positionAmt", 1))
-            if ps not in (sess_dir, "BOTH"):
-                continue
+            # In hedge mode, only match the exact leg (LONG or SHORT).
+            # In one-way mode, position side is "BOTH".
+            # Never match "BOTH" entries in hedge mode — they always show pa=0.
+            if _executor and _executor._hedge_mode:
+                if ps != sess_dir:
+                    continue
+            else:
+                if ps not in (sess_dir, "BOTH"):
+                    continue
             if abs(pa) < 1e-8:
                 logger.warning("Position sync: %s %s shows pa=0 — closed externally", cfg.symbol, sess_dir)
                 await _handle_external_close(0.0, "external_close")

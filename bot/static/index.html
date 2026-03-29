@@ -1314,7 +1314,7 @@ function adjustLevel(type, dir) {
       });
     }
   } else {
-    const cur = _overrideSlPrice ?? curSlPrice ?? computeSLPrice(curSession);
+    const cur = _overrideSlPrice ?? curSlPrice ?? null;
     _overrideSlPrice = cur + dir * step;
     if (csSeries && _slLine !== undefined) {
       _slLine = _removeLine(_slLine);
@@ -1815,14 +1815,6 @@ function computeTPPrice(session) {
     : session.avg_price - move;
 }
 
-function computeSLPrice(session) {
-  // Mirror engine: hard_stop_pct is UN-LEVERAGED, minimum 2.0%
-  const slPct = 2.0;
-  const move  = session.avg_price * slPct / 100;
-  return session.direction === 'LONG'
-    ? session.avg_price - move
-    : session.avg_price + move;
-}
 
 function _removeLine(ref) {
   try { if (ref) csSeries.removePriceLine(ref); } catch {}
@@ -1911,7 +1903,7 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
   // Hard-stop line — override takes priority; falls back to server then computed
   _slLine = _removeLine(_slLine);
   _slLine = csSeries.createPriceLine({
-    price:            _overrideSlPrice ?? curSlPrice ?? computeSLPrice(session),
+    price:            _overrideSlPrice ?? curSlPrice ?? null,
     color:            '#f85149',
     lineWidth:        1,
     lineStyle:        LightweightCharts.LineStyle.Dashed,
@@ -2053,7 +2045,7 @@ function updatePositionPanel() {
   const elapsed = s.open_time ? (Date.now() / 1000 - s.open_time) : 0;
 
   const tpPrice  = _overrideTpPrice ?? curTpPrice  ?? computeTPPrice(s);
-  const slPrice  = _overrideSlPrice ?? curSlPrice  ?? computeSLPrice(s);
+  const slPrice  = _overrideSlPrice ?? curSlPrice  ?? null;
   const trailRow = curTrailActive && curTrailPrice
     ? pr('Trail Stop', `<span class="prv" style="color:#ff9800">${fmtPrice(curTrailPrice)}</span>`)
     : '';
@@ -2074,7 +2066,7 @@ function updatePositionPanel() {
     </span>
   </div>`;
 
-  const slRow = `<div class="pr">
+  const slRow = slPrice != null ? `<div class="pr">
     <span class="prk">Hard Stop</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
@@ -2082,7 +2074,7 @@ function updatePositionPanel() {
       ${fmtLvlPnl(slPnl)}
       <button class="btn-adj" onclick="adjustLevel('sl',+1)">▲</button>
     </span>
-  </div>`;
+  </div>` : '';
 
   posEl.innerHTML = `
     ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
