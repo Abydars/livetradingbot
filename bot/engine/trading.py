@@ -351,7 +351,6 @@ class TradingEngine:
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True) -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
-        self._signal_engine._stoch_enabled = cfg.stoch_signal
         signal = self._signal_engine.compute(self.candles, flow_summary, ind)
         self.last_signal = signal
 
@@ -382,13 +381,10 @@ class TradingEngine:
         strength  = signal["strength"]
 
         if direction == "NEUTRAL":
-            await log_signal(cfg.symbol, "NEUTRAL", strength, signal["components"], "skip")
             return
         if strength < cfg.min_signal_strength:
-            await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
         if not signal["filters_passed"]:
-            await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
         # Stop cooldown: block re-entry for N seconds after a hard stop
@@ -456,7 +452,7 @@ class TradingEngine:
             direction=direction,
             entry_price=fill_price,
             qty=qty,
-            margin=cfg.margin_usdt,
+            margin=effective_margin,
             leverage=cfg.leverage,
             entry_reason=signal["reason"],
             signal_strength=strength,
@@ -473,7 +469,7 @@ class TradingEngine:
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
             f"OPEN {direction} @ {fill_price:.4f}  "
-            f"qty={qty}  margin={cfg.margin_usdt}  strength={strength:.2f}"
+            f"qty={qty}  margin={effective_margin}  strength={strength:.2f}"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
@@ -485,7 +481,7 @@ class TradingEngine:
             "symbol":    cfg.symbol,
             "direction": direction,
             "price":     fill_price,
-            "margin":    cfg.margin_usdt,
+            "margin":    effective_margin,
             "strength":  strength,
             "trading_mode": cfg.trading_mode,
         })
