@@ -73,6 +73,7 @@ class TradingEngine:
         # Trailing TP tracking
         self._trail_activated: bool = False
         self._trail_price: Optional[float] = None
+        self._trail_pct_mult: float = 1.0   # tighten-only multiplier, updated on candle close
 
         # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
         # Used by _on_user_data in main.py to compute correct blended average from true fill price.
@@ -173,6 +174,43 @@ class TradingEngine:
         notional = qty * price
         return notional * (taker_fee_pct / 100) * 2
 
+    @staticmethod
+    def _momentum_trail_mult(ind: Dict, direction: str) -> float:
+        """
+        Compute a tighten-only trail multiplier based on current momentum state.
+        Returns 1.0 (unchanged), 0.7 (fading), or 0.5 (exhausted).
+
+        STRONG    → 1.0: MACD hist aligned with direction AND RSI in healthy zone
+        FADING    → 0.7: MACD hist flat/shrinking OR RSI approaching extreme
+        EXHAUSTED → 0.5: MACD hist reversed against direction OR RSI beyond extreme
+
+        direction: "LONG" or "SHORT" — used to interpret MACD and RSI correctly.
+        """
+        rsi_val   = ind.get("rsi")
+        macd_data = ind.get("macd")
+
+        if rsi_val is None or macd_data is None:
+            return 1.0
+
+        hist = macd_data.get("hist", 0.0)
+
+        if direction == "LONG":
+            macd_aligned  = hist > 0
+            macd_reversed = hist < 0
+            rsi_exhausted = rsi_val > 73
+            rsi_fading    = 68 <= rsi_val <= 73
+        else:  # SHORT
+            macd_aligned  = hist < 0
+            macd_reversed = hist > 0
+            rsi_exhausted = rsi_val < 27
+            rsi_fading    = 27 <= rsi_val <= 32
+
+        if rsi_exhausted or macd_reversed:
+            return 0.5
+        if rsi_fading or not macd_aligned:
+            return 0.7
+        return 1.0
+
     # ------------------------------------------------------------------
     # Level prices helper (used by WS initial-state and _push_session)
     # ------------------------------------------------------------------
@@ -225,8 +263,34 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     def update_candles(self, candles: List[Dict]) -> None:
+        prev_last_time = self.candles[-1]["time"] if self.candles else 0
         self.candles = candles
         self.last_indicators = compute_all(candles)
+
+        new_last_time = candles[-1]["time"] if candles else 0
+        if new_last_time != prev_last_time and self._trail_activated and self._session:
+            self._adjust_trail_on_candle_close()
+
+    def _adjust_trail_on_candle_close(self) -> None:
+        """
+        Called on every confirmed candle close while trail is active.
+        Tightens _trail_pct_mult based on current momentum — never widens.
+        Only the multiplier changes; the ratcheted trail_price is untouched.
+        """
+        direction = self._session["direction"]
+        new_mult  = self._momentum_trail_mult(self.last_indicators, direction)
+
+        if new_mult < self._trail_pct_mult:
+            old_mult = self._trail_pct_mult
+            self._trail_pct_mult = new_mult
+            logger.info(
+                "TradingEngine: trail tightened on candle close  "
+                "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
+                old_mult,
+                new_mult,
+                self.last_indicators.get("rsi") or 0.0,
+                (self.last_indicators.get("macd") or {}).get("hist", 0.0),
+            )
 
     # ------------------------------------------------------------------
     # Main tick — called every N seconds by the scheduler
@@ -512,8 +576,10 @@ class TradingEngine:
         Using entry_price keeps the TP arm target fixed — it never drifts
         downward when DCA lowers avg_price.
         """
-        tp_pct    = p["tp_pct"]
-        trail_pct = p["trail_pct"]
+        tp_pct = p["tp_pct"]
+        # Apply tighten-only momentum multiplier. Floor at 0.10% so trail
+        # never becomes so tight that a single tick triggers an exit.
+        trail_pct = max(p["trail_pct"] * self._trail_pct_mult, 0.10)
 
         # TP arm: use manual override price if set, else entry-based %
         if self._override_tp_price is not None:
@@ -942,6 +1008,7 @@ class TradingEngine:
         self._hedges            = []
         self._trail_activated   = False
         self._trail_price       = None
+        self._trail_pct_mult    = 1.0
         self._entry_adaptive    = {}
         self._override_tp_price = None
         self._override_sl_price = None
@@ -1135,6 +1202,7 @@ class TradingEngine:
             self._hedges          = []
             self._trail_activated = False
             self._trail_price     = None
+            self._trail_pct_mult  = 1.0
             # Seed entry_adaptive from current ATR so TP/SL are immediately active
             self._entry_adaptive    = self._adaptive or {}
             self._override_tp_price = None
