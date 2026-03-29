@@ -428,7 +428,8 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     for hedge in list(_engine._hedges):
         await close_hedge(hedge["id"], 0.0)
 
-    await close_session(sess["id"], realized_pnl, reason)
+    await close_session(sess["id"], realized_pnl, reason,
+                        exit_price=fill_price if fill_price > 0 else None)
     logger.warning(
         "External close [%s]: %s %s fill=%.6f pnl=%.4f",
         reason, direction, symbol, fill_price, realized_pnl,
@@ -751,7 +752,8 @@ async def lifespan(app: FastAPI):
                 realized_pnl = 0.0
             for hedge in list(_engine._hedges):
                 await close_hedge(hedge["id"], 0.0)
-            await close_session(sess["id"], realized_pnl, "manual_reset")
+            await close_session(sess["id"], realized_pnl, "manual_reset",
+                                exit_price=fill_price if fill_price > 0 else None)
             logger.info(
                 "Startup sync (paper): closed orphaned session %d  pnl=%.4f",
                 sess["id"], realized_pnl,
@@ -791,7 +793,8 @@ async def lifespan(app: FastAPI):
                 for hedge in list(_engine._hedges):
                     await close_hedge(hedge["id"], 0.0)
 
-                await close_session(sess["id"], realized_pnl, "external_close")
+                await close_session(sess["id"], realized_pnl, "external_close",
+                                    exit_price=fill_price if fill_price > 0 else None)
                 logger.warning(
                     "Startup sync: session %d was open in DB but position is flat "
                     "on Binance — closed with pnl=%.4f (approx mark price %.6f)",
