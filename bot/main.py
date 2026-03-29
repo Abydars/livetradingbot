@@ -408,14 +408,17 @@ def _on_trade(event: Dict) -> None:
             )
 
             async def _do_trail_close():
-                cfg = await load_config()
-                if (
-                    _engine
-                    and _engine._session
-                    and _engine._trail_activated
-                    and not _engine._closing
-                ):
-                    await _engine._close_position(cfg, price, pnl_pct, "trailing_tp")
+                try:
+                    cfg = await load_config()
+                    if (
+                        _engine
+                        and _engine._session
+                        and _engine._trail_activated
+                        and not _engine._closing
+                    ):
+                        await _engine._close_position(cfg, price, pnl_pct, "trailing_tp")
+                except Exception as e:
+                    logger.error("WS trail close failed: %s", e)
 
             loop = asyncio.get_running_loop()
             loop.call_soon(lambda: asyncio.ensure_future(_do_trail_close()))
