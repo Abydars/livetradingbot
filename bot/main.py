@@ -369,12 +369,54 @@ def _on_exchange_error(msg: str) -> None:
 
 def _on_trade(event: Dict) -> None:
     global _last_price
-    _last_price = event["price"]
+    price = event["price"]
+    _last_price = price
     _flow.on_trade(event)
+
+    # Fast trail check on every WS tick — catches wicks that the 1s REST
+    # poll would miss. Only runs when trail is armed and a session is open.
+    if (
+        _engine
+        and _engine._session
+        and _engine._trail_activated
+        and _engine._trail_price is not None
+        and not _engine._closing
+    ):
+        direction = _engine._session["direction"]
+        trail_hit = (
+            (direction == "LONG"  and price <= _engine._trail_price) or
+            (direction == "SHORT" and price >= _engine._trail_price)
+        )
+        if trail_hit:
+            avg_price = _engine._session["avg_price"]
+            leverage  = _engine._session["leverage"]
+            if direction == "LONG":
+                pnl_pct = (price - avg_price) / avg_price * 100 * leverage
+            else:
+                pnl_pct = (avg_price - price) / avg_price * 100 * leverage
+
+            logger.info(
+                "WS trail hit @ %.6f  trail=%.6f  pnl=%.2f%%",
+                price, _engine._trail_price, pnl_pct,
+            )
+
+            async def _do_trail_close():
+                cfg = await load_config()
+                if (
+                    _engine
+                    and _engine._session
+                    and _engine._trail_activated
+                    and not _engine._closing
+                ):
+                    await _engine._close_position(cfg, price, pnl_pct, "trailing_tp")
+
+            loop = asyncio.get_running_loop()
+            loop.call_soon(lambda: asyncio.ensure_future(_do_trail_close()))
+
     asyncio.get_running_loop().call_soon(
         lambda: asyncio.ensure_future(_do_broadcast({
             "type":  "trade",
-            "price": event["price"],
+            "price": price,
             "qty":   event["qty"],
             "side":  "sell" if event["buyer_maker"] else "buy",
         }))
