@@ -73,6 +73,7 @@ class TradingEngine:
         # Trailing TP tracking
         self._trail_activated: bool = False
         self._trail_price: Optional[float] = None
+        self._trail_pct_mult: float = 1.0   # tighten-only multiplier, updated on candle close
 
         # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
         # Used by _on_user_data in main.py to compute correct blended average from true fill price.
@@ -89,6 +90,9 @@ class TradingEngine:
         # Cleared automatically when DCA fires, a hedge opens, or position closes.
         self._override_tp_price: Optional[float] = None
         self._override_sl_price: Optional[float] = None
+
+        # Breakeven stop — set after a DCA recovery to prevent giving back profit
+        self._breakeven_stop_price: Optional[float] = None
 
         # Stop cooldown: set to time.time() after hard stop, cleared on normal close.
         self._last_stop_time: Optional[float] = None
@@ -122,15 +126,16 @@ class TradingEngine:
                 tp_price = entry * (1 - tp / 100)
                 sl_price = avg   * (1 + sl / 100)
         self._broadcast({
-            "type":               "session",
-            "session":            self._session,
-            "hedges":             self._hedges,
-            "trail_price":        self._trail_price,
-            "trail_active":       self._trail_activated,
-            "tp_price":           tp_price,
-            "sl_price":           sl_price,
-            "override_tp_price":  self._override_tp_price,
-            "override_sl_price":  self._override_sl_price,
+            "type":                  "session",
+            "session":               self._session,
+            "hedges":                self._hedges,
+            "trail_price":           self._trail_price,
+            "trail_active":          self._trail_activated,
+            "tp_price":              tp_price,
+            "sl_price":              sl_price,
+            "override_tp_price":     self._override_tp_price,
+            "override_sl_price":     self._override_sl_price,
+            "breakeven_stop_price":  self._breakeven_stop_price,
         })
 
     def _pos_log(self, event: str, **kw) -> None:
@@ -172,6 +177,91 @@ class TradingEngine:
         """Estimate round-trip taker fees (entry + exit) for a position."""
         notional = qty * price
         return notional * (taker_fee_pct / 100) * 2
+
+    @staticmethod
+    def _momentum_trail_mult(ind: Dict, direction: str) -> float:
+        """
+        Compute a tighten-only trail multiplier based on current momentum state.
+        Returns 1.0 (unchanged), 0.7 (fading), or 0.5 (exhausted).
+
+        STRONG    → 1.0: MACD hist aligned with direction AND RSI in healthy zone
+        FADING    → 0.7: MACD hist flat/shrinking OR RSI approaching extreme
+        EXHAUSTED → 0.5: MACD hist reversed against direction OR RSI beyond extreme
+
+        direction: "LONG" or "SHORT" — used to interpret MACD and RSI correctly.
+        """
+        rsi_val   = ind.get("rsi")
+        macd_data = ind.get("macd")
+
+        if rsi_val is None or macd_data is None:
+            return 1.0
+
+        hist = macd_data.get("hist", 0.0)
+
+        if direction == "LONG":
+            macd_aligned  = hist > 0
+            macd_reversed = hist < 0
+            rsi_exhausted = rsi_val > 73
+            rsi_fading    = 68 <= rsi_val <= 73
+        else:  # SHORT
+            macd_aligned  = hist < 0
+            macd_reversed = hist > 0
+            rsi_exhausted = rsi_val < 27
+            rsi_fading    = 27 <= rsi_val <= 32
+
+        if rsi_exhausted or macd_reversed:
+            return 0.5
+        if rsi_fading or not macd_aligned:
+            return 0.7
+        return 1.0
+
+    @staticmethod
+    def _count_reversal_signals(ind: Dict, direction: str) -> int:
+        """
+        Count reversal indicators confirming a potential bounce (0–4).
+        Used to gate DCA entries when smart_dca_gate is enabled.
+
+        LONG signals: RSI oversold, BB lower band touch, MACD histogram
+                      near zero/turning, BB bands expanding.
+        SHORT signals: mirror of the above.
+        """
+        count = 0
+        rsi_val   = ind.get("rsi")
+        bb        = ind.get("bollinger")
+        macd_data = ind.get("macd")
+
+        # Signal 1: RSI extreme
+        if rsi_val is not None:
+            if direction == "LONG" and rsi_val < 38:
+                count += 1
+            elif direction == "SHORT" and rsi_val > 62:
+                count += 1
+
+        # Signal 2: Bollinger Band extreme touch
+        if bb is not None:
+            pct_b = bb.get("pct_b", 0.5)
+            if direction == "LONG" and pct_b <= 0.08:
+                count += 1
+            elif direction == "SHORT" and pct_b >= 0.92:
+                count += 1
+
+        # Signal 3: MACD histogram momentum exhaustion
+        # (hist near zero = adverse momentum is fading)
+        if macd_data is not None:
+            hist = macd_data.get("hist", 0.0)
+            if direction == "LONG" and hist > -0.0001:
+                count += 1
+            elif direction == "SHORT" and hist < 0.0001:
+                count += 1
+
+        # Signal 4: Bollinger bands expanding (volatility spike, often precedes reversal)
+        if bb is not None:
+            width = bb.get("width", 0)
+            mid   = bb.get("mid", 1)
+            if mid > 0 and (width / mid) > 0.01:
+                count += 1
+
+        return count
 
     # ------------------------------------------------------------------
     # Level prices helper (used by WS initial-state and _push_session)
@@ -225,8 +315,34 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     def update_candles(self, candles: List[Dict]) -> None:
+        prev_last_time = self.candles[-1]["time"] if self.candles else 0
         self.candles = candles
         self.last_indicators = compute_all(candles)
+
+        new_last_time = candles[-1]["time"] if candles else 0
+        if new_last_time != prev_last_time and self._trail_activated and self._session:
+            self._adjust_trail_on_candle_close()
+
+    def _adjust_trail_on_candle_close(self) -> None:
+        """
+        Called on every confirmed candle close while trail is active.
+        Tightens _trail_pct_mult based on current momentum — never widens.
+        Only the multiplier changes; the ratcheted trail_price is untouched.
+        """
+        direction = self._session["direction"]
+        new_mult  = self._momentum_trail_mult(self.last_indicators, direction)
+
+        if new_mult < self._trail_pct_mult:
+            old_mult = self._trail_pct_mult
+            self._trail_pct_mult = new_mult
+            logger.info(
+                "TradingEngine: trail tightened on candle close  "
+                "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
+                old_mult,
+                new_mult,
+                self.last_indicators.get("rsi") or 0.0,
+                (self.last_indicators.get("macd") or {}).get("hist", 0.0),
+            )
 
     # ------------------------------------------------------------------
     # Main tick — called every N seconds by the scheduler
@@ -424,21 +540,44 @@ class TradingEngine:
             entry_pct = (entry_price - price) / entry_price * 100
         pnl_pct = price_pct * leverage
 
-        # ---- Hard stop (avg-based, or manual override if set) ---------------
+        # ---- Stop loss checks -----------------------------------------------
+        # Priority 1: Manual UI override
         if self._override_sl_price is not None:
             sl_hit = (
                 (direction == "LONG"  and price <= self._override_sl_price) or
                 (direction == "SHORT" and price >= self._override_sl_price)
             )
-        else:
-            sl_hit = price_pct <= -p["hard_stop_pct"]
+            if sl_hit:
+                logger.warning(
+                    "TradingEngine: OVERRIDE SL HIT  price=%.4f  sl=%.4f",
+                    price, self._override_sl_price,
+                )
+                await self._emergency_close(cfg, price, pnl_pct)
+                return
 
-        if sl_hit:
-            logger.warning(
-                "TradingEngine: HARD STOP  price=%.4f  sl=%.4f (override=%s)",
-                price,
-                self._override_sl_price if self._override_sl_price else avg_price * (1 - p["hard_stop_pct"] / 100),
-                self._override_sl_price is not None,
+        # Priority 2: Breakeven stop — set after DCA recovery
+        if self._breakeven_stop_price is not None:
+            be_hit = (
+                (direction == "LONG"  and price <= self._breakeven_stop_price) or
+                (direction == "SHORT" and price >= self._breakeven_stop_price)
+            )
+            if be_hit:
+                logger.info(
+                    "TradingEngine: BREAKEVEN STOP HIT  price=%.4f  be_stop=%.4f",
+                    price, self._breakeven_stop_price,
+                )
+                await self._close_position(cfg, price, pnl_pct, "breakeven_stop")
+                return
+
+        # Priority 3: Last resort SL — liquidation buffer, black-swan only
+        # At 10× leverage liq is ~10% away; last_resort_sl_buffer=0.80 → fires at 8%.
+        liq_distance_pct = (1.0 / leverage) * 100
+        last_resort_pct  = liq_distance_pct * cfg.last_resort_sl_buffer
+        if price_pct <= -last_resort_pct:
+            logger.error(
+                "TradingEngine: LAST RESORT SL HIT  price=%.4f  "
+                "liq_dist=%.2f%%  buffer=%.2f  sl_pct=%.2f%%",
+                price, liq_distance_pct, cfg.last_resort_sl_buffer, last_resort_pct,
             )
             await self._emergency_close(cfg, price, pnl_pct)
             return
@@ -480,9 +619,47 @@ class TradingEngine:
                 await self._open_hedge(cfg, price, direction, qty)
             return
 
+        # ---- Breakeven stop activation (after a DCA recovery) ---------------
+        if (
+            cfg.breakeven_stop
+            and dca_count > 0
+            and self._breakeven_stop_price is None
+            and not self._trail_activated
+            and price_pct > 0
+        ):
+            fee_pct = (cfg.taker_fee_pct / 100) * 2   # round-trip, unleveraged
+            if direction == "LONG":
+                be_price = avg_price * (1 + fee_pct)
+            else:
+                be_price = avg_price * (1 - fee_pct)
+            self._breakeven_stop_price = be_price
+            logger.info(
+                "TradingEngine: breakeven stop SET @ %.6f  (avg=%.6f  fee_pct=%.4f%%)",
+                be_price, avg_price, fee_pct * 100,
+            )
+            self._broadcast({"type": "notification",
+                             "text": f"Breakeven stop armed @ {be_price:.4f}"})
+            self._push_session()
+
+        # ---- Profit-first exit: all DCAs used and price has recovered --------
+        if (
+            dca_count >= cfg.max_dca
+            and price_pct >= p["min_profit_pct"]
+            and not self._trail_activated
+            and not self._hedges
+        ):
+            logger.info(
+                "TradingEngine: PROFIT-FIRST exit — all DCAs used, price recovered"
+                " %.3f%% ≥ min %.3f%%", price_pct, p["min_profit_pct"],
+            )
+            await self._close_position(cfg, price, pnl_pct, "profit_first")
+            return
+
         # ---- DCA ------------------------------------------------------------
         if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"] and not self._hedges:
             opposite = "SHORT" if direction == "LONG" else "LONG"
+
+            # Gate 1: Signal must not actively disagree with main direction
             if signal["direction"] == opposite and signal["filters_passed"]:
                 logger.info(
                     "TradingEngine: DCA skipped — signal disagrees (%s vs main %s)",
@@ -490,8 +667,21 @@ class TradingEngine:
                 )
                 self._broadcast({"type": "notification",
                                  "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
-            else:
-                await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val)
+                return  # hard return, not just else
+
+            # Gate 2: Smart DCA reversal-indicator gate
+            if cfg.smart_dca_gate:
+                reversal_count = self._count_reversal_signals(ind, direction)
+                if reversal_count < cfg.smart_dca_signals:
+                    logger.debug(
+                        "TradingEngine: DCA gated — reversal signals %d/%d",
+                        reversal_count, cfg.smart_dca_signals,
+                    )
+                    self._broadcast({"type": "notification",
+                                     "text": f"DCA gated: {reversal_count}/{cfg.smart_dca_signals} reversal signals"})
+                    return
+
+            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val)
 
     # ------------------------------------------------------------------
     # Take-profit logic (trailing + fixed floor)
@@ -512,8 +702,10 @@ class TradingEngine:
         Using entry_price keeps the TP arm target fixed — it never drifts
         downward when DCA lowers avg_price.
         """
-        tp_pct    = p["tp_pct"]
-        trail_pct = p["trail_pct"]
+        tp_pct = p["tp_pct"]
+        # Apply tighten-only momentum multiplier. Floor at 0.10% so trail
+        # never becomes so tight that a single tick triggers an exit.
+        trail_pct = max(p["trail_pct"] * self._trail_pct_mult, 0.10)
 
         # TP arm: use manual override price if set, else entry-based %
         if self._override_tp_price is not None:
@@ -663,6 +855,7 @@ class TradingEngine:
         # Manual overrides no longer make sense after averaging down — clear them
         # so the engine resumes ATR-based levels for the new avg price.
         self._clear_level_overrides("dca")
+        self._breakeven_stop_price = None  # will re-arm on next recovery above avg
 
         # Recalculate risk thresholds from current ATR at DCA time.
         # Market volatility may have changed since entry; refreshing here keeps
@@ -938,15 +1131,17 @@ class TradingEngine:
             "trading_mode": cfg.trading_mode,
         })
 
-        self._session           = None
-        self._hedges            = []
-        self._trail_activated   = False
-        self._trail_price       = None
-        self._entry_adaptive    = {}
-        self._override_tp_price = None
-        self._override_sl_price = None
-        self._partial_tp_done   = False
-        self._last_stop_time    = None   # clear cooldown on normal close
+        self._session                = None
+        self._hedges                 = []
+        self._trail_activated        = False
+        self._trail_price            = None
+        self._trail_pct_mult         = 1.0
+        self._entry_adaptive         = {}
+        self._override_tp_price      = None
+        self._override_sl_price      = None
+        self._breakeven_stop_price   = None
+        self._partial_tp_done        = False
+        self._last_stop_time         = None   # clear cooldown on normal close
         self._push_session()
 
     async def _emergency_close(
@@ -1131,14 +1326,16 @@ class TradingEngine:
             _ = new_session_id  # id not needed further
 
             # ── 6. Update engine state ──────────────────────────────────
-            self._session         = await get_open_session()
-            self._hedges          = []
-            self._trail_activated = False
-            self._trail_price     = None
+            self._session              = await get_open_session()
+            self._hedges               = []
+            self._trail_activated      = False
+            self._trail_price          = None
+            self._trail_pct_mult       = 1.0
             # Seed entry_adaptive from current ATR so TP/SL are immediately active
-            self._entry_adaptive    = self._adaptive or {}
-            self._override_tp_price = None
-            self._override_sl_price = None
+            self._entry_adaptive         = self._adaptive or {}
+            self._override_tp_price      = None
+            self._override_sl_price      = None
+            self._breakeven_stop_price   = None
             self._pending_fills.clear()  # orphaned fill trackers from old main session
 
             partial_note = f"50% closed @ {price:.4f}" if half_qty > 0 else "100% promoted (min qty)"
