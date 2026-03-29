@@ -641,7 +641,7 @@ class TradingEngine:
             and dca_count > 0
             and self._breakeven_stop_price is None
             and not self._trail_activated
-            and price_pct > 0
+            and price_pct >= p["min_profit_pct"]
         ):
             fee_pct = (cfg.taker_fee_pct / 100) * 2   # round-trip, unleveraged
             if direction == "LONG":
