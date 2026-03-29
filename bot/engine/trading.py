@@ -641,19 +641,78 @@ class TradingEngine:
                              "text": f"Breakeven stop armed @ {be_price:.4f}"})
             self._push_session()
 
-        # ---- Profit-first exit: all DCAs used and price has recovered --------
+        # ---- Signal-aware exit: all DCAs used and price has recovered --------
+        # Three-tier decision based on current signal direction and strength.
         if (
             dca_count >= cfg.max_dca
             and price_pct >= p["min_profit_pct"]
             and not self._trail_activated
             and not self._hedges
         ):
-            logger.info(
-                "TradingEngine: PROFIT-FIRST exit — all DCAs used, price recovered"
-                " %.3f%% ≥ min %.3f%%", price_pct, p["min_profit_pct"],
-            )
-            await self._close_position(cfg, price, pnl_pct, "profit_first")
-            return
+            sig_dir      = signal.get("direction", "NEUTRAL")
+            sig_strength = signal.get("strength", 0.0)
+            sig_passed   = signal.get("filters_passed", False)
+            strong_threshold = cfg.min_signal_strength * 1.5
+
+            if sig_dir == direction and sig_passed:
+                # Signal confirms trade direction — momentum still valid.
+                # Arm the trail and let the position run rather than cutting early.
+                if sig_strength >= strong_threshold:
+                    # Strong confirmation: normal trail, full run.
+                    logger.info(
+                        "TradingEngine: DCA recovery — signal STRONG %s (%.2f) — "
+                        "arming trail, letting position run",
+                        sig_dir, sig_strength,
+                    )
+                    # Trail will be armed naturally on the next tick when
+                    # _check_tp() sees entry_pct >= tp_pct. Nothing to do here
+                    # except NOT closing — just return to let normal flow continue.
+                else:
+                    # Weak confirmation: arm trail but tighten it proactively.
+                    # Position still has upside but conviction is low.
+                    self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
+                    logger.info(
+                        "TradingEngine: DCA recovery — signal WEAK %s (%.2f) — "
+                        "trail tightened to %.1f×, letting position run",
+                        sig_dir, sig_strength, self._trail_pct_mult,
+                    )
+                self._broadcast({
+                    "type": "notification",
+                    "text": (
+                        f"DCA recovered — signal {sig_dir} ({sig_strength:.2f}) — "
+                        f"trailing, not closing early"
+                    ),
+                })
+
+            elif sig_dir != direction and sig_passed:
+                # Signal has flipped opposite — momentum has ended or reversed.
+                # Take the profit now before the reversal eats it back.
+                logger.info(
+                    "TradingEngine: DCA recovery — signal OPPOSITE %s vs %s — "
+                    "closing now at +%.3f%% before reversal",
+                    sig_dir, direction, price_pct,
+                )
+                await self._close_position(cfg, price, pnl_pct, "profit_first")
+                return
+
+            else:
+                # Signal is NEUTRAL or filters not passed — uncertain market.
+                # Arm the trail and set breakeven stop: protect capital but
+                # don't force an early exit if momentum resumes.
+                self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
+                logger.info(
+                    "TradingEngine: DCA recovery — signal NEUTRAL — "
+                    "arming tight trail + breakeven stop",
+                )
+                self._broadcast({
+                    "type": "notification",
+                    "text": (
+                        f"DCA recovered — signal neutral — "
+                        f"tight trail armed, breakeven protected"
+                    ),
+                })
+                # Breakeven stop will be set by the existing block above on the
+                # next tick when price_pct > 0 and dca_count > 0.
 
         # ---- DCA ------------------------------------------------------------
         if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"] and not self._hedges:
