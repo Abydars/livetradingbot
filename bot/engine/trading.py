@@ -1173,10 +1173,11 @@ class TradingEngine:
         pnl_pct: float,
         reason: str,
     ) -> None:
-        sess = self._session
+        sess      = self._session
         direction = sess["direction"]
         qty       = sess["qty"]
         margin    = sess["margin"]
+        leverage  = sess["leverage"]
 
         # Close any open hedges first and accumulate their PnL
         total_hedge_pnl = 0.0
