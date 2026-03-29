@@ -595,12 +595,22 @@ async def _on_user_data(event: dict) -> None:
                     (sess_dir == "SHORT" and order_side == "BUY")
                 )
                 if is_closing_side:
-                    _last_external_fill_price = fill_price
-                    logger.info(
-                        "External close detected (ORDER_TRADE_UPDATE): "
-                        "symbol=%s side=%s fill=%.6f — price captured for PnL calc",
-                        symbol, order_side, fill_price,
-                    )
+                    _oid = int(order_id) if order_id else 0
+                    if _oid and _oid in _engine._bot_close_order_ids:
+                        # This is the bot's own close order — remove from tracking set
+                        # and do NOT treat it as an external close.
+                        _engine._bot_close_order_ids.discard(_oid)
+                        logger.debug(
+                            "Bot close order %s filled @ %.6f — skipping external close capture",
+                            _oid, fill_price,
+                        )
+                    else:
+                        _last_external_fill_price = fill_price
+                        logger.info(
+                            "External close detected (ORDER_TRADE_UPDATE): "
+                            "symbol=%s side=%s fill=%.6f — price captured for PnL calc",
+                            symbol, order_side, fill_price,
+                        )
             return  # close/hedge/external order — don't touch avg_price
 
         sess = _engine._session
