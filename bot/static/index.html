@@ -2598,19 +2598,6 @@ function closeDrawers() {
   document.getElementById('drawer-overlay').classList.remove('active');
 }
 
-// Swipe gestures: right-swipe opens watchlist, left-swipe opens panel, either swipe closes open drawer
-let _swipeX = 0;
-document.addEventListener('touchstart', e => { _swipeX = e.touches[0].clientX; }, { passive: true });
-document.addEventListener('touchend', e => {
-  if (window.innerWidth > 767) return;
-  const dx = e.changedTouches[0].clientX - _swipeX;
-  const leftOpen  = document.getElementById('sym-sidebar').classList.contains('drawer-open');
-  const rightOpen = document.getElementById('right-col').classList.contains('drawer-open');
-  if (Math.abs(dx) < 40) return;  // ignore small swipes
-  if (leftOpen || rightOpen) { closeDrawers(); return; }
-  if (dx >  40) openDrawer('left');
-  if (dx < -40) openDrawer('right');
-}, { passive: true });
 
 function changeTf(tf) {
   if (tradingActive) {
