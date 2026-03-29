@@ -75,86 +75,83 @@ async def notify(webhook_url: str, event: str, data: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_embed(event: str, data: Dict) -> Dict:
-    _mode = data.get("trading_mode", "")
+    _mode     = data.get("trading_mode", "")
     paper_tag = f" [{_mode.upper()}]" if _mode else ""
     symbol    = data.get("symbol", "")
+    direction = data.get("direction", "")
+    dir_arrow = "▲" if direction == "LONG" else "▼" if direction == "SHORT" else ""
 
     if event == "TRADE_OPEN":
+        price    = _fmt_p(data.get("price", 0))
+        margin   = data.get("margin", 0)
+        strength = data.get("strength", 0)
         return {
-            "title": f"📈 TRADE OPEN{paper_tag}",
+            "title": f"📈 OPENED {dir_arrow} {direction} {symbol} @ {price}{paper_tag}",
             "color": _COLOUR["TRADE_OPEN"],
             "fields": [
-                {"name": "Symbol",    "value": symbol,                          "inline": True},
-                {"name": "Direction", "value": data.get("direction", ""),       "inline": True},
-                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),     "inline": True},
-                {"name": "Margin",    "value": f"{data.get('margin', 0)} USDT", "inline": True},
-                {"name": "Strength",  "value": f"{data.get('strength', 0):.2%}","inline": True},
+                {"name": "Margin",   "value": f"{margin} USDT", "inline": True},
+                {"name": "Strength", "value": f"{strength:.0%}", "inline": True},
             ],
         }
 
     if event == "TRADE_DCA":
+        level   = data.get("level", "?")
+        price   = _fmt_p(data.get("price", 0))
+        new_avg = _fmt_p(data.get("new_avg", 0))
+        total   = data.get("total_margin", 0)
         return {
-            "title": f"🔁 DCA #{data.get('level', '?')}{paper_tag}",
+            "title": f"🔁 DCA #{level} {dir_arrow} {direction} {symbol} @ {price}{paper_tag}",
             "color": _COLOUR["TRADE_DCA"],
             "fields": [
-                {"name": "Symbol",        "value": symbol,                              "inline": True},
-                {"name": "Direction",     "value": data.get("direction", ""),           "inline": True},
-                {"name": "Fill Price",    "value": _fmt_p(data.get('price', 0)),           "inline": True},
-                {"name": "New Avg",       "value": _fmt_p(data.get('new_avg', 0)),       "inline": True},
-                {"name": "Total Margin",  "value": f"{data.get('total_margin', 0)} USDT","inline": True},
+                {"name": "New Avg",      "value": new_avg,         "inline": True},
+                {"name": "Total Margin", "value": f"{total} USDT", "inline": True},
             ],
         }
 
     if event == "HEDGE_OPEN":
+        price = _fmt_p(data.get("price", 0))
+        qty   = _fmt_qty(data.get("qty", 0))
         return {
-            "title": f"🛡 HEDGE OPEN{paper_tag}",
+            "title": f"🛡 HEDGE {dir_arrow} {direction} {symbol} @ {price}{paper_tag}",
             "color": _COLOUR["HEDGE_OPEN"],
             "fields": [
-                {"name": "Symbol",    "value": symbol,                        "inline": True},
-                {"name": "Direction", "value": data.get("direction", ""),     "inline": True},
-                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),   "inline": True},
-                {"name": "Qty",       "value": _fmt_qty(data.get("qty", 0)),  "inline": True},
+                {"name": "Qty", "value": qty, "inline": True},
             ],
         }
 
     if event == "TRADE_CLOSE":
-        pnl    = data.get("pnl", 0)
-        colour = _COLOUR["TRADE_CLOSE_WIN"] if pnl >= 0 else _COLOUR["TRADE_CLOSE_LOSS"]
-        icon   = "✅" if pnl >= 0 else "❌"
+        pnl     = data.get("pnl", 0)
+        pnl_pct = data.get("pnl_pct", 0)
+        price   = _fmt_p(data.get("price", 0))
+        reason  = data.get("reason", "")
+        colour  = _COLOUR["TRADE_CLOSE_WIN"] if pnl >= 0 else _COLOUR["TRADE_CLOSE_LOSS"]
+        icon    = "✅" if pnl >= 0 else "❌"
+        pnl_str = f"{pnl:+.2f} USDT ({pnl_pct:+.2f}%)"
         return {
-            "title": f"{icon} TRADE CLOSED{paper_tag}",
+            "title": f"{icon} CLOSED {dir_arrow} {direction} {symbol} {pnl_str}{paper_tag}",
             "color": colour,
             "fields": [
-                {"name": "Symbol",    "value": symbol,                              "inline": True},
-                {"name": "Direction", "value": data.get("direction", ""),           "inline": True},
-                {"name": "Price",     "value": _fmt_p(data.get('price', 0)),         "inline": True},
-                {"name": "PnL",       "value": f"{pnl:+.2f} USDT ({data.get('pnl_pct', 0):+.2f}%)", "inline": True},
-                {"name": "Reason",    "value": data.get("reason", ""),              "inline": True},
+                {"name": "Exit Price", "value": price,  "inline": True},
+                {"name": "Reason",     "value": reason, "inline": True},
             ],
         }
 
     if event == "HARD_STOP":
+        price   = _fmt_p(data.get("price", 0))
+        pnl_pct = data.get("pnl_pct", 0)
         return {
-            "title": f"⚠️ HARD STOP TRIGGERED{paper_tag}",
+            "title": f"🛑 LAST RESORT SL {symbol} @ {price}  ({pnl_pct:+.2f}%){paper_tag}",
             "color": _COLOUR["HARD_STOP"],
-            "fields": [
-                {"name": "Symbol",  "value": symbol,                              "inline": True},
-                {"name": "Price",   "value": _fmt_p(data.get('price', 0)),         "inline": True},
-                {"name": "PnL %",   "value": f"{data.get('pnl_pct', 0):+.2f}%",  "inline": True},
-            ],
+            "fields": [],
         }
 
     if event == "HEDGE_PROMOTED":
+        price = _fmt_p(data.get("price", 0))
         return {
-            "title": f"♻ HEDGE PROMOTED → MAIN{paper_tag}",
+            "title": f"♻ PROMOTED {dir_arrow} {direction} {symbol} @ {price}{paper_tag}",
             "color": _COLOUR["HEDGE_PROMOTED"],
             "fields": [
-                {"name": "Symbol",            "value": symbol,                                        "inline": True},
-                {"name": "Direction",         "value": data.get("direction", ""),                     "inline": True},
-                {"name": "Entry Price",       "value": _fmt_p(data.get("price", 0)),                  "inline": True},
-                {"name": "Qty",               "value": _fmt_qty(data.get("qty", 0)),                  "inline": True},
-                {"name": "Margin",            "value": f"{data.get('margin', 0)} USDT",               "inline": True},
-                {"name": "Partial Close Qty", "value": _fmt_qty(data.get("partial_close_qty", 0)),    "inline": True},
+                {"name": "Margin", "value": f"{data.get('margin', 0)} USDT", "inline": True},
             ],
         }
 
