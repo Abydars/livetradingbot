@@ -45,7 +45,6 @@ _COLOUR = {
     "TRADE_CLOSE_WIN": 0x00C853,
     "TRADE_CLOSE_LOSS": 0xD32F2F,
     "HARD_STOP":       0xD32F2F,   # red
-    "AUTO_SWITCH":     0xF9A825,   # gold
 }
 
 
@@ -156,16 +155,6 @@ def _build_embed(event: str, data: Dict) -> Dict:
                 {"name": "Qty",               "value": _fmt_qty(data.get("qty", 0)),                  "inline": True},
                 {"name": "Margin",            "value": f"{data.get('margin', 0)} USDT",               "inline": True},
                 {"name": "Partial Close Qty", "value": _fmt_qty(data.get("partial_close_qty", 0)),    "inline": True},
-            ],
-        }
-
-    if event == "AUTO_SWITCH":
-        return {
-            "title": f"🔀 AUTO SWITCH{paper_tag}",
-            "color": _COLOUR["AUTO_SWITCH"],
-            "fields": [
-                {"name": "From", "value": data.get("old_symbol", ""), "inline": True},
-                {"name": "To",   "value": data.get("new_symbol", ""), "inline": True},
             ],
         }
 

@@ -347,11 +347,6 @@ async def _scan_symbols(cfg) -> None:
             "type": "notification",
             "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
         })
-        await notify(cfg.discord_webhook, "AUTO_SWITCH", {
-            "old_symbol":   cfg.symbol,
-            "new_symbol":   new_sym,
-            "trading_mode": cfg.trading_mode,
-        })
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
         _on_exchange_error(f"Symbol scan failed: {exc}")
