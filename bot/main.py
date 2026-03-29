@@ -516,6 +516,11 @@ async def _on_user_data(event: dict) -> None:
         o = event.get("o", {})
         if o.get("X") != "FILLED":
             return
+        # x = Execution Type per Binance docs.
+        # Only process actual trade fills (TRADE) or liquidation executions (CALCULATED).
+        # Skip AMENDMENT (order modified), EXPIRED, NEW, CANCELED etc.
+        if o.get("x") not in ("TRADE", "CALCULATED"):
+            return
 
         # Compute fill price from raw cumulative fields for maximum accuracy.
         # Z = Cumulative Quote Asset Transacted Quantity (total USDT)
@@ -549,9 +554,11 @@ async def _on_user_data(event: dict) -> None:
             or client_id.startswith("settlement_autoclose-")
         )
 
+        realized_pnl_raw = float(o.get("rp", 0))
         logger.info(
-            "Fill: orderId=%s %s type=%s client=%s avgPrice=%.6f qty=%.4f",
+            "Fill: orderId=%s %s type=%s client=%s fill=%.6f qty=%.4f rp=%+.4f",
             order_id, symbol, order_type, client_id, fill_price, fill_qty,
+            realized_pnl_raw,
         )
 
         # Forced close (liquidation / ADL / settlement) — position closed by exchange.
