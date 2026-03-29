@@ -26,6 +26,10 @@ class BotConfig:
     margin_usdt: float
     max_dca: int
     max_re_hedge: int
+    smart_dca_gate: bool
+    smart_dca_signals: int
+    breakeven_stop: bool
+    last_resort_sl_buffer: float
     min_signal_strength: float
     cooldown_after_stop_s: int
     max_daily_loss_usdt: float
@@ -105,6 +109,10 @@ async def load_config() -> BotConfig:
         margin_usdt=_f("margin_usdt", 10.0),
         max_dca=_i("max_dca", 3),
         max_re_hedge=_i("max_re_hedge", 3),
+        smart_dca_gate=_b("smart_dca_gate", True),
+        smart_dca_signals=_i("smart_dca_signals", 2),
+        breakeven_stop=_b("breakeven_stop", True),
+        last_resort_sl_buffer=_f("last_resort_sl_buffer", 0.80),
         min_signal_strength=_f("min_signal_strength", 0.25),
         cooldown_after_stop_s=_i("cooldown_after_stop_s", 300),
         max_daily_loss_usdt=_f("max_daily_loss_usdt", 0.0),
