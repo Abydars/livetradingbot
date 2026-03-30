@@ -357,7 +357,7 @@ async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
     global _tried_syms, _entry_wait_ts, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
     try:
-        top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
+        top = await _rest.get_top_movers(n=cfg.scanner_top_n, timeframe=cfg.timeframe)
         if not top:
             return
 
@@ -1558,7 +1558,7 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             # Cold start — fetch immediately for this client
             try:
                 cfg_cold = await load_config()
-                top = await _rest.get_top_movers(n=10, timeframe=cfg_cold.timeframe)
+                top = await _rest.get_top_movers(n=cfg_cold.scanner_top_n, timeframe=cfg_cold.timeframe)
                 movers = _format_movers(top)
                 await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
             except Exception:
