@@ -83,6 +83,7 @@ _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow 
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
+_entry_wait_ts: float = 0.0           # timestamp when we switched to current candidate (0 = not waiting)
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
@@ -353,7 +354,7 @@ def _format_movers(top: list) -> list:
 
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
+    global _entry_wait_ts, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
     try:
         top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
@@ -401,22 +402,74 @@ async def _scan_symbols(cfg) -> None:
         await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
         # Auto-switch only when enabled and no open position
-        if not cfg.auto_switch or _engine._session is not None or not _trading_active:
+        if not cfg.auto_switch or not _trading_active:
+            _entry_wait_ts = 0.0
+            return
+        if _engine._session is not None:
+            # Position is open — reset wait timer so next entry search starts fresh
+            _entry_wait_ts = 0.0
             return
 
+        now_ts     = time.time()
+        top_scores = {t["symbol"]: t["_score"] for t in top}
         best       = top[0]
         new_sym    = best["symbol"]
         best_score = best["_score"]
-        cur_score  = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
+        cur_score  = top_scores.get(cfg.symbol, 0.0)
 
+        # Already on the best symbol — reset timer, nothing to do
         if new_sym == cfg.symbol:
-            return  # already on the top symbol
-        if cur_score > 0 and best_score < cur_score * cfg.switch_threshold:
-            return  # not meaningfully better — stay put
+            _entry_wait_ts = 0.0
+            await _do_broadcast({
+                "type": "entry_wait",
+                "waiting": False, "elapsed": 0, "timeout": cfg.entry_wait_s, "symbol": cfg.symbol,
+            })
+            return
+
+        # Current symbol has fallen off the top list entirely — it has gone cold.
+        # Switch immediately without waiting.
+        if cfg.symbol not in top_scores:
+            logger.info("Auto-switch: %s gone cold — switching immediately to %s", cfg.symbol, new_sym)
+        elif cur_score > 0 and best_score < cur_score * cfg.switch_threshold:
+            # Best is not meaningfully better than current — keep waiting
+            _entry_wait_ts = 0.0
+            return
+        else:
+            # A better symbol exists. Start timer if not already running.
+            if _entry_wait_ts == 0.0:
+                _entry_wait_ts = now_ts
+                logger.info(
+                    "Auto-switch pending: %s (score %.1f) waiting %.0fs for entry before trying %s (score %.1f)",
+                    cfg.symbol, cur_score, cfg.entry_wait_s, new_sym, best_score,
+                )
+                await _do_broadcast({
+                    "type": "entry_wait",
+                    "waiting": True, "elapsed": 0, "timeout": cfg.entry_wait_s,
+                    "symbol": cfg.symbol, "candidate": new_sym,
+                })
+                return
+
+            elapsed = now_ts - _entry_wait_ts
+
+            # Broadcast countdown every scan so UI can show progress
+            await _do_broadcast({
+                "type": "entry_wait",
+                "waiting": True, "elapsed": round(elapsed, 1), "timeout": cfg.entry_wait_s,
+                "symbol": cfg.symbol, "candidate": new_sym,
+            })
+
+            if elapsed < cfg.entry_wait_s:
+                return  # still within wait window — give current symbol more time
+
+            # Timer expired — no entry signal arrived. Fall through to switch.
+            logger.info(
+                "Auto-switch: %s timed out after %.0fs (no entry) — switching to %s",
+                cfg.symbol, elapsed, new_sym,
+            )
 
         logger.info(
-            "Auto-switch: %s → %s  (score %.1f → %.1f, threshold %.2fx)",
-            cfg.symbol, new_sym, cur_score, best_score, cfg.switch_threshold,
+            "Auto-switch: %s → %s  (score %.1f → %.1f)",
+            cfg.symbol, new_sym, cur_score, best_score,
         )
         await set_config_bulk({"symbol": new_sym})
         # Fetch 200 candles for the new symbol BEFORE switching so the engine
@@ -447,6 +500,7 @@ async def _scan_symbols(cfg) -> None:
 
         # symbol_ready MUST go first — UI clears the chart on this message.
         # Candles sent after so they populate the freshly cleared chart.
+        _entry_wait_ts = 0.0   # reset — we just switched, start fresh on new symbol
         global _last_switch_ts, _htf_bias, _last_htf_fetch
         _last_switch_ts = time.time()
         _htf_bias = "NEUTRAL"
