@@ -123,21 +123,26 @@ class TradingEngine:
     def _push_session(self) -> None:
         """Push current session + hedges + trade-level prices to all WS clients."""
         tp_price = sl_price = None
-        ref = self._entry_adaptive or self._adaptive
-        if self._session and ref:
+
+        if self._session:
             entry    = self._session["entry_price"]
             avg      = self._session["avg_price"]
             d        = self._session["direction"]
             leverage = self._session["leverage"]
-            tp       = ref["tp_pct"]
 
-            # TP arm: fixed at original entry price
-            if d == "LONG":
-                tp_price = entry * (1 + tp / 100)
-            else:
-                tp_price = entry * (1 - tp / 100)
+            # TP arm: requires _entry_adaptive (locked at entry).
+            # Only compute if available — after restart it may not be set yet,
+            # and will be populated on the next tick when _manage_position runs.
+            ref = self._entry_adaptive or self._adaptive
+            if ref:
+                tp = ref["tp_pct"]
+                if d == "LONG":
+                    tp_price = entry * (1 + tp / 100)
+                else:
+                    tp_price = entry * (1 - tp / 100)
 
-            # SL: use breakeven stop if set, else last resort SL.
+            # SL: does NOT need ref — only uses session values + buffer cache.
+            # This works correctly even after restart when ref is empty.
             if self._breakeven_stop_price is not None:
                 sl_price = self._breakeven_stop_price
             else:
