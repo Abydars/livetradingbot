@@ -78,7 +78,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "smart_dca_signals":       "2",
     "breakeven_stop":          "1",
     "last_resort_sl_buffer":   "0.80",
-    "min_signal_strength": "0.25",
+    "min_signal_strength": "0.30",
     "trading_mode":        "paper",
     "discord_webhook":     "",
     "auto_switch":         "1",
