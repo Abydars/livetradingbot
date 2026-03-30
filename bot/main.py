@@ -443,16 +443,17 @@ async def _scan_symbols(cfg) -> None:
         if cfg.symbol in candidates:
             next_candidate = next((s for s in candidates if s != cfg.symbol), None)
 
-            # If #1 symbol scores switch_threshold× better than current while we are
-            # waiting, switch immediately — no need to finish the candle timer.
-            # Uses cfg.switch_threshold (config field, default 1.1 = 10% better).
+            # Check if #1 symbol is switch_threshold× better — immediate switch,
+            # bypasses candle timer entirely.
             top_score = top[0]["_score"]
             cur_score = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
             top_sym   = top[0]["symbol"]
+
             if (top_sym != cfg.symbol
                     and top_sym not in _tried_syms
                     and cur_score > 0
                     and top_score >= cur_score * cfg.switch_threshold):
+                # Immediate switch — do not touch candle timer state
                 logger.info(
                     "Auto-switch: %s (score %.1f) is %.0f%% better than %s (score %.1f)"
                     " — switching immediately (threshold %.2f×)",
@@ -462,9 +463,10 @@ async def _scan_symbols(cfg) -> None:
                 _tried_syms.add(cfg.symbol)
                 _entry_start_candle   = 0
                 _neutral_since_candle = 0
-                candidates = [top_sym]
+                new_sym = top_sym
+
             else:
-                # Record which candle we started waiting on
+                # Normal candle-based wait path
                 if _entry_start_candle == 0 and cur_candle > 0:
                     _entry_start_candle = cur_candle
                     logger.info(
@@ -472,56 +474,57 @@ async def _scan_symbols(cfg) -> None:
                         cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
                     )
 
-            # Candles elapsed since we started on this symbol
-            total_candles = max(0, (cur_candle - _entry_start_candle) // tf_secs) if tf_secs > 0 else 0
+                total_candles = max(0, (cur_candle - _entry_start_candle) // tf_secs) if tf_secs > 0 else 0
 
-            # Only count NEUTRAL candles. Directional signal resets the neutral counter.
-            sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
-            if sig_dir == "NEUTRAL":
-                if _neutral_since_candle == 0 and cur_candle > 0:
-                    _neutral_since_candle = cur_candle
-                neutral_candles = max(0, (cur_candle - _neutral_since_candle) // tf_secs) if tf_secs > 0 else 0
-            else:
-                _neutral_since_candle = 0   # directional — reset neutral counter
-                neutral_candles       = 0
+                sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
+                if sig_dir == "NEUTRAL":
+                    if _neutral_since_candle == 0 and cur_candle > 0:
+                        _neutral_since_candle = cur_candle
+                    neutral_candles = max(0, (cur_candle - _neutral_since_candle) // tf_secs) if tf_secs > 0 else 0
+                else:
+                    _neutral_since_candle = 0
+                    neutral_candles       = 0
 
-            await _do_broadcast({
-                "type":      "entry_wait",
-                "waiting":   True,
-                "elapsed":   neutral_candles,
-                "timeout":   cfg.entry_wait_candles,
-                "symbol":    cfg.symbol,
-                "candidate": next_candidate or "",
-                "tried":     len(_tried_syms),
-                "total":     len(top_syms),
-                "signal":    sig_dir,
-            })
+                await _do_broadcast({
+                    "type":      "entry_wait",
+                    "waiting":   True,
+                    "elapsed":   neutral_candles,
+                    "timeout":   cfg.entry_wait_candles,
+                    "symbol":    cfg.symbol,
+                    "candidate": next_candidate or "",
+                    "tried":     len(_tried_syms),
+                    "total":     len(top_syms),
+                    "signal":    sig_dir,
+                })
 
-            if neutral_candles < cfg.entry_wait_candles and total_candles < _ENTRY_HARD_MAX_CANDLES:
-                return  # still within wait window
+                if neutral_candles < cfg.entry_wait_candles and total_candles < _ENTRY_HARD_MAX_CANDLES:
+                    return  # still within wait window
 
-            if total_candles >= _ENTRY_HARD_MAX_CANDLES:
-                logger.info(
-                    "Auto-switch: %s — hard max %d candles reached (signal oscillating), moving to next",
-                    cfg.symbol, total_candles,
-                )
-            else:
-                logger.info(
-                    "Auto-switch: %s — NEUTRAL for %d candles, moving to next candidate",
-                    cfg.symbol, neutral_candles,
-                )
-            _tried_syms.add(cfg.symbol)
-            candidates = [s for s in top_syms if s not in _tried_syms]
+                if total_candles >= _ENTRY_HARD_MAX_CANDLES:
+                    logger.info(
+                        "Auto-switch: %s — hard max %d candles reached (signal oscillating), moving to next",
+                        cfg.symbol, total_candles,
+                    )
+                else:
+                    logger.info(
+                        "Auto-switch: %s — NEUTRAL for %d candles, moving to next candidate",
+                        cfg.symbol, neutral_candles,
+                    )
 
-            if not candidates:
-                # Just exhausted the last candidate — reset and use full list
-                _tried_syms.clear()
-                candidates = [s for s in top_syms if s != cfg.symbol]
+                _tried_syms.add(cfg.symbol)
+                candidates = [s for s in top_syms if s not in _tried_syms]
+
                 if not candidates:
-                    return  # only one symbol in scanner, nothing to switch to
+                    _tried_syms.clear()
+                    candidates = [s for s in top_syms if s != cfg.symbol]
+                    if not candidates:
+                        return
 
-        # Pick the best available untried candidate
-        new_sym = candidates[0]
+                new_sym = candidates[0]
+
+        else:
+            # Current symbol is not a candidate — pick best untried directly
+            new_sym = candidates[0]
 
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
         await set_config_bulk({"symbol": new_sym})
