@@ -340,15 +340,39 @@ async def _scan_symbols(cfg) -> None:
             cfg.symbol, new_sym, cur_score, best_score, cfg.switch_threshold,
         )
         await set_config_bulk({"symbol": new_sym})
-        await _ws.switch_symbol(new_sym)
-        _last_candles_fetch = 0.0
-        # Reset price so next tick fetches a fresh mark-price for the new symbol
-        # instead of using stale price from the old symbol
+        # Fetch 200 candles for the new symbol BEFORE switching so the engine
+        # is ready to compute a signal on the very first tick after switch —
+        # no extra 30-second candle-refresh cycle needed.
+        raw_candles = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
+        fresh_candles = [
+            {
+                "open":   float(k[1]),
+                "high":   float(k[2]),
+                "low":    float(k[3]),
+                "close":  float(k[4]),
+                "volume": float(k[5]),
+                "time":   int(k[0]) // 1000,
+            }
+            for k in raw_candles
+        ] if raw_candles else []
+
+        # WS resubscribe and Binance symbol prep are independent — run in parallel.
+        await asyncio.gather(
+            _ws.switch_symbol(new_sym),
+            _executor.prepare_symbol(new_sym, cfg.leverage),
+        )
+
+        # Reset stale price so the next tick gets a fresh mark-price for new symbol.
         _last_price = 0.0
         _last_price_rest_fetch = 0.0
-        # Pre-configure the new symbol on Binance (margin type, leverage) so the
-        # first order fires immediately without setup latency.
-        await _executor.prepare_symbol(new_sym, cfg.leverage)
+
+        # Feed candles to engine immediately — first tick can compute signal
+        # without waiting for the candle refresh cycle.
+        if fresh_candles:
+            _engine.update_candles(fresh_candles)
+            _last_candles_fetch = time.time()
+        else:
+            _last_candles_fetch = 0.0   # fallback: fetch on next tick
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
         await _do_broadcast({
             "type": "notification",
