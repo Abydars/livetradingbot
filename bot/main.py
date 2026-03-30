@@ -371,6 +371,19 @@ async def _scan_symbols(cfg) -> None:
         if fresh_candles:
             _engine.update_candles(fresh_candles)
             _last_candles_fetch = time.time()
+            # Broadcast candles + indicators immediately so the chart
+            # renders on switch — without this the UI waits up to 30s
+            # for the next candle refresh cycle.
+            await _do_broadcast({
+                "type":    "candles",
+                "candles": fresh_candles[-100:],
+            })
+            ind = _engine.last_indicators
+            if ind:
+                await _do_broadcast({
+                    "type":       "indicators",
+                    "indicators": _safe_ind(ind),
+                })
         else:
             _last_candles_fetch = 0.0   # fallback: fetch on next tick
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
