@@ -86,6 +86,9 @@ class TradingEngine:
         # Minimum time gate between DCAs — set on each DCA execution
         self._last_dca_time: Optional[float] = None
 
+        # Smart SL: counts consecutive ticks of strong opposite signal in loss
+        self._smart_sl_ticks: int = 0
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -613,6 +616,40 @@ class TradingEngine:
         if await self._check_tp(cfg, price, entry_pct, pnl_pct, direction, p):
             return
 
+        # ---- Smart SL: signal-confirmed early exit when all DCAs exhausted ---
+        # Fires when all DCAs are used, position is losing, and a strong
+        # opposite signal is confirmed for 3 consecutive ticks.
+        # Exits well before the last resort SL to limit losses.
+        # Does NOT fire while DCAs remain — DCA is the preferred rescue.
+        if (
+            dca_count >= cfg.max_dca
+            and price_pct < 0
+            and not self._trail_activated
+            and not self._hedges
+        ):
+            opposite = "SHORT" if direction == "LONG" else "LONG"
+            strong_opposite = (
+                signal["direction"] == opposite
+                and signal["filters_passed"]
+                and signal["strength"] >= cfg.min_signal_strength * 1.5
+            )
+            if strong_opposite:
+                self._smart_sl_ticks += 1
+                if self._smart_sl_ticks >= 3:
+                    logger.info(
+                        "TradingEngine: SMART SL — signal %s str=%.2f confirmed "
+                        "%d ticks, price_pct=%.3f%% — exiting before last resort SL",
+                        signal["direction"], signal["strength"],
+                        self._smart_sl_ticks, price_pct,
+                    )
+                    self._smart_sl_ticks = 0
+                    await self._close_position(cfg, price, pnl_pct, "smart_sl")
+                    return
+            else:
+                self._smart_sl_ticks = 0
+        else:
+            self._smart_sl_ticks = 0
+
         # ---- Hedge management -----------------------------------------------
         if self._hedges:
             await self._manage_hedges(cfg, price, price_pct, pnl_pct, p, signal)
@@ -959,6 +996,7 @@ class TradingEngine:
             return
 
         self._last_dca_time = time.time()
+        self._smart_sl_ticks = 0   # DCA fired — reset smart SL counter
 
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
@@ -1291,6 +1329,7 @@ class TradingEngine:
         self._last_stop_time         = None   # clear cooldown on normal close
         self._bot_close_order_ids.clear()
         self._last_dca_time          = None
+        self._smart_sl_ticks         = 0
         self._push_session()
 
     async def _emergency_close(
