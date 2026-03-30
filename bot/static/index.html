@@ -1368,7 +1368,7 @@ function adjustLevel(type, dir) {
 }
 
 // chart handles
-let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S;
+let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S, volSeries;
 
 // live candle (updated on every trade tick)
 let _liveCandle = null;
@@ -1438,6 +1438,19 @@ function initChart() {
   ema9S  = chart.addLineSeries({ color:'rgba(240,180,41,.75)',  lineWidth:1, priceLineVisible:false, lastValueVisible:false });
   ema21S = chart.addLineSeries({ color:'rgba(63,185,80,.75)',   lineWidth:1, priceLineVisible:false, lastValueVisible:false });
   ema50S = chart.addLineSeries({ color:'rgba(88,166,255,.75)',  lineWidth:1, priceLineVisible:false, lastValueVisible:false });
+
+  // Volume histogram — bottom 18% of chart, separate price scale
+  volSeries = chart.addHistogramSeries({
+    priceScaleId:       'volume',
+    priceLineVisible:   false,
+    lastValueVisible:   false,
+    color:              'rgba(88,166,255,0.35)',
+  });
+  volSeries.priceScale().applyOptions({
+    scaleMargins: { top: 0.82, bottom: 0.00 },
+    borderVisible: false,
+    drawTicks:     false,
+  });
 
   // Resize observer
   new ResizeObserver(() => {
@@ -1567,6 +1580,7 @@ function dispatch(msg) {
       // into the new symbol's price range while waiting for the candles message.
       _liveCandle = null;
       if (csSeries) { csSeries.setData([]); }
+      if (volSeries) { volSeries.setData([]); }
       if (ema9S)    { ema9S.setData([]);    }
       if (ema21S)   { ema21S.setData([]);   }
       if (ema50S)   { ema50S.setData([]);   }
@@ -1820,6 +1834,17 @@ function processCandleUpdate(candles) {
   ema9S.applyOptions({ priceFormat: priceFmt });
   ema21S.applyOptions({ priceFormat: priceFmt });
   ema50S.applyOptions({ priceFormat: priceFmt });
+
+  // Volume bars — green if close >= open, red if close < open
+  if (volSeries) {
+    volSeries.setData(candles.map(c => ({
+      time:  c.time,
+      value: c.volume || 0,
+      color: (c.close >= c.open)
+        ? 'rgba(63,185,80,0.45)'
+        : 'rgba(248,81,73,0.45)',
+    })));
+  }
 
   // Seed live candle from the last (current open) candle returned by server
   const last = candles[candles.length - 1];
