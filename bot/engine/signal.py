@@ -224,25 +224,41 @@ class SignalEngine:
 
     def _score_stoch_rsi(self, ind: Dict) -> float:
         """
-        Stochastic RSI k-line based score.
-        k > 80 → overbought → short signal (fade toward -1)
-        k < 20 → oversold  → long signal  (fade toward +1)
-        Returns 0.0 when indicator data is unavailable.
+        Stochastic RSI hybrid score: zone level (60%) + k/d crossover (40%).
+
+        Zone (k-line position):
+          k > 80 → overbought → negative score toward -1
+          k < 20 → oversold  → positive score toward +1
+          20–80  → linear gradient through zero
+
+        Crossover (k vs d-line):
+          k > d → momentum turning up   → positive confirmation
+          k < d → momentum still falling → penalises the zone score
+          Normalised by 20-point spread, clamped to ±1.
+
+        Using both prevents knife-catching: k=8 scores differently depending on
+        whether it is still falling (k < d) or bouncing (k > d). The d-line was
+        already computed in indicators.py but previously ignored.
         """
         sr = ind.get("stoch_rsi")
         if sr is None:
             return 0.0
         k = float(sr.get("k", 50.0))
+        d = float(sr.get("d", 50.0))
+
+        # Zone score — primary signal (unchanged logic)
         if k >= 80:
-            # -0.5 at k=80, approaching -1.0 at k=100
-            score = -0.5 - 0.5 * (k - 80) / 20.0
+            zone_score = -0.5 - 0.5 * (k - 80) / 20.0
         elif k <= 20:
-            # +0.5 at k=20, approaching +1.0 at k=0
-            score = 0.5 + 0.5 * (20 - k) / 20.0
+            zone_score = 0.5 + 0.5 * (20 - k) / 20.0
         else:
-            # Linear ±0.5 across the neutral zone
-            score = (50.0 - k) / 60.0
-        return _clamp(score)
+            zone_score = (50.0 - k) / 60.0
+
+        # Crossover score — k vs d confirms or contradicts the zone
+        diff        = k - d
+        cross_score = (1.0 if diff > 0 else -1.0) * min(abs(diff) / 20.0, 1.0)
+
+        return _clamp(0.6 * zone_score + 0.4 * cross_score)
 
     # ------------------------------------------------------------------
     # Entry filters
