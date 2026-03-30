@@ -35,6 +35,9 @@ from database import (
     get_performance,
     get_sessions,
     get_signal_log,
+    insert_pos_log,
+    get_pos_log,
+    clear_pos_log,
     init_db,
     set_config,
     set_config_bulk,
@@ -269,12 +272,9 @@ async def _ticker_loop() -> None:
             return
         except Exception as exc:
             logger.error("ticker_loop error: %s", exc, exc_info=True)
-            _broadcast({
-                "type": "pos_log",
-                "event": "failed",
-                "ts": int(time.time()),
-                "reason": str(exc),
-            })
+            _pl = {"type": "pos_log", "event": "failed", "ts": int(time.time()), "reason": str(exc)}
+            _broadcast(_pl)
+            asyncio.ensure_future(insert_pos_log("failed", _pl))
 
         await asyncio.sleep(1.0)
 
@@ -366,12 +366,12 @@ async def _scan_symbols(cfg) -> None:
 def _on_exchange_error(msg: str) -> None:
     """Forward any Binance WS error to the position log in the UI."""
     logger.warning("Exchange error: %s", msg)
-    _broadcast({
-        "type":   "pos_log",
-        "event":  "failed",
-        "ts":     int(time.time()),
-        "reason": msg,
-    })
+    _pl = {"type": "pos_log", "event": "failed", "ts": int(time.time()), "reason": msg}
+    _broadcast(_pl)
+    try:
+        asyncio.get_running_loop().create_task(insert_pos_log("failed", _pl))
+    except RuntimeError:
+        pass
 
 
 def _on_trade(event: Dict) -> None:
@@ -525,8 +525,10 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     price_str = f"@ {fill_price:.6f}" if fill_price > 0 else "(price unknown)"
     _broadcast({"type": "notification",
                 "text": f"⚠ {label} {symbol} {price_str}  pnl={realized_pnl:+.4f}"})
-    _broadcast({"type": "pos_log", "event": reason, "ts": int(time.time()),
-                "symbol": symbol, "price": fill_price, "pnl": realized_pnl})
+    _pl = {"type": "pos_log", "event": reason, "ts": int(time.time()),
+           "symbol": symbol, "price": fill_price, "pnl": realized_pnl}
+    _broadcast(_pl)
+    asyncio.ensure_future(insert_pos_log(reason, _pl))
 
     _engine._session         = None
     _engine._hedges          = []
@@ -992,6 +994,18 @@ async def api_sessions(limit: int = 100):
 async def api_signal_log(limit: int = 100):
     rows = await get_signal_log(limit)
     return {"signal_log": rows}
+
+
+@app.get("/api/pos_log")
+async def api_pos_log(limit: int = 30, before_id: Optional[int] = None):
+    rows = await get_pos_log(limit, before_id)
+    return {"pos_log": rows}
+
+
+@app.delete("/api/pos_log")
+async def api_clear_pos_log():
+    await clear_pos_log()
+    return {"ok": True}
 
 
 @app.get("/api/performance")

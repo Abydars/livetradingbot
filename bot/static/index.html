@@ -1225,8 +1225,11 @@
 
     <!-- Position log -->
     <section class="rcard" id="card-pos-log">
-      <div class="rcard-title">POSITION LOG</div>
-      <div id="pos-log-list"><div class="empty">No events yet</div></div>
+      <div class="rcard-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>POSITION LOG</span>
+        <button id="clear-pos-log-btn" onclick="clearPosLog()" style="font-size:10px;padding:2px 8px;background:transparent;border:1px solid #444;color:#888;border-radius:3px;cursor:pointer;">CLEAR</button>
+      </div>
+      <div id="pos-log-list" onscroll="onPosLogScroll(this)"><div class="empty">No events yet</div></div>
     </section>
 
   </div><!-- /right-col -->
@@ -2167,10 +2170,13 @@ function pr(label, value) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   POSITION LOG
+   POSITION LOG — persistent, scroll-loaded
 ═══════════════════════════════════════════════════════ */
-const _posLogEntries = [];
-const _POS_LOG_MAX = 50;
+const _posLogEntries = [];   // in-memory, newest last
+let _posLogOldestId  = null; // for pagination
+let _posLogLoading   = false;
+let _posLogExhausted = false;
+const _POS_LOG_PAGE  = 20;   // entries per page
 
 const _PL_LABELS = {
   open:        'OPEN',
@@ -2179,6 +2185,8 @@ const _PL_LABELS = {
   hedge_open:  'HEDGE',
   hedge_close: 'H-CLOSE',
   failed:      'FAILED',
+  smart_sl:    'SMART SL',
+  signal_degraded: 'SIG DEG',
 };
 const _PL_CLASSES = {
   open:        'pl-open',
@@ -2187,32 +2195,29 @@ const _PL_CLASSES = {
   hedge_open:  'pl-hedge-open',
   hedge_close: 'pl-hedge-close',
   failed:      'pl-failed',
+  smart_sl:    'pl-close',
+  signal_degraded: 'pl-close',
 };
 
 function _fmtPosLogTime(ts) {
   const d = new Date(ts * 1000);
-  return d.toTimeString().slice(0, 8);
+  return d.toLocaleTimeString();
 }
 
 function _buildPosLogDetail(e) {
   if (e.event === 'failed')
     return `<span class="pl-detail">${e.reason || 'unknown error'}</span>`;
-
   const dir  = e.direction || '';
   const px   = e.price  ? fmtPrice(e.price) : '';
   const qty  = e.qty    ? ` qty=${fmtQty(e.qty)}` : '';
   const sym  = e.symbol || '';
   const mode = e.mode   ? ` [${e.mode.toUpperCase()}]` : '';
   let detail = `${sym} ${dir} @ ${px}${qty}${mode}`;
-
-  if (e.event === 'dca')
-    detail += ` · DCA#${e.dca_n} avg=${fmtPrice(e.new_avg)}`;
-  if (e.event === 'hedge_open')
-    detail += ` · hedge#${e.hedge_n}`;
-
+  if (e.event === 'dca')         detail += ` · DCA#${e.dca_n} avg=${fmtPrice(e.new_avg)}`;
+  if (e.event === 'hedge_open')  detail += ` · hedge#${e.hedge_n}`;
   let pnlHtml = '';
   if (e.pnl !== undefined) {
-    const cls = e.pnl >= 0 ? 'pl-pnl-pos' : 'pl-pnl-neg';
+    const cls  = e.pnl >= 0 ? 'pl-pnl-pos' : 'pl-pnl-neg';
     const sign = e.pnl >= 0 ? '+' : '';
     pnlHtml = ` <span class="${cls}">${sign}${e.pnl.toFixed(4)} USDT`;
     if (e.pnl_pct !== undefined) pnlHtml += ` (${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%)`;
@@ -2222,6 +2227,16 @@ function _buildPosLogDetail(e) {
   return `<span class="pl-detail">${detail}${pnlHtml}</span>`;
 }
 
+function _posLogRowHtml(e) {
+  const badgeCls = _PL_CLASSES[e.event] || 'pl-open';
+  const label    = _PL_LABELS[e.event]  || e.event.toUpperCase();
+  return `<div class="pl-row" data-id="${e._id || ''}">
+    <span class="pl-badge ${badgeCls}">${label}</span>
+    ${_buildPosLogDetail(e)}
+    <span class="pl-time">${_fmtPosLogTime(e.ts)}</span>
+  </div>`;
+}
+
 function _renderPosLog() {
   const el = document.getElementById('pos-log-list');
   if (!el) return;
@@ -2229,22 +2244,60 @@ function _renderPosLog() {
     el.innerHTML = '<div class="empty">No events yet</div>';
     return;
   }
-  el.innerHTML = _posLogEntries.slice().reverse().map(e => {
-    const badgeCls = _PL_CLASSES[e.event] || 'pl-open';
-    const label    = _PL_LABELS[e.event]  || e.event.toUpperCase();
-    return `<div class="pl-row">
-      <span class="pl-badge ${badgeCls}">${label}</span>
-      ${_buildPosLogDetail(e)}
-      <span class="pl-time">${_fmtPosLogTime(e.ts)}</span>
-    </div>`;
-  }).join('');
+  // newest at top
+  el.innerHTML = [..._posLogEntries].reverse().map(_posLogRowHtml).join('');
 }
 
 function addPosLogEntry(e) {
+  // Assign temporary _id if none (live WS events)
+  if (!e._id) e._id = Date.now();
   _posLogEntries.push(e);
-  if (_posLogEntries.length > _POS_LOG_MAX) _posLogEntries.shift();
   _renderPosLog();
 }
+
+async function _loadPosLog(prepend = false) {
+  if (_posLogLoading || _posLogExhausted) return;
+  _posLogLoading = true;
+  try {
+    let url = `/api/pos_log?limit=${_POS_LOG_PAGE}`;
+    if (prepend && _posLogOldestId) url += `&before_id=${_posLogOldestId}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    const rows = data.pos_log || [];
+    if (rows.length < _POS_LOG_PAGE) _posLogExhausted = true;
+    if (rows.length) {
+      // rows come newest-first from API; push oldest-first into _posLogEntries
+      const ordered = [...rows].reverse();
+      if (prepend) {
+        _posLogEntries.unshift(...ordered);
+      } else {
+        _posLogEntries.push(...ordered);
+      }
+      _posLogOldestId = rows[rows.length - 1]._id;
+    }
+    _renderPosLog();
+  } catch(e) { console.error('pos_log load error', e); }
+  finally { _posLogLoading = false; }
+}
+
+function onPosLogScroll(el) {
+  // Load more when user scrolls near bottom (oldest entries)
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+    _loadPosLog(true);
+  }
+}
+
+async function clearPosLog() {
+  if (!confirm('Clear all position log entries?')) return;
+  await fetch('/api/pos_log', { method: 'DELETE' });
+  _posLogEntries.length = 0;
+  _posLogOldestId  = null;
+  _posLogExhausted = false;
+  _renderPosLog();
+}
+
+// Load initial entries on page load
+_loadPosLog();
 
 /* ═══════════════════════════════════════════════════════
    ORDER BOOK — Step 9

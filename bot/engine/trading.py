@@ -170,8 +170,17 @@ class TradingEngine:
         })
 
     def _pos_log(self, event: str, **kw) -> None:
-        """Broadcast a structured position-log entry to all connected clients."""
-        self._broadcast({"type": "pos_log", "event": event, "ts": _ts(), **kw})
+        """Broadcast a structured position-log entry to all connected clients
+        and persist it to the database for reload on page refresh."""
+        payload = {"type": "pos_log", "event": event, "ts": _ts(), **kw}
+        self._broadcast(payload)
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            from database import insert_pos_log
+            loop.create_task(insert_pos_log(event, payload))
+        except RuntimeError:
+            pass
 
     def _clear_level_overrides(self, reason: str = "") -> None:
         """Clear manual TP/SL overrides and notify the UI."""
