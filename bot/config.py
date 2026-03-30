@@ -58,6 +58,7 @@ class BotConfig:
     auto_switch: bool
     scan_interval_s: int
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
+    entry_wait_s: int       # seconds to wait for an entry signal before switching to next candidate
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -139,6 +140,7 @@ async def load_config() -> BotConfig:
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 10),
         switch_threshold=_f("switch_threshold", 1.1),
+        entry_wait_s=_i("entry_wait_s", 45),
         api_key=api_key,
         api_secret=api_secret,
     )
