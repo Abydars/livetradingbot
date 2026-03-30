@@ -1020,7 +1020,7 @@ class TradingEngine:
             self._session["id"],
             avg_price=new_avg,
             qty=total_qty,
-            margin=self._session["margin"] + cfg.margin_usdt,
+            margin=self._session["margin"] + dca_margin,
             dca_count=dca_count + 1,
         )
         self._session = await get_open_session()
