@@ -1321,7 +1321,7 @@ function adjustLevel(type, dir) {
       _slLine = csSeries.createPriceLine({
         price: _overrideSlPrice, color: '#f85149', lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: true, title: 'HARD STOP',
+        axisLabelVisible: true, title: 'LAST RESORT SL',
       });
     }
   }
@@ -1910,7 +1910,7 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
     lineWidth:        1,
     lineStyle:        LightweightCharts.LineStyle.Dashed,
     axisLabelVisible: true,
-    title:            'HARD STOP',
+    title:            'LAST RESORT SL',
   });
 
   // Trailing stop line (orange dotted, only when active)
@@ -2069,7 +2069,7 @@ function updatePositionPanel() {
   </div>`;
 
   const slRow = slPrice != null ? `<div class="pr">
-    <span class="prk">Hard Stop</span>
+    <span class="prk">Last Resort SL</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
       <span style="color:var(--red)">${fmtPrice(slPrice)}</span>
