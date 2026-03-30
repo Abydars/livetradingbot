@@ -80,6 +80,8 @@ _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
+_htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
+_last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
@@ -141,6 +143,18 @@ async def _do_broadcast(msg: Dict) -> None:
 # Order flow helpers
 # ---------------------------------------------------------------------------
 
+def _htf_for_timeframe(tf: str) -> tuple:
+    """Return (htf_timeframe, ttl_seconds) for the given base timeframe."""
+    return {
+        "1m":  ("15m", 15 * 60),
+        "3m":  ("30m", 30 * 60),
+        "5m":  ("1h",  60 * 60),
+        "15m": ("4h",  240 * 60),
+        "30m": ("4h",  240 * 60),
+        "1h":  ("1d",  1440 * 60),
+    }.get(tf, ("15m", 15 * 60))
+
+
 def _flow_window_for_timeframe(tf: str) -> int:
     """Return order-flow window in seconds as ~50% of the candle period."""
     _TF_SECONDS = {
@@ -188,7 +202,7 @@ async def _sync_position_rest(cfg) -> None:
 
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check
+    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch
     cfg = await load_config()
 
     while True:
@@ -252,7 +266,29 @@ async def _ticker_loop() -> None:
             else:
                 flow_warmup_s = _flow_window_for_timeframe(cfg.timeframe)
                 in_flow_warmup = (time.time() - _last_switch_ts) < flow_warmup_s
-                await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup)
+
+                # HTF EMA bias — refresh once per TTL; cheap (1 REST call, 70 candles)
+                htf_tf, htf_ttl = _htf_for_timeframe(cfg.timeframe)
+                if now - _last_htf_fetch >= htf_ttl:
+                    try:
+                        htf_raw = await _rest.get_klines(cfg.symbol, interval=htf_tf, limit=70)
+                        if htf_raw and len(htf_raw) >= 50:
+                            from exchange.binance_rest import _scan_ema as _ema
+                            htf_closes = [float(k[4]) for k in htf_raw]
+                            htf_ema21 = _ema(htf_closes, 21)
+                            htf_ema50 = _ema(htf_closes, 50)
+                            if htf_ema21 > htf_ema50 and htf_closes[-1] > htf_ema21:
+                                _htf_bias = "LONG"
+                            elif htf_ema21 < htf_ema50 and htf_closes[-1] < htf_ema21:
+                                _htf_bias = "SHORT"
+                            else:
+                                _htf_bias = "NEUTRAL"
+                            _last_htf_fetch = now
+                            _broadcast({"type": "htf_bias", "bias": _htf_bias, "timeframe": htf_tf})
+                    except Exception as exc:
+                        logger.debug("HTF fetch failed: %s", exc)
+
+                await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
             # Detect trade close → trigger immediate symbol scan (auto_switch only)
             cur_session_open = _engine._session is not None
@@ -309,6 +345,7 @@ def _format_movers(top: list) -> list:
             "vol_surge": t.get("_vol_surge", 1.0),
             "momentum":  t.get("_momentum", 0.0),
             "atr_pct":   t.get("_atr_pct", 0.0),
+            "htf_bias":  t.get("_htf_bias", ""),
         })
     return out
 
@@ -320,6 +357,29 @@ async def _scan_symbols(cfg) -> None:
         top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
             return
+
+        # Batch HTF bias for all scanner symbols
+        try:
+            from exchange.binance_rest import _scan_ema as _ema
+            htf_tf, _ = _htf_for_timeframe(cfg.timeframe)
+            syms = [t["symbol"] for t in top]
+            htf_klines_map = await _rest.get_klines_batch(syms, interval=htf_tf, limit=70)
+            for t in top:
+                kl = htf_klines_map.get(t["symbol"], [])
+                if len(kl) >= 50:
+                    closes = [float(k[4]) for k in kl]
+                    e21 = _ema(closes, 21)
+                    e50 = _ema(closes, 50)
+                    if e21 > e50 and closes[-1] > e21:
+                        t["_htf_bias"] = "LONG"
+                    elif e21 < e50 and closes[-1] < e21:
+                        t["_htf_bias"] = "SHORT"
+                    else:
+                        t["_htf_bias"] = "NEUTRAL"
+                else:
+                    t["_htf_bias"] = ""
+        except Exception as exc:
+            logger.debug("Scanner HTF batch failed: %s", exc)
 
         _last_top_movers = _format_movers(top)
         await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
@@ -371,8 +431,10 @@ async def _scan_symbols(cfg) -> None:
 
         # symbol_ready MUST go first — UI clears the chart on this message.
         # Candles sent after so they populate the freshly cleared chart.
-        global _last_switch_ts
+        global _last_switch_ts, _htf_bias, _last_htf_fetch
         _last_switch_ts = time.time()
+        _htf_bias = "NEUTRAL"
+        _last_htf_fetch = 0.0
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         if fresh_candles:
@@ -1125,6 +1187,13 @@ async def ws_endpoint(websocket: WebSocket):
                 "ts":     int(time.time()),
                 "reason": _exchange_error,
             }))
+
+        # Send current HTF bias
+        await websocket.send_text(json.dumps({
+            "type": "htf_bias",
+            "bias": _htf_bias,
+            "timeframe": _htf_for_timeframe(cfg.timeframe)[0],
+        }))
 
         # Send cached top-movers for the sidebar
         if _last_top_movers:
