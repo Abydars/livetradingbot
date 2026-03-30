@@ -67,6 +67,14 @@ class BotConfig:
     def paper_mode(self) -> bool:
         return self.trading_mode == "paper"
 
+    @property
+    def tf_minutes(self) -> int:
+        """Candle duration in minutes — used to scale tick-based timers."""
+        return {
+            "1m": 1, "3m": 3, "5m": 5, "15m": 15,
+            "30m": 30, "1h": 60, "2h": 120, "4h": 240,
+        }.get(self.timeframe, 1)
+
 
 async def load_config() -> BotConfig:
     """Load config from DB and merge with environment variables."""
