@@ -1670,7 +1670,7 @@ function updateSymSidebar(movers) {
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
     const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span>${biasBadge}${htfBadge}</div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span><span style="display:flex;gap:3px;align-items:center">${biasBadge}${htfBadge}</span></div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
