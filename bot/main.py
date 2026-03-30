@@ -225,31 +225,34 @@ async def _ticker_loop() -> None:
 
             # Refresh candles periodically
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
-                raw = await _rest.get_klines(cfg.symbol, interval=cfg.timeframe, limit=200)
-                candles = [
-                    {
-                        "open":   float(k[1]),
-                        "high":   float(k[2]),
-                        "low":    float(k[3]),
-                        "close":  float(k[4]),
-                        "volume": float(k[5]),
-                        "time":   int(k[0]) // 1000,
-                    }
-                    for k in raw
-                ]
-                _engine.update_candles(candles)
-                _last_candles_fetch = now
+                try:
+                    raw = await _rest.get_klines(cfg.symbol, interval=cfg.timeframe, limit=200)
+                    candles = [
+                        {
+                            "open":   float(k[1]),
+                            "high":   float(k[2]),
+                            "low":    float(k[3]),
+                            "close":  float(k[4]),
+                            "volume": float(k[5]),
+                            "time":   int(k[0]) // 1000,
+                        }
+                        for k in raw
+                    ]
+                    _engine.update_candles(candles)
+                    _last_candles_fetch = now
 
-                # Broadcast candles + indicators to UI
-                ind = _engine.last_indicators
-                await _do_broadcast({
-                    "type":    "candles",
-                    "candles": candles[-100:],   # last 100 for chart
-                })
-                await _do_broadcast({
-                    "type":       "indicators",
-                    "indicators": _safe_ind(ind),
-                })
+                    # Broadcast candles + indicators to UI
+                    ind = _engine.last_indicators
+                    await _do_broadcast({
+                        "type":    "candles",
+                        "candles": candles[-100:],   # last 100 for chart
+                    })
+                    await _do_broadcast({
+                        "type":       "indicators",
+                        "indicators": _safe_ind(ind),
+                    })
+                except Exception as exc:
+                    logger.warning("Candle refresh failed (will retry): %s", exc)
 
             # Broadcast price tick
             await _do_broadcast({
