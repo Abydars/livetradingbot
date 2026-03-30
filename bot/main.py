@@ -443,13 +443,34 @@ async def _scan_symbols(cfg) -> None:
         if cfg.symbol in candidates:
             next_candidate = next((s for s in candidates if s != cfg.symbol), None)
 
-            # Record which candle we started waiting on
-            if _entry_start_candle == 0 and cur_candle > 0:
-                _entry_start_candle = cur_candle
+            # If #1 symbol scores switch_threshold× better than current while we are
+            # waiting, switch immediately — no need to finish the candle timer.
+            # Uses cfg.switch_threshold (config field, default 1.1 = 10% better).
+            top_score = top[0]["_score"]
+            cur_score = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
+            top_sym   = top[0]["symbol"]
+            if (top_sym != cfg.symbol
+                    and top_sym not in _tried_syms
+                    and cur_score > 0
+                    and top_score >= cur_score * cfg.switch_threshold):
                 logger.info(
-                    "Auto-switch: waiting up to %d NEUTRAL candles on %s  (next: %s)",
-                    cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
+                    "Auto-switch: %s (score %.1f) is %.0f%% better than %s (score %.1f)"
+                    " — switching immediately (threshold %.2f×)",
+                    top_sym, top_score, (top_score / cur_score - 1) * 100,
+                    cfg.symbol, cur_score, cfg.switch_threshold,
                 )
+                _tried_syms.add(cfg.symbol)
+                _entry_start_candle   = 0
+                _neutral_since_candle = 0
+                candidates = [top_sym]
+            else:
+                # Record which candle we started waiting on
+                if _entry_start_candle == 0 and cur_candle > 0:
+                    _entry_start_candle = cur_candle
+                    logger.info(
+                        "Auto-switch: waiting up to %d NEUTRAL candles on %s  (next: %s)",
+                        cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
+                    )
 
             # Candles elapsed since we started on this symbol
             total_candles = max(0, (cur_candle - _entry_start_candle) // tf_secs) if tf_secs > 0 else 0
