@@ -115,6 +115,7 @@ class OrderFlowAnalyzer:
             "score":         round(score, 4),
             "imbalance":     round(imbalance, 4),
             "bid_ask_ratio": round(ba_ratio, 4),
+            "trade_count":   len(self._trades),
         }
 
     # ------------------------------------------------------------------
