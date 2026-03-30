@@ -673,7 +673,7 @@ class TradingEngine:
             )
             if strong_opposite:
                 self._smart_sl_ticks += 1
-                if self._smart_sl_ticks >= 5:
+                if self._smart_sl_ticks >= max(5, 5 * cfg.tf_minutes):
                     logger.info(
                         "TradingEngine: SMART SL — signal %s str=%.2f "
                         "confirmed %d ticks, price_pct=%.3f%% dca=%d/%d",
@@ -703,7 +703,7 @@ class TradingEngine:
             and signal["direction"] == "NEUTRAL"
         ):
             self._signal_degraded_ticks += 1
-            if self._signal_degraded_ticks >= 15:
+            if self._signal_degraded_ticks >= max(15, 15 * cfg.tf_minutes // 3):
                 logger.info(
                     "TradingEngine: SIGNAL DEGRADATION EXIT — NEUTRAL for %d ticks "
                     "price_pct=%.3f%% dca=%d/%d — conviction gone",
