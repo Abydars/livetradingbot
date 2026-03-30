@@ -241,45 +241,46 @@ class TradingEngine:
         """
         Count reversal indicators confirming a potential bounce (0–4).
         Used to gate DCA entries when smart_dca_gate is enabled.
-
-        LONG signals: RSI oversold, BB lower band touch, MACD histogram
-                      near zero/turning, BB bands expanding.
-        SHORT signals: mirror of the above.
+        Each signal must be genuinely extreme — not just slightly off-centre.
         """
         count = 0
         rsi_val   = ind.get("rsi")
         bb        = ind.get("bollinger")
         macd_data = ind.get("macd")
 
-        # Signal 1: RSI extreme
+        # Signal 1: RSI genuinely oversold/overbought
         if rsi_val is not None:
-            if direction == "LONG" and rsi_val < 38:
+            if direction == "LONG" and rsi_val < 35:      # was 38
                 count += 1
-            elif direction == "SHORT" and rsi_val > 62:
+            elif direction == "SHORT" and rsi_val > 65:   # was 62
                 count += 1
 
-        # Signal 2: Bollinger Band extreme touch
+        # Signal 2: Bollinger Band extreme touch (price at/beyond band)
         if bb is not None:
             pct_b = bb.get("pct_b", 0.5)
-            if direction == "LONG" and pct_b <= 0.08:
+            if direction == "LONG" and pct_b <= 0.05:     # was 0.08
                 count += 1
-            elif direction == "SHORT" and pct_b >= 0.92:
+            elif direction == "SHORT" and pct_b >= 0.95:  # was 0.92
                 count += 1
 
-        # Signal 3: MACD histogram momentum exhaustion
-        # (hist near zero = adverse momentum is fading)
+        # Signal 3: MACD histogram actively turning (not just near zero)
+        # Must be positive for LONG (turning up) or negative for SHORT (turning down)
+        # Previous threshold < 0.0001 fired on almost every tick
         if macd_data is not None:
             hist = macd_data.get("hist", 0.0)
-            if direction == "LONG" and hist > -0.0001:
+            if direction == "LONG" and hist > 0:           # was > -0.0001
                 count += 1
-            elif direction == "SHORT" and hist < 0.0001:
+            elif direction == "SHORT" and hist < 0:        # was < 0.0001
                 count += 1
 
-        # Signal 4: Bollinger bands expanding (volatility spike, often precedes reversal)
+        # Signal 4: BB squeeze release — bands must be meaningfully wide
+        # AND expanding (not just wide). Requires previous width to compare.
+        # Since we don't have history here, use a stricter threshold.
+        # width/mid > 0.03 means bands are 3%+ of price — genuinely expanded
         if bb is not None:
             width = bb.get("width", 0)
             mid   = bb.get("mid", 1)
-            if mid > 0 and (width / mid) > 0.01:
+            if mid > 0 and (width / mid) > 0.03:          # was 0.01
                 count += 1
 
         return count
