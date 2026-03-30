@@ -45,6 +45,7 @@ class SignalEngine:
         candles: List[Dict],
         flow_summary: Dict,
         ind: Dict,
+        prev_ind: Optional[Dict] = None,
     ) -> Dict:
         """
         Parameters
@@ -67,7 +68,9 @@ class SignalEngine:
             "reason": str,
         }
         """
-        components = self._score_components(flow_summary, ind)
+        if prev_ind is None:
+            prev_ind = {}
+        components = self._score_components(flow_summary, ind, prev_ind)
         composite = (
             components["flow"]     * _W_FLOW
             + components["trend"]    * _W_TREND
@@ -113,61 +116,100 @@ class SignalEngine:
     # Component scoring
     # ------------------------------------------------------------------
 
-    def _score_components(self, flow: Dict, ind: Dict) -> Dict[str, float]:
+    def _score_components(self, flow: Dict, ind: Dict, prev_ind: Dict) -> Dict[str, float]:
         return {
             "flow":     self._score_flow(flow),
             "trend":    self._score_trend(ind),
-            "momentum": self._score_momentum(ind),
+            "momentum": self._score_momentum(ind, prev_ind),
             "mean_rev": self._score_mean_reversion(ind),
-            "rsi":      self._score_rsi(ind),
+            "rsi":      self._score_rsi(ind, prev_ind),
             "stoch":    self._score_stoch_rsi(ind),
         }
 
     def _score_flow(self, flow: Dict) -> float:
         """
-        Combine three order-flow signals, each naturally in [-1, +1]:
-          score      — taker buy/sell notional delta over rolling window
-          imbalance  — qty-weighted bid/ask book imbalance (top N levels)
-          ba_ratio   — notional-weighted bid/ask book imbalance (large orders)
-        Average all three equally and clamp.
+        Weighted combination of three order-flow signals:
+          score     (50%) — taker buy/sell notional delta: hardest to spoof, most reliable
+          imbalance (30%) — qty-weighted bid/ask book imbalance: snapshot, can be spoofed
+          ba_ratio  (20%) — notional-weighted book imbalance: same spoof risk as above
+
+        Confidence scaling: low trade count in window = low reliability.
+        20+ trades → full confidence. Fewer → score scales down linearly.
+        This prevents a single large trade from dominating a quiet window.
         """
         score     = float(flow.get("score", 0.0))
         imbalance = float(flow.get("imbalance", 0.0))
-        # bid_ask_ratio is in [0, 1]; map to [-1, +1]
         ba_ratio  = (float(flow.get("bid_ask_ratio", 0.5)) - 0.5) * 2.0
-        combined  = (score + imbalance + ba_ratio) / 3.0
-        return _clamp(combined)
+        combined  = score * 0.50 + imbalance * 0.30 + ba_ratio * 0.20
+
+        # Scale by trade count confidence: ramp from 0 to 1 over first 20 trades
+        trade_count = int(flow.get("trade_count", 20))
+        confidence  = min(trade_count / 20.0, 1.0)
+        return _clamp(combined * confidence)
 
     def _score_trend(self, ind: Dict) -> float:
         """
-        EMA21 vs EMA50 cross.
-        +1 = EMA21 strongly above EMA50, -1 = strongly below.
-        Normalised by ATR% so score magnitude is regime-independent.
+        EMA21 vs EMA50 cross, ATR-normalised.
+        +1 = EMA21 strongly above EMA50 AND price above EMA21 (confirmed uptrend).
+        -1 = EMA21 strongly below EMA50 AND price below EMA21 (confirmed downtrend).
+
+        Price-vs-EMA21 check: if price is on the wrong side of EMA21
+        (e.g. EMA21 > EMA50 but price already crashed below EMA21),
+        the trend structure is still bullish but price has broken it —
+        reduce score by 50% to reflect the weakening.
         """
         ema21: Optional[float] = ind.get("ema21")
         ema50: Optional[float] = ind.get("ema50")
         if ema21 is None or ema50 is None or ema50 == 0:
             return 0.0
         diff_pct = (ema21 - ema50) / ema50
-        atr_val = ind.get("atr")
-        atr_pct = (atr_val / ema50) if (atr_val and ema50 and ema50 > 0) else 0.005
-        scaled = diff_pct / max(atr_pct, 1e-6)
-        return _clamp(scaled)
+        atr_val  = ind.get("atr")
+        atr_pct  = (atr_val / ema50) if (atr_val and ema50 and ema50 > 0) else 0.005
+        scaled   = diff_pct / max(atr_pct, 1e-6)
+        score    = _clamp(scaled)
 
-    def _score_momentum(self, ind: Dict) -> float:
+        # Price confirmation: reduce score if price is on wrong side of EMA21
+        price = ind.get("price")
+        if price and ema21:
+            bullish_structure = score > 0
+            price_confirms    = price > ema21 if bullish_structure else price < ema21
+            if not price_confirms:
+                score *= 0.5   # structure intact but price has broken it — reduce confidence
+
+        return score
+
+    def _score_momentum(self, ind: Dict, prev_ind: Dict) -> float:
         """
-        MACD histogram direction and magnitude.
-        1 ATR of histogram movement relative to price = ±1 score.
+        MACD histogram direction, magnitude, and slope.
+        Base: histogram normalised by price and ATR (regime-independent).
+        Slope: compare current hist to prev tick hist.
+          Accelerating (hist growing in same direction) → +20% boost.
+          Decelerating (hist shrinking) → –20% reduction.
+          Reversing (hist changing sign) → –40% reduction.
         """
         macd_data = ind.get("macd")
         if macd_data is None:
             return 0.0
-        hist  = macd_data["hist"]
-        ema50 = ind.get("ema50") or 1.0
+        hist    = macd_data["hist"]
+        ema50   = ind.get("ema50") or 1.0
         atr_val = ind.get("atr")
         atr_pct = (atr_val / ema50) if (atr_val and ema50 and ema50 > 0) else 0.001
-        norm = (hist / ema50) / max(atr_pct, 1e-6)
-        return _clamp(norm)
+        norm    = (hist / ema50) / max(atr_pct, 1e-6)
+        score   = _clamp(norm)
+
+        # Slope check using previous tick histogram
+        prev_hist = (prev_ind.get("macd") or {}).get("hist")
+        if prev_hist is not None and abs(prev_hist) > 1e-12:
+            same_sign    = (hist > 0) == (prev_hist > 0)
+            accelerating = same_sign and abs(hist) > abs(prev_hist)
+            if not same_sign:
+                score *= 0.60   # histogram reversed sign — momentum flipping
+            elif accelerating:
+                score = _clamp(score * 1.20)   # momentum building
+            else:
+                score *= 0.80   # momentum fading
+
+        return score
 
     def _score_mean_reversion(self, ind: Dict) -> float:
         """
@@ -186,63 +228,86 @@ class SignalEngine:
             return _clamp(-(pct_b - 0.8) / 0.2)  # 0..-1
         return 0.0
 
-    def _score_rsi(self, ind: Dict) -> float:
+    def _score_rsi(self, ind: Dict, prev_ind: Dict) -> float:
         """
-        Smooth monotonic RSI scoring from -1 to +1.
+        Smooth monotonic RSI scoring from -1 to +1, with slope confirmation.
 
-        Logic (from LONG perspective):
-          RSI < 30  → strongly oversold → strong LONG signal (+0.8 to +1.0)
-          RSI 30–40 → mildly oversold  → mild LONG signal  (+0.2 to +0.8)
-          RSI 40–60 → neutral zone     → proportional      (-0.5 to +0.5)
-          RSI 60–70 → mildly overbought → mild SHORT signal (-0.2 to -0.8)
-          RSI > 70  → strongly overbought → strong SHORT    (-0.8 to -1.0)
+        Zone scoring (unchanged):
+          RSI < 30  → strongly oversold → +0.8 to +1.0
+          RSI 30–40 → mildly oversold   → +0.2 to +0.8
+          RSI 40–60 → neutral           → -0.2 to +0.2
+          RSI 60–70 → mildly overbought → -0.2 to -0.8
+          RSI > 70  → strongly overbought → -0.8 to -1.0
 
-        No discontinuities. Monotonically decreasing.
-        Filter blocks entries at RSI extremes (>75 LONG, <25 SHORT).
+        Slope multiplier:
+          RSI rising  + positive zone score → 1.15× (recovering oversold — confirmed)
+          RSI falling + positive zone score → 0.85× (entering oversold — wait)
+          RSI falling + negative zone score → 1.15× (confirmed overbought selling)
+          RSI rising  + negative zone score → 0.85× (overbought bouncing — wait)
         """
         rsi_val = ind.get("rsi")
         if rsi_val is None:
             return 0.0
 
         if rsi_val <= 30:
-            # Oversold: +0.8 at rsi=30, +1.0 at rsi=0
             score = 0.8 + 0.2 * (30 - rsi_val) / 30.0
         elif rsi_val <= 40:
-            # Approaching oversold: +0.2 at rsi=40, +0.8 at rsi=30
             score = 0.2 + 0.6 * (40 - rsi_val) / 10.0
         elif rsi_val <= 60:
-            # Neutral: linear +0.2 → -0.2 (connects the adjacent zones at rsi=40/60)
             score = 0.2 - 0.4 * (rsi_val - 40) / 20.0
         elif rsi_val <= 70:
-            # Approaching overbought: -0.2 at rsi=60, -0.8 at rsi=70
             score = -0.2 - 0.6 * (rsi_val - 60) / 10.0
         else:
-            # Overbought: -0.8 at rsi=70, -1.0 at rsi=100
             score = -0.8 - 0.2 * (rsi_val - 70) / 30.0
+
+        # Slope confirmation: does RSI direction match the zone signal?
+        prev_rsi = prev_ind.get("rsi")
+        if prev_rsi is not None:
+            rsi_rising = rsi_val > prev_rsi
+            if (score > 0 and rsi_rising) or (score < 0 and not rsi_rising):
+                score = _clamp(score * 1.15)   # direction confirms zone
+            else:
+                score *= 0.85                  # direction contradicts zone — reduce
 
         return _clamp(score)
 
     def _score_stoch_rsi(self, ind: Dict) -> float:
         """
-        Stochastic RSI k-line based score.
-        k > 80 → overbought → short signal (fade toward -1)
-        k < 20 → oversold  → long signal  (fade toward +1)
-        Returns 0.0 when indicator data is unavailable.
+        Stochastic RSI hybrid score: zone level (60%) + k/d crossover (40%).
+
+        Zone (k-line position):
+          k > 80 → overbought → negative score toward -1
+          k < 20 → oversold  → positive score toward +1
+          20–80  → linear gradient through zero
+
+        Crossover (k vs d-line):
+          k > d → momentum turning up   → positive confirmation
+          k < d → momentum still falling → penalises the zone score
+          Normalised by 20-point spread, clamped to ±1.
+
+        Using both prevents knife-catching: k=8 scores differently depending on
+        whether it is still falling (k < d) or bouncing (k > d). The d-line was
+        already computed in indicators.py but previously ignored.
         """
         sr = ind.get("stoch_rsi")
         if sr is None:
             return 0.0
         k = float(sr.get("k", 50.0))
+        d = float(sr.get("d", 50.0))
+
+        # Zone score — primary signal (unchanged logic)
         if k >= 80:
-            # -0.5 at k=80, approaching -1.0 at k=100
-            score = -0.5 - 0.5 * (k - 80) / 20.0
+            zone_score = -0.5 - 0.5 * (k - 80) / 20.0
         elif k <= 20:
-            # +0.5 at k=20, approaching +1.0 at k=0
-            score = 0.5 + 0.5 * (20 - k) / 20.0
+            zone_score = 0.5 + 0.5 * (20 - k) / 20.0
         else:
-            # Linear ±0.5 across the neutral zone
-            score = (50.0 - k) / 60.0
-        return _clamp(score)
+            zone_score = (50.0 - k) / 60.0
+
+        # Crossover score — k vs d confirms or contradicts the zone
+        diff        = k - d
+        cross_score = (1.0 if diff > 0 else -1.0) * min(abs(diff) / 20.0, 1.0)
+
+        return _clamp(0.6 * zone_score + 0.4 * cross_score)
 
     # ------------------------------------------------------------------
     # Entry filters

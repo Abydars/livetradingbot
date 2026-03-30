@@ -126,7 +126,8 @@ class TradingEngine:
 
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
-        self.last_indicators: Dict = {}
+        self.last_indicators:  Dict = {}
+        self._prev_indicators: Dict = {}   # indicators from the tick before last — used for slope checks
         self.candles: List[Dict] = []
 
     # ------------------------------------------------------------------
@@ -395,7 +396,8 @@ class TradingEngine:
     def update_candles(self, candles: List[Dict]) -> None:
         prev_last_time = self.candles[-1]["time"] if self.candles else 0
         self.candles = candles
-        self.last_indicators = compute_all(candles)
+        self._prev_indicators = self.last_indicators   # save before overwrite
+        self.last_indicators  = compute_all(candles)
 
         new_last_time = candles[-1]["time"] if candles else 0
         if new_last_time != prev_last_time and self._trail_activated and self._session:
@@ -429,7 +431,7 @@ class TradingEngine:
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
-        signal = self._signal_engine.compute(self.candles, flow_summary, ind)
+        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators)
         self.last_signal = signal
 
         # Broadcast signal to UI
