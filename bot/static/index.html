@@ -1516,7 +1516,8 @@ function dispatch(msg) {
         break;
       }
       bar.classList.add('visible');
-      sym.textContent  = (msg.symbol || '').replace('USDT', '');
+      const triedStr = msg.tried > 0 ? ` (${msg.tried}/${msg.total} tried)` : '';
+      sym.textContent  = (msg.symbol || '').replace('USDT', '') + triedStr;
       next.textContent = msg.candidate ? '→ ' + msg.candidate.replace('USDT', '') : '';
       const pct = msg.timeout > 0 ? Math.min(msg.elapsed / msg.timeout * 100, 100) : 0;
       fill.style.width      = pct + '%';
