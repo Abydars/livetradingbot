@@ -93,7 +93,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "timeframe":           "1m",
     "trading_active":      "0",
     "switch_threshold":    "1.1",
-    "entry_wait_s":        "45",    # seconds to wait for entry before trying next symbol
+    "entry_wait_candles":  "3",     # candles to wait (NEUTRAL) before trying next symbol
     "scanner_top_n":       "10",   # how many symbols to show in the scanner sidebar
     "cooldown_after_stop_s": "300",
     "max_daily_loss_usdt":   "0",

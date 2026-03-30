@@ -83,9 +83,9 @@ _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow 
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
-_entry_wait_ts:    float = 0.0        # timestamp when we switched to current candidate (0 = not waiting)
-_neutral_since_ts: float = 0.0        # timestamp when signal last became NEUTRAL (0 = signal is directional)
-_ENTRY_HARD_MAX_MULT = 4              # hard max = entry_wait_s × this, catches oscillating signals
+_entry_start_candle:   int = 0        # candle close time when we switched to current candidate (0 = not waiting)
+_neutral_since_candle: int = 0        # candle close time when signal went NEUTRAL (0 = directional)
+_ENTRY_HARD_MAX_CANDLES = 10          # hard max candles on one symbol regardless of signal direction
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
@@ -360,7 +360,7 @@ def _format_movers(top: list) -> list:
 
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _neutral_since_ts, _tried_syms, _entry_wait_ts, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
+    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
     try:
         top = await _rest.get_top_movers(n=cfg.scanner_top_n, timeframe=cfg.timeframe)
         if not top:
@@ -409,19 +409,22 @@ async def _scan_symbols(cfg) -> None:
 
         # Auto-switch only when enabled and no open position
         if not cfg.auto_switch or not _trading_active:
-            _entry_wait_ts    = 0.0
-            _neutral_since_ts = 0.0
+            _entry_start_candle   = 0
+            _neutral_since_candle = 0
             _tried_syms.clear()
             return
         if _engine._session is not None:
             # Position is open — clear cycle state so next entry search starts fresh
-            _entry_wait_ts    = 0.0
-            _neutral_since_ts = 0.0
+            _entry_start_candle   = 0
+            _neutral_since_candle = 0
             _tried_syms.clear()
             return
 
-        now_ts   = time.time()
         top_syms = [t["symbol"] for t in top]   # ordered best → worst
+
+        # Current candle close time (int seconds) — used for candle-based counting
+        cur_candle = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
+        tf_secs    = cfg.tf_minutes * 60 if cfg.tf_minutes > 0 else 60
 
         # If current symbol dropped off the top list entirely, mark it as tried
         if cfg.symbol not in top_syms:
@@ -436,34 +439,36 @@ async def _scan_symbols(cfg) -> None:
             _tried_syms.clear()
             candidates = top_syms[:]
 
-        # Current symbol is still an active candidate — apply entry wait timer
+        # Current symbol is still an active candidate — apply candle-based wait
         if cfg.symbol in candidates:
             next_candidate = next((s for s in candidates if s != cfg.symbol), None)
 
-            if _entry_wait_ts == 0.0:
-                _entry_wait_ts = now_ts
+            # Record which candle we started waiting on
+            if _entry_start_candle == 0 and cur_candle > 0:
+                _entry_start_candle = cur_candle
                 logger.info(
-                    "Auto-switch: waiting up to %.0fs NEUTRAL on %s for entry  (next: %s)",
-                    cfg.entry_wait_s, cfg.symbol, next_candidate or "—",
+                    "Auto-switch: waiting up to %d NEUTRAL candles on %s  (next: %s)",
+                    cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
                 )
 
-            # Only count time when signal is NEUTRAL.
-            # A directional signal (LONG/SHORT) means the symbol shows potential —
-            # reset the neutral clock and keep waiting even if entry guards are blocking.
+            # Candles elapsed since we started on this symbol
+            total_candles = max(0, (cur_candle - _entry_start_candle) // tf_secs) if tf_secs > 0 else 0
+
+            # Only count NEUTRAL candles. Directional signal resets the neutral counter.
             sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
             if sig_dir == "NEUTRAL":
-                if _neutral_since_ts == 0.0:
-                    _neutral_since_ts = now_ts   # signal just went neutral
-                neutral_elapsed = now_ts - _neutral_since_ts
+                if _neutral_since_candle == 0 and cur_candle > 0:
+                    _neutral_since_candle = cur_candle
+                neutral_candles = max(0, (cur_candle - _neutral_since_candle) // tf_secs) if tf_secs > 0 else 0
             else:
-                _neutral_since_ts = 0.0          # signal is directional — reset neutral clock
-                neutral_elapsed   = 0.0
+                _neutral_since_candle = 0   # directional — reset neutral counter
+                neutral_candles       = 0
 
             await _do_broadcast({
                 "type":      "entry_wait",
                 "waiting":   True,
-                "elapsed":   round(neutral_elapsed, 1),
-                "timeout":   cfg.entry_wait_s,
+                "elapsed":   neutral_candles,
+                "timeout":   cfg.entry_wait_candles,
                 "symbol":    cfg.symbol,
                 "candidate": next_candidate or "",
                 "tried":     len(_tried_syms),
@@ -471,21 +476,19 @@ async def _scan_symbols(cfg) -> None:
                 "signal":    sig_dir,
             })
 
-            total_elapsed = now_ts - _entry_wait_ts
-            if neutral_elapsed < cfg.entry_wait_s and total_elapsed < cfg.entry_wait_s * _ENTRY_HARD_MAX_MULT:
+            if neutral_candles < cfg.entry_wait_candles and total_candles < _ENTRY_HARD_MAX_CANDLES:
                 return  # still within wait window
 
-            if total_elapsed >= cfg.entry_wait_s * _ENTRY_HARD_MAX_MULT:
+            if total_candles >= _ENTRY_HARD_MAX_CANDLES:
                 logger.info(
-                    "Auto-switch: %s — hard max %.0fs reached (signal oscillating), moving to next",
-                    cfg.symbol, total_elapsed,
+                    "Auto-switch: %s — hard max %d candles reached (signal oscillating), moving to next",
+                    cfg.symbol, total_candles,
                 )
-
-            # Signal has been NEUTRAL for entry_wait_s — no edge on this symbol
-            logger.info(
-                "Auto-switch: %s — NEUTRAL for %.0fs, moving to next candidate",
-                cfg.symbol, neutral_elapsed,
-            )
+            else:
+                logger.info(
+                    "Auto-switch: %s — NEUTRAL for %d candles, moving to next candidate",
+                    cfg.symbol, neutral_candles,
+                )
             _tried_syms.add(cfg.symbol)
             candidates = [s for s in top_syms if s not in _tried_syms]
 
@@ -529,8 +532,8 @@ async def _scan_symbols(cfg) -> None:
 
         # symbol_ready MUST go first — UI clears the chart on this message.
         # Candles sent after so they populate the freshly cleared chart.
-        _entry_wait_ts    = now_ts   # start timer immediately for the new symbol
-        _neutral_since_ts = 0.0      # reset neutral clock for the new symbol
+        _entry_start_candle   = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
+        _neutral_since_candle = 0   # reset neutral clock for the new symbol
         _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
         global _last_switch_ts, _htf_bias, _last_htf_fetch
         _last_switch_ts = time.time()
