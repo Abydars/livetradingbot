@@ -1703,8 +1703,10 @@ function updatePrice(price) {
   el.style.color = dir > 0 ? '#3fb950' : dir < 0 ? '#f85149' : '#c9d1d9';
   el.textContent = fmtPrice(price);
   lastPrice = price;
-  // refresh unrealised PnL on each tick
-  if (curSession?.status === 'open') refreshPnL();
+  if (curSession?.status === 'open') {
+    refreshPnL();
+    updatePositionPanel();
+  }
 }
 
 function calcMinMove(price) {
