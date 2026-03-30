@@ -646,14 +646,13 @@ class TradingEngine:
             strong_opposite = (
                 signal["direction"] == opposite
                 and signal["filters_passed"]
-                and signal["strength"] >= cfg.min_signal_strength * 1.5
             )
             if strong_opposite:
                 self._smart_sl_ticks += 1
                 if self._smart_sl_ticks >= 3:
                     logger.info(
-                        "TradingEngine: SMART SL — signal %s str=%.2f confirmed "
-                        "%d ticks, price_pct=%.3f%% dca=%d/%d — exiting early",
+                        "TradingEngine: SMART SL — signal %s str=%.2f "
+                        "confirmed %d ticks, price_pct=%.3f%% dca=%d/%d",
                         signal["direction"], signal["strength"],
                         self._smart_sl_ticks, price_pct,
                         dca_count, cfg.max_dca,
