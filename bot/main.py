@@ -85,6 +85,7 @@ _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
 _entry_wait_ts:    float = 0.0        # timestamp when we switched to current candidate (0 = not waiting)
 _neutral_since_ts: float = 0.0        # timestamp when signal last became NEUTRAL (0 = signal is directional)
+_ENTRY_HARD_MAX_MULT = 4              # hard max = entry_wait_s × this, catches oscillating signals
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
@@ -470,8 +471,15 @@ async def _scan_symbols(cfg) -> None:
                 "signal":    sig_dir,
             })
 
-            if neutral_elapsed < cfg.entry_wait_s:
+            total_elapsed = now_ts - _entry_wait_ts
+            if neutral_elapsed < cfg.entry_wait_s and total_elapsed < cfg.entry_wait_s * _ENTRY_HARD_MAX_MULT:
                 return  # still within wait window
+
+            if total_elapsed >= cfg.entry_wait_s * _ENTRY_HARD_MAX_MULT:
+                logger.info(
+                    "Auto-switch: %s — hard max %.0fs reached (signal oscillating), moving to next",
+                    cfg.symbol, total_elapsed,
+                )
 
             # Signal has been NEUTRAL for entry_wait_s — no edge on this symbol
             logger.info(
