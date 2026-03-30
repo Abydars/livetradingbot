@@ -423,6 +423,51 @@ def _on_trade(event: Dict) -> None:
             loop = asyncio.get_running_loop()
             loop.call_soon(lambda: asyncio.ensure_future(_do_trail_close()))
 
+    # WS hard stop check — fires on every trade tick like trail check
+    if (
+        _engine
+        and _engine._session
+        and not _engine._trail_activated
+        and not _engine._closing
+    ):
+        sess      = _engine._session
+        direction = sess["direction"]
+        avg_price = sess["avg_price"]
+        leverage  = sess["leverage"]
+        liq_distance_pct = (1.0 / leverage) * 100
+        last_resort_pct  = liq_distance_pct * getattr(_engine, "_last_resort_buffer_cache", 0.80)
+
+        if direction == "LONG":
+            price_pct = (price - avg_price) / avg_price * 100
+        else:
+            price_pct = (avg_price - price) / avg_price * 100
+
+        if price_pct <= -last_resort_pct:
+            if direction == "LONG":
+                pnl_pct = (price - avg_price) / avg_price * 100 * leverage
+            else:
+                pnl_pct = (avg_price - price) / avg_price * 100 * leverage
+
+            logger.error(
+                "WS last resort SL hit @ %.6f  price_pct=%.2f%%  pnl=%.2f%%",
+                price, price_pct, pnl_pct,
+            )
+
+            async def _do_hard_stop_close():
+                try:
+                    cfg = await load_config()
+                    if (
+                        _engine
+                        and _engine._session
+                        and not _engine._closing
+                    ):
+                        await _engine._emergency_close(cfg, price, pnl_pct)
+                except Exception as e:
+                    logger.error("WS hard stop close failed: %s", e)
+
+            loop = asyncio.get_running_loop()
+            loop.call_soon(lambda: asyncio.ensure_future(_do_hard_stop_close()))
+
     asyncio.get_running_loop().call_soon(
         lambda: asyncio.ensure_future(_do_broadcast({
             "type":  "trade",
