@@ -796,13 +796,18 @@
     .sym-htf.long  { background: rgba(63,185,80,.25); color: var(--green); }
     .sym-htf.short { background: rgba(248,81,73,.25); color: var(--red); }
     .sym-metrics { font-size: 9px; color: var(--muted); margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
-    #entry-wait-bar { display:none; align-items:center; gap:6px; padding:5px 10px; margin:4px 8px; border-radius:6px; font-size:11px; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.1); }
+    #entry-wait-bar { display:none; flex-direction:column; gap:5px; padding:7px 10px 8px; margin:4px 8px 2px; border-radius:7px; font-size:11px; background:rgba(227,179,65,.07); border:1px solid rgba(227,179,65,.25); }
     #entry-wait-bar.visible { display:flex; }
-    #ew-label { color:var(--muted); }
-    #ew-sym { font-weight:600; color:var(--text); }
-    #ew-track { flex:1; height:4px; background:rgba(255,255,255,.12); border-radius:2px; }
-    #ew-fill  { height:4px; background:#e3b341; border-radius:2px; width:0%; transition:width .5s linear; }
-    #ew-next  { color:var(--muted); font-size:10px; }
+    #ew-row1 { display:flex; align-items:center; justify-content:space-between; }
+    #ew-row2 { display:flex; align-items:center; gap:4px; }
+    #ew-label { color:var(--muted); font-size:9px; letter-spacing:.06em; text-transform:uppercase; }
+    #ew-sym   { font-weight:700; color:#e3b341; font-size:12px; }
+    #ew-arrow { color:var(--muted); font-size:10px; margin:0 2px; }
+    #ew-next  { font-weight:600; color:var(--text); font-size:11px; }
+    #ew-tried { color:var(--muted); font-size:9px; margin-left:auto; }
+    #ew-timer { font-size:10px; font-variant-numeric:tabular-nums; color:#e3b341; font-weight:600; min-width:32px; text-align:right; }
+    #ew-track { flex:1; height:3px; background:rgba(255,255,255,.1); border-radius:2px; }
+    #ew-fill  { height:3px; background:#e3b341; border-radius:2px; width:0%; transition:width .5s linear; }
 
     /* ═══════════════════════════════ RESPONSIVE ══ */
 
@@ -1099,10 +1104,17 @@
       <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
     </div>
     <div id="entry-wait-bar">
-      <span id="ew-label">Waiting on</span>
-      <span id="ew-sym">—</span>
+      <div id="ew-row1">
+        <span id="ew-label">Scanning for entry</span>
+        <span id="ew-timer">0s</span>
+      </div>
+      <div id="ew-row2">
+        <span id="ew-sym">—</span>
+        <span id="ew-arrow">→</span>
+        <span id="ew-next">?</span>
+        <span id="ew-tried"></span>
+      </div>
       <div id="ew-track"><div id="ew-fill"></div></div>
-      <span id="ew-next">→ ?</span>
     </div>
     <div id="sym-list"></div>
   </div>
@@ -1506,22 +1518,27 @@ function dispatch(msg) {
       break;
 
     case 'entry_wait': {
-      const bar  = document.getElementById('entry-wait-bar');
-      const sym  = document.getElementById('ew-sym');
-      const fill = document.getElementById('ew-fill');
-      const next = document.getElementById('ew-next');
+      const bar   = document.getElementById('entry-wait-bar');
+      const sym   = document.getElementById('ew-sym');
+      const fill  = document.getElementById('ew-fill');
+      const next  = document.getElementById('ew-next');
+      const timer = document.getElementById('ew-timer');
+      const tried = document.getElementById('ew-tried');
       if (!bar) break;
       if (!msg.waiting) {
         bar.classList.remove('visible');
         break;
       }
       bar.classList.add('visible');
-      const triedStr = msg.tried > 0 ? ` (${msg.tried}/${msg.total} tried)` : '';
-      sym.textContent  = (msg.symbol || '').replace('USDT', '') + triedStr;
-      next.textContent = msg.candidate ? '→ ' + msg.candidate.replace('USDT', '') : '';
-      const pct = msg.timeout > 0 ? Math.min(msg.elapsed / msg.timeout * 100, 100) : 0;
+      sym.textContent   = (msg.symbol    || '').replace('USDT', '');
+      next.textContent  = (msg.candidate || '').replace('USDT', '') || '—';
+      tried.textContent = msg.total > 0 ? `${msg.tried}/${msg.total}` : '';
+      const rem = Math.max(0, (msg.timeout || 0) - (msg.elapsed || 0));
+      timer.textContent = rem > 0 ? Math.ceil(rem) + 's' : '—';
+      const pct = msg.timeout > 0 ? Math.min((msg.elapsed || 0) / msg.timeout * 100, 100) : 0;
       fill.style.width      = pct + '%';
       fill.style.background = pct > 75 ? '#f85149' : '#e3b341';
+      timer.style.color     = pct > 75 ? '#f85149' : '#e3b341';
       break;
     }
 

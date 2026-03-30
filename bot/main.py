@@ -532,7 +532,7 @@ async def _scan_symbols(cfg) -> None:
 
         await _do_broadcast({
             "type": "notification",
-            "text": f"Auto-switched: {cfg.symbol} → {new_sym}  (score {best_score:.1f})",
+            "text": f"Auto-switched: {cfg.symbol} → {new_sym}",
         })
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
