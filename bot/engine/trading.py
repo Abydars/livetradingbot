@@ -89,6 +89,9 @@ class TradingEngine:
         # Smart SL: counts consecutive ticks of strong opposite signal in loss
         self._smart_sl_ticks: int = 0
 
+        # Signal degradation exit: counts ticks of NEUTRAL while position losing
+        self._signal_degraded_ticks: int = 0
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -180,24 +183,35 @@ class TradingEngine:
         self._broadcast({"type": "level_overrides_cleared"})
 
     @staticmethod
-    def _compute_adaptive(atr: float, price: float) -> Dict[str, float]:
+    def _compute_adaptive(
+        atr: float,
+        price: float,
+        strength: float = 0.0,
+    ) -> Dict[str, float]:
         """
-        Derive all risk thresholds from ATR.
-        All values are un-leveraged price percentages.
+        Derive all risk thresholds from ATR, optionally scaled by signal strength.
+
+        strength: signal strength at entry (0.0–1.0).
+          tp_pct and trail_pct scale up with stronger signals so high-conviction
+          entries get more room to run before the trail fires.
+          DCA, hedge, and stop thresholds are ATR-only (unchanged).
 
         Ordering guaranteed:
           dca_step < hedge_trigger < hard_stop
           trail_pct < tp_pct
           min_profit_pct < tp_pct
         """
-        atr_pct = (atr / price * 100) if price > 0 else 1.0
+        atr_pct  = (atr / price * 100) if price > 0 else 1.0
+        s        = max(0.0, min(1.0, strength))
+        tp_scale = 1.0 + s          # 0%→1.0×  35%→1.35×  70%→1.70×
+        tr_scale = 1.0 + s * 0.5   # 0%→1.0×  35%→1.175× 70%→1.35×
         return {
-            "tp_pct":            max(atr_pct * 2.5, 0.8),   # TP: 2.5× ATR, min 0.8%
-            "trail_pct":         max(atr_pct * 1.0, 0.25),  # trail: 1.0× ATR, min 0.25%
-            "min_profit_pct":    max(atr_pct * 0.3, 0.10),  # min to close: 0.3× ATR, min 0.10%
-            "dca_step_pct":      max(atr_pct * 1.5, 0.50),  # DCA: 1.5× ATR, min 0.50%
-            "hedge_trigger_pct": max(atr_pct * 3.0, 1.00),  # hedge: 3.0× ATR, min 1.00%
-            "hard_stop_pct":     max(atr_pct * 5.0, 2.00),  # stop: 5.0× ATR, min 2.00%
+            "tp_pct":            max(atr_pct * 2.5, 0.8)  * tp_scale,
+            "trail_pct":         max(atr_pct * 1.0, 0.25) * tr_scale,
+            "min_profit_pct":    max(atr_pct * 0.3, 0.10),
+            "dca_step_pct":      max(atr_pct * 1.5, 0.50),
+            "hedge_trigger_pct": max(atr_pct * 3.0, 1.00),
+            "hard_stop_pct":     max(atr_pct * 5.0, 2.00),
         }
 
     @staticmethod
@@ -456,7 +470,7 @@ class TradingEngine:
         if atr_val <= 0:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
             return
-        entry_adaptive = self._compute_adaptive(atr_val, price)
+        entry_adaptive = self._compute_adaptive(atr_val, price, strength)
         if entry_adaptive["tp_pct"] < 0.4:
             logger.info(
                 "TradingEngine: skipping entry — TP too tight (%.3f%% < 0.40%%)",
@@ -632,13 +646,14 @@ class TradingEngine:
             return
 
         # ---- Smart SL: signal-confirmed early exit (priority over DCA) ------
-        # Fires when position is losing AND signal strongly confirms the loss
-        # direction for 3 consecutive ticks. Takes priority over DCA — if the
-        # signal says the move will continue against us, adding capital is wrong.
-        # Requires at least min_profit_pct of loss to avoid firing on noise.
-        # Does NOT fire when hedges are active (hedge logic handles recovery).
+        # Fires when position has moved meaningfully against us (>= 50% of DCA
+        # step) AND opposite signal confirmed for 5 consecutive ticks.
+        # Using dca_step*0.5 as threshold (not min_profit_pct) prevents false
+        # exits on tiny dips + momentary signal flips — position must be in a
+        # real adverse move before Smart SL considers exiting.
+        # 5 ticks (vs 3) gives more confirmation, reducing false positives.
         if (
-            price_pct <= -p["min_profit_pct"]
+            price_pct <= -(p["dca_step_pct"] * 0.5)
             and not self._trail_activated
             and not self._hedges
         ):
@@ -649,7 +664,7 @@ class TradingEngine:
             )
             if strong_opposite:
                 self._smart_sl_ticks += 1
-                if self._smart_sl_ticks >= 3:
+                if self._smart_sl_ticks >= 5:
                     logger.info(
                         "TradingEngine: SMART SL — signal %s str=%.2f "
                         "confirmed %d ticks, price_pct=%.3f%% dca=%d/%d",
@@ -664,6 +679,33 @@ class TradingEngine:
                 self._smart_sl_ticks = 0
         else:
             self._smart_sl_ticks = 0
+
+        # ---- Signal degradation exit: conviction gone while losing ----------
+        # If position is losing by at least half a DCA step AND signal has been
+        # NEUTRAL for 15 consecutive ticks (15 seconds), exit cleanly.
+        # Using dca_step*0.5 threshold (same as Smart SL) prevents firing on
+        # tiny dips. 15 ticks gives position time to develop before declaring
+        # conviction lost. This complements Smart SL which handles OPPOSITE
+        # signal — this handles the NEUTRAL case (neither confirms nor denies).
+        if (
+            price_pct <= -(p["dca_step_pct"] * 0.5)
+            and not self._trail_activated
+            and not self._hedges
+            and signal["direction"] == "NEUTRAL"
+        ):
+            self._signal_degraded_ticks += 1
+            if self._signal_degraded_ticks >= 15:
+                logger.info(
+                    "TradingEngine: SIGNAL DEGRADATION EXIT — NEUTRAL for %d ticks "
+                    "price_pct=%.3f%% dca=%d/%d — conviction gone",
+                    self._signal_degraded_ticks, price_pct,
+                    dca_count, cfg.max_dca,
+                )
+                self._signal_degraded_ticks = 0
+                await self._close_position(cfg, price, pnl_pct, "signal_degraded")
+                return
+        else:
+            self._signal_degraded_ticks = 0
 
         # ---- Hedge management -----------------------------------------------
         if self._hedges:
@@ -1012,6 +1054,7 @@ class TradingEngine:
 
         self._last_dca_time = time.time()
         self._smart_sl_ticks = 0   # DCA fired — reset smart SL counter
+        self._signal_degraded_ticks = 0
 
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
@@ -1345,6 +1388,7 @@ class TradingEngine:
         self._bot_close_order_ids.clear()
         self._last_dca_time          = None
         self._smart_sl_ticks         = 0
+        self._signal_degraded_ticks  = 0
         self._push_session()
 
     async def _emergency_close(
