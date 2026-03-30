@@ -626,7 +626,6 @@ class BinanceRestClient:
             if not data or len(data) < 15:
                 continue
 
-            # Parse klines: [open_time, open, high, low, close, volume, ...]
             highs  = [float(k[2]) for k in data]
             lows   = [float(k[3]) for k in data]
             closes = [float(k[4]) for k in data]
@@ -636,37 +635,79 @@ class BinanceRestClient:
             if price <= 0:
                 continue
 
-            # Volume surge: last-3-candle avg vs 10-candle baseline
-            if len(vols) >= 13:
-                recent_vol   = sum(vols[-3:]) / 3
-                baseline_vol = sum(vols[-13:-3]) / 10
-                vol_surge = recent_vol / baseline_vol if baseline_vol > 0 else 1.0
-            else:
-                vol_surge = 1.0
-
-            # Short-term momentum: abs price change over last 5 candles
-            if len(closes) >= 6:
-                momentum_pct = abs(closes[-1] - closes[-6]) / closes[-6] * 100
-            else:
-                momentum_pct = 0.0
-
-            # ATR volatility
+            # ── ATR — used as gate and normaliser, not as score component ──
             atr     = _scan_atr(highs, lows, closes, 14)
             atr_pct = (atr / price * 100) if price > 0 else 0.0
 
-            # RSI — penalise exhausted symbols
-            rsi_val     = _scan_rsi(closes, 14)
-            rsi_penalty = 0.5 if (rsi_val > 80 or rsi_val < 20) else 1.0
+            # Gate: skip symbols that are too quiet or too chaotic to trade
+            if atr_pct < 0.3:
+                continue   # not enough volatility for reliable signals
+            atr_penalty = 0.60 if atr_pct > 5.0 else 1.0   # chaotic = penalty
 
-            # Trend alignment: EMA9 and EMA21 both point same direction as move
+            # ── Volume surge: last-3-candle avg vs 10-candle baseline ──
+            if len(vols) >= 13:
+                recent_vol   = sum(vols[-3:]) / 3
+                baseline_vol = sum(vols[-13:-3]) / 10
+                vol_surge    = recent_vol / baseline_vol if baseline_vol > 0 else 1.0
+            else:
+                vol_surge = 1.0
+
+            # ── Momentum with acceleration check ──
+            # Base: abs price change over last 5 candles
+            momentum_pct = abs(closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0.0
+
+            # Acceleration: compare last 3 candles vs previous 3 candles
+            # accel > 1 = momentum speeding up (good), < 1 = slowing down (bad)
+            if len(closes) >= 7:
+                recent_move = abs(closes[-1] - closes[-4]) / max(closes[-4], 1e-10)
+                older_move  = abs(closes[-4] - closes[-7]) / max(closes[-7], 1e-10)
+                accel = recent_move / older_move if older_move > 0.0001 else 1.0
+                accel = min(max(accel, 0.3), 3.0)   # clamp 0.3x – 3x
+            else:
+                accel = 1.0
+            momentum_score = momentum_pct * min(accel, 2.0)
+
+            # ── RSI — tiered penalty ──
+            rsi_val = _scan_rsi(closes, 14)
+            if rsi_val > 80 or rsi_val < 20:
+                rsi_penalty = 0.50   # hard exhaustion
+            elif rsi_val > 70 or rsi_val < 30:
+                rsi_penalty = 0.80   # near exhaustion
+            else:
+                rsi_penalty = 1.0
+
+            # ── EMA trend: continuous strength instead of binary bonus ──
             ema9  = _scan_ema(closes, 9)
             ema21 = _scan_ema(closes, 21)
             bullish_setup = ema9 > ema21 and closes[-1] > ema21
             bearish_setup = ema9 < ema21 and closes[-1] < ema21
-            trend_aligned = bullish_setup or bearish_setup
-            trend_bonus   = 0.15 if trend_aligned else 0.0
 
-            # Direction bias from EMA alignment, fall back to 24h direction
+            if atr_pct > 0:
+                ema_diff_pct   = abs(ema9 - ema21) / ema21
+                trend_strength = min(ema_diff_pct / (atr_pct / 100), 1.0)   # normalised 0→1
+            else:
+                trend_strength = 0.0
+            trend_score = trend_strength * 0.20   # max contribution 0.20
+
+            # ── Signal tendency: lightweight pre-check aligned with signal engine ──
+            # Uses EMA trend + MACD histogram as a proxy for what the signal engine
+            # will compute. Symbols with clearer directional tendency rank higher,
+            # reducing switches to symbols that immediately give NEUTRAL signal.
+            if len(closes) >= 27:
+                # MACD-like: 9-period EMA vs 26-period EMA delta, ATR-normalised
+                ema26    = _scan_ema(closes, 26)
+                macd_val = (ema9 - ema26) / ema26 if ema26 > 0 else 0.0
+                macd_norm = abs(macd_val) / (atr_pct / 100) if atr_pct > 0 else 0.0
+                macd_norm = min(macd_norm, 1.0)
+
+                # Trend component (EMA21 vs EMA50 proxy using available data)
+                trend_norm = min(abs(ema9 - ema21) / ema21 / (atr_pct / 100), 1.0) if atr_pct > 0 else 0.0
+
+                signal_tendency = (macd_norm * 0.5 + trend_norm * 0.5)
+            else:
+                signal_tendency = 0.0
+
+            # ── Direction bias ──
             if bullish_setup:
                 bias = "LONG"
             elif bearish_setup:
@@ -674,14 +715,15 @@ class BinanceRestClient:
             else:
                 bias = c["_bias"]
 
-            # Final composite score
-            base_score  = (
-                vol_surge    * 0.35
-                + momentum_pct * 0.30
-                + atr_pct      * 0.20
-                + trend_bonus
+            # ── Final composite score ──
+            # Weights: vol_surge 0.30, momentum_accel 0.25, signal_tendency 0.20, trend 0.25
+            base_score = (
+                vol_surge         * 0.30
+                + momentum_score  * 0.25
+                + signal_tendency * 0.20
+                + trend_score
             )
-            final_score = base_score * rsi_penalty
+            final_score = base_score * rsi_penalty * atr_penalty
 
             c["_score"]     = final_score
             c["_bias"]      = bias
