@@ -79,6 +79,7 @@ _last_symbol_scan: float = 0.0
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _trading_active: bool = False          # persisted in config.trading_active
+_last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
@@ -249,7 +250,9 @@ async def _ticker_loop() -> None:
                         err = _exchange_error or "Exchange client unavailable — check API keys"
                         _on_exchange_error(err)
             else:
-                await _engine.tick(cfg, price, allow_entry=_trading_active)
+                flow_warmup_s = _flow_window_for_timeframe(cfg.timeframe)
+                in_flow_warmup = (time.time() - _last_switch_ts) < flow_warmup_s
+                await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup)
 
             # Detect trade close → trigger immediate symbol scan (auto_switch only)
             cur_session_open = _engine._session is not None
@@ -312,7 +315,7 @@ def _format_movers(top: list) -> list:
 
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
+    global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
     try:
         top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
@@ -368,6 +371,8 @@ async def _scan_symbols(cfg) -> None:
 
         # symbol_ready MUST go first — UI clears the chart on this message.
         # Candles sent after so they populate the freshly cleared chart.
+        global _last_switch_ts
+        _last_switch_ts = time.time()
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         if fresh_candles:
