@@ -24,11 +24,11 @@ _W_RSI      = 0.10
 _W_STOCH    = 0.07
 
 # Decision thresholds
-_ENTRY_THRESHOLD = 0.20   # composite must exceed ±0.20 for a directional signal
+_ENTRY_THRESHOLD = 0.25   # composite must exceed ±0.25 for a directional signal
 _RSI_OB = 75.0            # overbought block for LONG
 _RSI_OS = 25.0            # oversold block for SHORT
-_RSI_EXTREME_OB = 70.0    # above this = mean-reversion SHORT allowed
-_RSI_EXTREME_OS = 30.0    # below this = mean-reversion LONG allowed
+_RSI_EXTREME_OB = 75.0    # above this = mean-reversion SHORT allowed
+_RSI_EXTREME_OS = 25.0    # below this = mean-reversion LONG allowed
 
 
 def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -88,8 +88,8 @@ class SignalEngine:
         # Strength = how far composite is beyond the threshold, scaled 0→1
         if raw_dir != "NEUTRAL":
             excess = abs(composite) - _ENTRY_THRESHOLD
-            # max possible excess ≈ 0.80 (all components fully aligned)
-            strength = _clamp(excess / 0.80, 0.0, 1.0)
+            # max realistic excess ≈ 0.75 (all components strongly aligned)
+            strength = _clamp(excess / 0.75, 0.0, 1.0)
         else:
             strength = 0.0
 
@@ -188,41 +188,37 @@ class SignalEngine:
 
     def _score_rsi(self, ind: Dict) -> float:
         """
-        Zone-based RSI scoring that aligns with _apply_filters():
-          > 75        → -0.5  hard overbought penalty (filter blocks LONG here)
-          70–75       → fade -0.1 → -0.5  approaching filter block
-          60–70       → fade +0.5 → 0.0   weakening bullish momentum
-          40–60       → linear -0.5 → +0.5 confirmation zone
-          30–40       → fade 0.0 → -0.5   weakening bearish momentum
-          25–30       → fade +0.1 → +0.5  approaching oversold block
-          < 25        → +0.5  hard oversold penalty (filter blocks SHORT here)
+        Smooth monotonic RSI scoring from -1 to +1.
+
+        Logic (from LONG perspective):
+          RSI < 30  → strongly oversold → strong LONG signal (+0.8 to +1.0)
+          RSI 30–40 → mildly oversold  → mild LONG signal  (+0.2 to +0.8)
+          RSI 40–60 → neutral zone     → proportional      (-0.5 to +0.5)
+          RSI 60–70 → mildly overbought → mild SHORT signal (-0.2 to -0.8)
+          RSI > 70  → strongly overbought → strong SHORT    (-0.8 to -1.0)
+
+        No discontinuities. Monotonically decreasing.
+        Filter blocks entries at RSI extremes (>75 LONG, <25 SHORT).
         """
         rsi_val = ind.get("rsi")
         if rsi_val is None:
             return 0.0
 
-        if rsi_val > 75:
-            # Hard overbought — filter will block LONG entries anyway
-            score = -0.5
-        elif rsi_val >= 70:
-            # Fade from -0.1 (at 75) to -0.5 is wrong direction; fade -0.1 → -0.5
-            # as RSI climbs from 70 toward 75
-            score = -0.1 - 0.4 * (rsi_val - 70) / 5.0
-        elif rsi_val >= 60:
-            # Momentum weakening: fade +0.5 → 0.0 as RSI climbs 60→70
-            score = 0.5 * (70 - rsi_val) / 10.0
-        elif rsi_val >= 40:
-            # Confirmation zone: linear -0.5 → +0.5
-            score = (rsi_val - 50.0) / 20.0
-        elif rsi_val >= 30:
-            # Momentum weakening bearish: fade 0.0 → -0.5 as RSI falls 40→30
-            score = -0.5 * (40 - rsi_val) / 10.0
-        elif rsi_val >= 25:
-            # Approaching oversold block: fade +0.1 → +0.5 as RSI falls 30→25
-            score = 0.1 + 0.4 * (30 - rsi_val) / 5.0
+        if rsi_val <= 30:
+            # Oversold: +0.8 at rsi=30, +1.0 at rsi=0
+            score = 0.8 + 0.2 * (30 - rsi_val) / 30.0
+        elif rsi_val <= 40:
+            # Approaching oversold: +0.2 at rsi=40, +0.8 at rsi=30
+            score = 0.2 + 0.6 * (40 - rsi_val) / 10.0
+        elif rsi_val <= 60:
+            # Neutral: linear +0.2 → -0.2 (connects the adjacent zones at rsi=40/60)
+            score = 0.2 - 0.4 * (rsi_val - 40) / 20.0
+        elif rsi_val <= 70:
+            # Approaching overbought: -0.2 at rsi=60, -0.8 at rsi=70
+            score = -0.2 - 0.6 * (rsi_val - 60) / 10.0
         else:
-            # Hard oversold — filter will block SHORT entries anyway
-            score = 0.5
+            # Overbought: -0.8 at rsi=70, -1.0 at rsi=100
+            score = -0.8 - 0.2 * (rsi_val - 70) / 30.0
 
         return _clamp(score)
 
