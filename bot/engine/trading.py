@@ -276,14 +276,16 @@ class TradingEngine:
             elif direction == "SHORT" and hist < 0:        # was < 0.0001
                 count += 1
 
-        # Signal 4: BB squeeze release — bands must be meaningfully wide
-        # AND expanding (not just wide). Requires previous width to compare.
-        # Since we don't have history here, use a stricter threshold.
-        # width/mid > 0.03 means bands are 3%+ of price — genuinely expanded
-        if bb is not None:
-            width = bb.get("width", 0)
-            mid   = bb.get("mid", 1)
-            if mid > 0 and (width / mid) > 0.03:          # was 0.01
+        # Signal 4: StochRSI extreme (genuinely oversold/overbought)
+        # k < 20 = oversold → LONG reversal likely
+        # k > 80 = overbought → SHORT reversal likely
+        # Fires ~20% of time vs BB width which fired ~100% of time
+        sr = ind.get("stoch_rsi")
+        if sr is not None:
+            k = float(sr.get("k", 50.0))
+            if direction == "LONG" and k < 20:
+                count += 1
+            elif direction == "SHORT" and k > 80:
                 count += 1
 
         return count
@@ -759,7 +761,7 @@ class TradingEngine:
             # Gate 1b: Require minimum signal conviction for DCA.
             # NEUTRAL signal (strength=0, no direction) means signal engine
             # has no view — do not average down without any supporting evidence.
-            if signal["direction"] == "NEUTRAL" or signal["strength"] < cfg.min_signal_strength:
+            if signal["direction"] == "NEUTRAL" or signal["strength"] < cfg.min_signal_strength * 1.2:
                 logger.info(
                     "TradingEngine: DCA skipped — no signal conviction "
                     "(dir=%s strength=%.2f)",
@@ -1149,7 +1151,7 @@ class TradingEngine:
                 if (
                     signal.get("direction") == h_dir
                     and signal.get("filters_passed", False)
-                    and signal.get("strength", 0.0) >= 0.3
+                    and signal.get("strength", 0.0) >= cfg.min_signal_strength * 1.2
                 ):
                     logger.debug(
                         "TradingEngine: recovery close deferred — signal still %s (hedge dir)",
