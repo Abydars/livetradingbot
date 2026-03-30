@@ -322,7 +322,7 @@ async def _scan_symbols(cfg) -> None:
         await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
         # Auto-switch only when enabled and no open position
-        if not cfg.auto_switch or _engine._session is not None:
+        if not cfg.auto_switch or _engine._session is not None or not _trading_active:
             return
 
         best       = top[0]
