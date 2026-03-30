@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS signal_log (
     rsi_score   REAL,
     action      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS pos_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event   TEXT    NOT NULL,
+    payload TEXT    NOT NULL,
+    ts      INTEGER NOT NULL
+);
 """
 
 _DEFAULT_CONFIG: Dict[str, str] = {
@@ -136,6 +143,15 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
         except Exception:
             pass  # column already exists
+    # Create pos_log table if missing (older DBs won't have it)
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS pos_log (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            event   TEXT    NOT NULL,
+            payload TEXT    NOT NULL,
+            ts      INTEGER NOT NULL
+        )"""
+    )
     await db.commit()
 
 
@@ -369,6 +385,55 @@ async def get_signal_log(limit: int = 100) -> List[Dict[str, Any]]:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Position log — persisted across restarts
+# ---------------------------------------------------------------------------
+
+async def insert_pos_log(event: str, payload: dict) -> None:
+    import json
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO pos_log (event, payload, ts)
+               VALUES (?, ?, ?)""",
+            (event, json.dumps(payload), payload.get("ts", int(time.time()))),
+        )
+        await db.execute(
+            "DELETE FROM pos_log WHERE id NOT IN "
+            "(SELECT id FROM pos_log ORDER BY id DESC LIMIT 2000)"
+        )
+        await db.commit()
+
+
+async def get_pos_log(limit: int = 30, before_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    import json
+    async with aiosqlite.connect(DB_PATH) as db:
+        if before_id:
+            cur = await db.execute(
+                "SELECT id, event, payload, ts FROM pos_log "
+                "WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (before_id, limit),
+            )
+        else:
+            cur = await db.execute(
+                "SELECT id, event, payload, ts FROM pos_log "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cur.fetchall()
+    result = []
+    for row in rows:
+        entry = json.loads(row[2])
+        entry["_id"] = row[0]
+        result.append(entry)
+    return result
+
+
+async def clear_pos_log() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pos_log")
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
