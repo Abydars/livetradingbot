@@ -2078,9 +2078,19 @@ function updateSignalPanel(sig) {
   badge.textContent = dir;
   badge.className   = 'sig-badge ' + dir.toLowerCase();
 
-  // Strength %
-  document.getElementById('sig-strength').textContent =
-    ((sig.strength || 0) * 100).toFixed(1) + '%';
+  // Strength % when directional, raw composite when NEUTRAL
+  const strEl = document.getElementById('sig-strength');
+  if (dir === 'NEUTRAL') {
+    const comp = sig.composite ?? 0;
+    const sign = comp >= 0 ? '+' : '';
+    strEl.textContent = sign + (comp * 100).toFixed(1) + '%';
+    strEl.style.opacity = '0.5';
+    strEl.title = `composite ${sign}${comp.toFixed(4)} — threshold ±0.25`;
+  } else {
+    strEl.textContent = ((sig.strength || 0) * 100).toFixed(1) + '%';
+    strEl.style.opacity = '1';
+    strEl.title = '';
+  }
 
   // Reason text
   document.getElementById('sig-reason').textContent = sig.reason || '';
