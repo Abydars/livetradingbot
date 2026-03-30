@@ -304,21 +304,31 @@ class TradingEngine:
 
     def get_level_prices(self):
         """Return (tp_price, sl_price) for the current session, or (None, None).
-        Manual overrides take priority over ATR-computed values."""
-        ref = self._entry_adaptive or self._adaptive
-        if not self._session or not ref:
+        Uses the same formulas as _push_session() for consistency.
+        Manual overrides take priority."""
+        if not self._session:
             return None, None
-        entry = self._session["entry_price"]
-        avg   = self._session["avg_price"]
-        d     = self._session["direction"]
-        tp    = ref["tp_pct"]
-        sl    = ref["hard_stop_pct"]
-        if d == "LONG":
-            computed_tp = entry * (1 + tp / 100)
-            computed_sl = avg   * (1 - sl / 100)
+        entry    = self._session["entry_price"]
+        avg      = self._session["avg_price"]
+        d        = self._session["direction"]
+        leverage = self._session["leverage"]
+
+        # TP: needs _entry_adaptive — may be empty right after restart
+        computed_tp = None
+        ref = self._entry_adaptive or self._adaptive
+        if ref:
+            tp = ref["tp_pct"]
+            computed_tp = entry * (1 + tp / 100) if d == "LONG" else entry * (1 - tp / 100)
+
+        # SL: last resort SL — does NOT need ref
+        if self._breakeven_stop_price is not None:
+            computed_sl = self._breakeven_stop_price
         else:
-            computed_tp = entry * (1 - tp / 100)
-            computed_sl = avg   * (1 + sl / 100)
+            buffer  = self._last_resort_buffer_cache
+            liq_pct = (1.0 / leverage) if leverage > 0 else 0.10
+            sl_pct  = liq_pct * buffer
+            computed_sl = avg * (1 - sl_pct) if d == "LONG" else avg * (1 + sl_pct)
+
         return (
             self._override_tp_price if self._override_tp_price is not None else computed_tp,
             self._override_sl_price if self._override_sl_price is not None else computed_sl,
@@ -621,14 +631,14 @@ class TradingEngine:
         if await self._check_tp(cfg, price, entry_pct, pnl_pct, direction, p):
             return
 
-        # ---- Smart SL: signal-confirmed early exit when all DCAs exhausted ---
-        # Fires when all DCAs are used, position is losing, and a strong
-        # opposite signal is confirmed for 3 consecutive ticks.
-        # Exits well before the last resort SL to limit losses.
-        # Does NOT fire while DCAs remain — DCA is the preferred rescue.
+        # ---- Smart SL: signal-confirmed early exit (priority over DCA) ------
+        # Fires when position is losing AND signal strongly confirms the loss
+        # direction for 3 consecutive ticks. Takes priority over DCA — if the
+        # signal says the move will continue against us, adding capital is wrong.
+        # Requires at least min_profit_pct of loss to avoid firing on noise.
+        # Does NOT fire when hedges are active (hedge logic handles recovery).
         if (
-            dca_count >= cfg.max_dca
-            and price_pct < 0
+            price_pct <= -p["min_profit_pct"]
             and not self._trail_activated
             and not self._hedges
         ):
@@ -643,9 +653,10 @@ class TradingEngine:
                 if self._smart_sl_ticks >= 3:
                     logger.info(
                         "TradingEngine: SMART SL — signal %s str=%.2f confirmed "
-                        "%d ticks, price_pct=%.3f%% — exiting before last resort SL",
+                        "%d ticks, price_pct=%.3f%% dca=%d/%d — exiting early",
                         signal["direction"], signal["strength"],
                         self._smart_sl_ticks, price_pct,
+                        dca_count, cfg.max_dca,
                     )
                     self._smart_sl_ticks = 0
                     await self._close_position(cfg, price, pnl_pct, "smart_sl")
