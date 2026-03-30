@@ -2762,11 +2762,13 @@ function openDrawer(side) {
   if (side === 'left')  document.getElementById('sym-sidebar').classList.add('drawer-open');
   if (side === 'right') document.getElementById('right-col').classList.add('drawer-open');
   document.getElementById('drawer-overlay').classList.add('active');
+  document.body.style.overflow = 'hidden';
 }
 function closeDrawers() {
   document.getElementById('sym-sidebar').classList.remove('drawer-open');
   document.getElementById('right-col').classList.remove('drawer-open');
   document.getElementById('drawer-overlay').classList.remove('active');
+  document.body.style.overflow = '';
 }
 
 
