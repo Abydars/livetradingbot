@@ -92,6 +92,10 @@ class TradingEngine:
         # Signal degradation exit: counts ticks of NEUTRAL while position losing
         self._signal_degraded_ticks: int = 0
 
+        # Rescue mode: set after rescue DCA, arms a tight trail to minimize loss
+        self._rescue_mode:        bool          = False
+        self._rescue_trail_price: Optional[float] = None   # best price seen since rescue DCA
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -700,21 +704,72 @@ class TradingEngine:
             price_pct <= -(p["dca_step_pct"] * 0.5)
             and not self._trail_activated
             and not self._hedges
+            and not self._rescue_mode
             and signal["direction"] == "NEUTRAL"
         ):
             self._signal_degraded_ticks += 1
             if self._signal_degraded_ticks >= max(15, 15 * cfg.tf_minutes // 3):
-                logger.info(
-                    "TradingEngine: SIGNAL DEGRADATION EXIT — NEUTRAL for %d ticks "
-                    "price_pct=%.3f%% dca=%d/%d — conviction gone",
-                    self._signal_degraded_ticks, price_pct,
-                    dca_count, cfg.max_dca,
-                )
                 self._signal_degraded_ticks = 0
-                await self._close_position(cfg, price, pnl_pct, "signal_degraded")
+                if dca_count < cfg.max_dca:
+                    # DCA available — rescue: lower avg, then tight trail
+                    logger.info(
+                        "TradingEngine: SIGNAL DEGRADATION — NEUTRAL %d ticks "
+                        "price_pct=%.3f%% dca=%d/%d — executing rescue DCA",
+                        max(15, 15 * cfg.tf_minutes // 3), price_pct,
+                        dca_count, cfg.max_dca,
+                    )
+                    await self._try_rescue_dca(
+                        cfg, price, direction, avg_price, qty, dca_count, atr_val
+                    )
+                else:
+                    # All DCAs exhausted — exit immediately
+                    logger.info(
+                        "TradingEngine: SIGNAL DEGRADATION EXIT — NEUTRAL, "
+                        "no DCA left, price_pct=%.3f%%",
+                        price_pct,
+                    )
+                    await self._close_position(cfg, price, pnl_pct, "signal_degraded")
                 return
         else:
-            self._signal_degraded_ticks = 0
+            if not self._rescue_mode:
+                self._signal_degraded_ticks = 0
+
+        # ---- Rescue trail: signal-adaptive trail armed after rescue DCA ------
+        # Once rescue mode is active, track the best price and exit on pullback.
+        # Trail width adapts to current signal:
+        #   Signal recovered (same dir) → loosen: 1.0 + strength (1.0×–2.0×)
+        #   Signal NEUTRAL              → tight:  0.5×
+        #   Signal OPPOSITE             → very tight: 0.3× (Smart SL also fires)
+        # This gives the position room to run if conviction returns, while
+        # exiting quickly if the signal stays gone or reverses.
+        if self._rescue_mode and self._rescue_trail_price is not None:
+            if signal["direction"] == direction and signal["filters_passed"]:
+                rescue_mult = 1.0 + signal["strength"]   # 1.0× – 2.0×
+            elif signal["direction"] == "NEUTRAL":
+                rescue_mult = 0.5
+            else:
+                rescue_mult = 0.3   # opposite — very tight
+            rescue_trail_pct = p["trail_pct"] * rescue_mult
+            if direction == "LONG":
+                if price > self._rescue_trail_price:
+                    self._rescue_trail_price = price   # ratchet up
+                rescue_level = self._rescue_trail_price * (1 - rescue_trail_pct / 100)
+                trail_hit    = price <= rescue_level
+            else:
+                if price < self._rescue_trail_price:
+                    self._rescue_trail_price = price   # ratchet down
+                rescue_level = self._rescue_trail_price * (1 + rescue_trail_pct / 100)
+                trail_hit    = price >= rescue_level
+            if trail_hit:
+                logger.info(
+                    "TradingEngine: RESCUE TRAIL fired @ %.6f  "
+                    "best=%.6f  trail_pct=%.3f%%  price_pct=%.3f%%",
+                    price, self._rescue_trail_price, rescue_trail_pct, price_pct,
+                )
+                self._rescue_mode        = False
+                self._rescue_trail_price = None
+                await self._close_position(cfg, price, pnl_pct, "rescue_trail")
+                return
 
         # ---- Hedge management -----------------------------------------------
         if self._hedges:
@@ -1138,6 +1193,91 @@ class TradingEngine:
             "trading_mode": cfg.trading_mode,
         })
 
+    async def _try_rescue_dca(
+        self,
+        cfg: BotConfig,
+        price: float,
+        direction: str,
+        avg_price: float,
+        qty: float,
+        dca_count: int,
+        atr_val: float = 0.0,
+    ) -> None:
+        """
+        Rescue DCA — bypasses signal gates and adverse pressure check.
+        Called when signal degrades while position is losing. Lowers avg
+        price then arms a tight trailing stop to minimize the eventual loss.
+        """
+        dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
+        new_qty    = self._executor.calc_qty(cfg.symbol, dca_margin, cfg.leverage, price)
+        side       = "BUY" if direction == "LONG" else "SELL"
+
+        order = await self._executor.place_market_order(
+            cfg.symbol, side, new_qty, current_price=price
+        )
+        fill_price = float(order.get("avgPrice") or price)
+
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {
+                "type": "dca", "prior_qty": qty,
+                "prior_avg": avg_price, "new_qty": new_qty,
+            }
+
+        total_qty = qty + new_qty
+        new_avg   = (avg_price * qty + fill_price * new_qty) / total_qty
+
+        await update_session(
+            self._session["id"],
+            avg_price=new_avg,
+            qty=total_qty,
+            margin=self._session["margin"] + dca_margin,
+            dca_count=dca_count + 1,
+        )
+        self._session = await get_open_session()
+
+        self._clear_level_overrides("rescue_dca")
+        self._breakeven_stop_price  = None
+        self._last_dca_time         = time.time()
+        self._smart_sl_ticks        = 0
+        self._signal_degraded_ticks = 0
+
+        # Recalculate ATR-based thresholds at DCA price, preserve tp_pct
+        if atr_val > 0 and price > 0:
+            old_tp_pct = self._entry_adaptive.get("tp_pct")
+            self._entry_adaptive = self._compute_adaptive(atr_val, price)
+            if old_tp_pct is not None:
+                self._entry_adaptive["tp_pct"] = old_tp_pct
+
+        # Arm rescue trail from fill price — tracks best price from here
+        self._rescue_mode        = True
+        self._rescue_trail_price = fill_price
+
+        msg = (
+            f"{_mode_prefix(cfg.trading_mode)}"
+            f"RESCUE DCA #{dca_count+1} {direction} @ {fill_price:.4f}  "
+            f"new_avg={new_avg:.4f}  tight trail armed"
+        )
+        logger.info("TradingEngine: %s", msg)
+        self._broadcast({"type": "notification", "text": msg})
+        self._pos_log(
+            "dca", direction=direction, price=fill_price, qty=new_qty,
+            dca_n=dca_count + 1, new_avg=round(new_avg, 6),
+            symbol=cfg.symbol, mode=cfg.trading_mode,
+        )
+        self._push_session()
+
+        await log_signal(cfg.symbol, direction, 0.0, {}, "rescue_dca")
+        await notify(cfg.discord_webhook, "TRADE_DCA", {
+            "symbol":       cfg.symbol,
+            "direction":    direction,
+            "level":        dca_count + 1,
+            "price":        fill_price,
+            "new_avg":      new_avg,
+            "total_margin": self._session["margin"],
+            "trading_mode": cfg.trading_mode,
+        })
+
     # ------------------------------------------------------------------
     # Hedge
     # ------------------------------------------------------------------
@@ -1398,6 +1538,8 @@ class TradingEngine:
         self._last_dca_time          = None
         self._smart_sl_ticks         = 0
         self._signal_degraded_ticks  = 0
+        self._rescue_mode        = False
+        self._rescue_trail_price = None
         self._push_session()
 
     async def _emergency_close(
