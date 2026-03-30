@@ -719,13 +719,23 @@ class BinanceRestClient:
             else:
                 bias = c["_bias"]
 
-            # ── Final composite score ──
+            # ── Normalise all components to 0→1 before applying weights ──
+            # vol_surge is unbounded (pump can be 10+), cap at 3× as "maximum useful surge"
+            # momentum_score = momentum_pct × accel, also unbounded, cap at 3.0
+            # signal_tendency already 0→1 (clamped)
+            # trend_score already 0→0.20, normalise back to 0→1
+            vol_norm   = min(vol_surge / 3.0, 1.0)
+            mom_norm   = min(momentum_score / 3.0, 1.0)
+            sig_norm   = signal_tendency               # already 0→1
+            trend_norm = min(trend_score / 0.20, 1.0) # 0.20 is max from trend_strength*0.20
+
+            # Weights now sum to 1.0 and all inputs are in 0→1 range
             # Weights: vol_surge 0.30, momentum_accel 0.25, signal_tendency 0.20, trend 0.25
             base_score = (
-                vol_surge         * 0.30
-                + momentum_score  * 0.25
-                + signal_tendency * 0.20
-                + trend_score
+                vol_norm   * 0.30
+                + mom_norm * 0.25
+                + sig_norm * 0.20
+                + trend_norm * 0.25
             )
             final_score = base_score * rsi_penalty * atr_penalty
 
