@@ -1669,11 +1669,15 @@ function updateSymSidebar(movers) {
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
     const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
+    const tagRow = (biasBadge || htfBadge)
+      ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}</div>`
+      : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span><span style="display:flex;gap:3px;align-items:center">${biasBadge}${htfBadge}</span></div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span></div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
+      ${tagRow}
     </div>`;
   }).join('');
 }
