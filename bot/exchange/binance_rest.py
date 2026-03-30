@@ -617,7 +617,7 @@ class BinanceRestClient:
         # ── Phase 2: kline deep score ──────────────────────────────────
         pool_syms  = [c["symbol"] for c in phase2_pool]
         klines_map = await self.get_klines_batch(
-            pool_syms, interval=timeframe, limit=25
+            pool_syms, interval=timeframe, limit=70
         )
 
         for c in phase2_pool:
@@ -679,11 +679,14 @@ class BinanceRestClient:
             # ── EMA trend: continuous strength instead of binary bonus ──
             ema9  = _scan_ema(closes, 9)
             ema21 = _scan_ema(closes, 21)
-            bullish_setup = ema9 > ema21 and closes[-1] > ema21
-            bearish_setup = ema9 < ema21 and closes[-1] < ema21
+            ema50 = _scan_ema(closes, 50)
+            # Use EMA21 vs EMA50 — matches signal engine TREND component (23% weight)
+            # EMA9 vs EMA21 was causing scanner/signal engine disagreement
+            bullish_setup = ema21 > ema50 and closes[-1] > ema21
+            bearish_setup = ema21 < ema50 and closes[-1] < ema21
 
             if atr_pct > 0:
-                ema_diff_pct   = abs(ema9 - ema21) / ema21
+                ema_diff_pct   = abs(ema21 - ema50) / ema21
                 trend_strength = min(ema_diff_pct / (atr_pct / 100), 1.0)   # normalised 0→1
             else:
                 trend_strength = 0.0
@@ -701,7 +704,7 @@ class BinanceRestClient:
                 macd_norm = min(macd_norm, 1.0)
 
                 # Trend component (EMA21 vs EMA50 proxy using available data)
-                trend_norm = min(abs(ema9 - ema21) / ema21 / (atr_pct / 100), 1.0) if atr_pct > 0 else 0.0
+                trend_norm = min(abs(ema21 - ema50) / ema21 / (atr_pct / 100), 1.0) if atr_pct > 0 else 0.0
 
                 signal_tendency = (macd_norm * 0.5 + trend_norm * 0.5)
             else:
