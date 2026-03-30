@@ -1449,11 +1449,11 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         global _last_candles_fetch, _binance_client, _executor, _ws, _flow
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
 
-        # Block symbol/timeframe changes while trading is active
-        if _trading_active and ("symbol" in updates or "timeframe" in updates):
+        # Block symbol/timeframe changes while a position is open
+        if ("symbol" in updates or "timeframe" in updates) and _engine._session is not None:
             await ws.send_text(json.dumps({
                 "type": "config_saved", "ok": False,
-                "error": "Stop trading before changing symbol or timeframe",
+                "error": "Cannot change symbol or timeframe while a position is open",
             }))
             return
 
@@ -1545,6 +1545,13 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             _last_candles_fetch = 0.0
             cfg2 = await load_config()
             await _executor.prepare_symbol(new_sym, cfg2.leverage)
+            # Reset auto-switch cycle — manual override starts fresh on chosen symbol
+            global _entry_start_candle, _neutral_since_candle, _tried_syms, _htf_bias, _last_htf_fetch
+            _entry_start_candle   = 0
+            _neutral_since_candle = 0
+            _tried_syms.clear()
+            _htf_bias        = "NEUTRAL"
+            _last_htf_fetch  = 0.0
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         # Re-apply leverage immediately if it was changed

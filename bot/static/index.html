@@ -2767,9 +2767,9 @@ function hideSymLoader() {
 }
 
 function changeSymbol(sym) {
-  if (tradingActive) {
-    showToast('Stop trading before changing symbol', 'warn');
-    setSymbolSelect(currentSymbol);  // revert the select
+  if (window._sessionOpen) {
+    showToast('Cannot change symbol while position is open', 'warn');
+    setSymbolSelect(currentSymbol);
     return;
   }
   currentSymbol = sym;
