@@ -426,7 +426,7 @@ class TradingEngine:
     # Main tick — called every N seconds by the scheduler
     # ------------------------------------------------------------------
 
-    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False) -> None:
+    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
         signal = self._signal_engine.compute(self.candles, flow_summary, ind)
@@ -439,7 +439,7 @@ class TradingEngine:
 
         if self._session is None:
             if allow_entry:
-                await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup)
+                await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
         else:
             await self._manage_position(cfg, price, signal, ind, atr_val)
 
@@ -455,6 +455,7 @@ class TradingEngine:
         ind: Dict,
         atr_val: float,
         flow_warmup: bool = False,
+        htf_bias: str = "NEUTRAL",
     ) -> None:
         direction = signal["direction"]
         strength  = signal["strength"]
@@ -513,6 +514,16 @@ class TradingEngine:
             logger.debug(
                 "TradingEngine: entry pending — signal %s confirmed %d/%d ticks",
                 direction, self._entry_signal_ticks, persist_needed,
+            )
+            return
+
+        # HTF confirmation: if the higher timeframe has a clear directional bias,
+        # block entries that go counter to it. "NEUTRAL" means no HTF data yet or
+        # the EMAs are mixed — in that case we allow the entry through.
+        if htf_bias != "NEUTRAL" and htf_bias != direction:
+            logger.debug(
+                "TradingEngine: entry blocked — HTF bias %s disagrees with signal %s",
+                htf_bias, direction,
             )
             return
 

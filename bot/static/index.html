@@ -555,6 +555,11 @@
     .sig-badge.short   { color: var(--red);    border-color: var(--red);    background: rgba(248,81,73,.1); }
     .sig-badge.neutral { color: var(--muted);  border-color: var(--muted);  background: transparent; }
 
+    .htf-badge { font-size: 9px; font-weight: 600; padding: 1px 5px; border: 1px solid; border-radius: 3px; }
+    .htf-badge.long    { color: var(--green); border-color: var(--green); background: rgba(63,185,80,.08); }
+    .htf-badge.short   { color: var(--red);   border-color: var(--red);   background: rgba(248,81,73,.08); }
+    .htf-badge.neutral { color: var(--muted); border-color: var(--muted); background: transparent; }
+
     #sig-strength { font-size: 12px; }
     #sig-reason   { font-size: 10px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
 
@@ -787,6 +792,9 @@
     .sym-bias  { font-size: 8px; font-weight: 700; letter-spacing: .05em; padding: 1px 4px; border-radius: 3px; }
     .sym-bias.long { background: rgba(63,185,80,.18); color: var(--green); }
     .sym-bias.short { background: rgba(248,81,73,.18); color: var(--red); }
+    .sym-htf   { font-size: 8px; font-weight: 600; padding: 1px 3px; border-radius: 2px; opacity: .85; }
+    .sym-htf.long  { background: rgba(63,185,80,.25); color: var(--green); }
+    .sym-htf.short { background: rgba(248,81,73,.25); color: var(--red); }
     .sym-metrics { font-size: 9px; color: var(--muted); margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
 
     /* ═══════════════════════════════ RESPONSIVE ══ */
@@ -1176,6 +1184,7 @@
       <div id="sig-top">
         <span id="sig-badge" class="sig-badge neutral">NEUTRAL</span>
         <span id="sig-strength">0.0%</span>
+        <span id="htf-badge" class="htf-badge neutral" title="HTF EMA bias">HTF –</span>
       </div>
       <div id="sig-reason">Waiting…</div>
       <div id="sig-bars">
@@ -1529,6 +1538,18 @@ function dispatch(msg) {
       }
       break;
 
+    case 'htf_bias': {
+      const b   = (msg.bias || 'NEUTRAL').toUpperCase();
+      const tf  = msg.timeframe || '';
+      const el  = document.getElementById('htf-badge');
+      if (el) {
+        el.textContent  = `HTF ${b === 'NEUTRAL' ? '–' : b}${tf ? ' ' + tf : ''}`;
+        el.className    = 'htf-badge ' + b.toLowerCase();
+        el.title        = `HTF EMA bias on ${tf}: ${b}`;
+      }
+      break;
+    }
+
     case 'signal':
       if (msg.data) updateSignalPanel(msg.data);
       break;
@@ -1641,11 +1662,15 @@ function updateSymSidebar(movers) {
     const biasBadge = bias
       ? `<span class="sym-bias ${biasCls}">${bias}</span>`
       : '';
+    const htfB  = (m.htf_bias || '').toUpperCase();
+    const htfBadge = (htfB === 'LONG' || htfB === 'SHORT')
+      ? `<span class="sym-htf ${htfB.toLowerCase()}">HTF ${htfB}</span>`
+      : '';
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
     const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span>${biasBadge}</div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span>${biasBadge}${htfBadge}</div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
