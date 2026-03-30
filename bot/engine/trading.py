@@ -92,6 +92,12 @@ class TradingEngine:
         # Signal degradation exit: counts ticks of NEUTRAL while position losing
         self._signal_degraded_ticks: int = 0
 
+        # Signal persistence: count consecutive ticks holding the same direction.
+        # Entry only fires after signal holds for N ticks — prevents entering on
+        # a single noisy tick that immediately flips back to NEUTRAL.
+        self._entry_signal_ticks: int = 0
+        self._entry_signal_dir:   str = "NEUTRAL"
+
         # Rescue mode: set after rescue DCA, arms a tight trail to minimize loss
         self._rescue_mode:        bool          = False
         self._rescue_trail_price: Optional[float] = None   # best price seen since rescue DCA
@@ -479,10 +485,35 @@ class TradingEngine:
                 return
 
         if direction == "NEUTRAL":
+            self._entry_signal_ticks = 0
+            self._entry_signal_dir   = "NEUTRAL"
             return
         if strength < cfg.min_signal_strength:
+            self._entry_signal_ticks = 0
+            self._entry_signal_dir   = "NEUTRAL"
             return
         if not signal["filters_passed"]:
+            self._entry_signal_ticks = 0
+            self._entry_signal_dir   = "NEUTRAL"
+            return
+
+        # Signal persistence filter: require the same directional signal to hold
+        # for N consecutive ticks before allowing entry. A signal that appears for
+        # one tick and disappears is likely noise. N scales with timeframe so that
+        # on 1m the filter is 3 seconds and on 15m it is 45 seconds.
+        persist_needed = max(3, cfg.tf_minutes * 3)
+        if direction == self._entry_signal_dir:
+            self._entry_signal_ticks += 1
+        else:
+            # Direction changed — reset counter and start fresh
+            self._entry_signal_dir   = direction
+            self._entry_signal_ticks = 1
+
+        if self._entry_signal_ticks < persist_needed:
+            logger.debug(
+                "TradingEngine: entry pending — signal %s confirmed %d/%d ticks",
+                direction, self._entry_signal_ticks, persist_needed,
+            )
             return
 
         # Stop cooldown: block re-entry for N seconds after a hard stop
@@ -1564,6 +1595,8 @@ class TradingEngine:
         self._last_dca_time          = None
         self._smart_sl_ticks         = 0
         self._signal_degraded_ticks  = 0
+        self._entry_signal_ticks = 0
+        self._entry_signal_dir   = "NEUTRAL"
         self._rescue_mode        = False
         self._rescue_trail_price = None
         self._push_session()
