@@ -844,7 +844,8 @@
         max-height: 340px;
       }
 
-      #tabs-wrap { height: 195px; }
+      #tabs-wrap { height: auto; flex-shrink: 0; }
+      .tbl-scroll { overflow-y: visible; flex: none; }
 
       #right-col {
         width: 100%;
@@ -915,7 +916,7 @@
         max-height: 280px;
       }
 
-      #tabs-wrap { height: 185px; }
+      #tabs-wrap { height: auto; }
 
       #ws-label { display: none; }
 
@@ -1052,9 +1053,12 @@
       #right-col.drawer-open { transform: translateX(0); }
 
       /* Cards stack vertically inside the right drawer */
-      #right-col .rcard { flex-shrink: 0; }
+      #right-col .rcard { flex-shrink: 0; width: 100%; box-sizing: border-box; }
       #card-hedge,
       #card-ob { grid-column: auto !important; }
+
+      /* Remove nested scroll — drawer itself scrolls */
+      #right-col #pos-log-list { max-height: none; overflow-y: visible; }
     }
   </style>
 </head>
@@ -2303,6 +2307,7 @@ const _PL_LABELS = {
   failed:      'FAILED',
   smart_sl:    'SMART SL',
   signal_degraded: 'SIG DEG',
+  rescue_dca:  'RESCUE DCA',
 };
 const _PL_CLASSES = {
   open:        'pl-open',
@@ -2313,6 +2318,7 @@ const _PL_CLASSES = {
   failed:      'pl-failed',
   smart_sl:    'pl-close',
   signal_degraded: 'pl-close',
+  rescue_dca:  'pl-dca',
 };
 
 function _fmtPosLogTime(ts) {
