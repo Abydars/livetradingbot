@@ -610,9 +610,10 @@ class BinanceRestClient:
                 "_atr_pct":   vol_pct * 100,
             })
 
-        # Keep top 25 for phase 2 (sorted by phase-1 score)
+        # Keep top 15 for phase 2 — Phase 1 already filters well enough.
+        # Smaller pool = faster batch fetch (~300ms saved per scan cycle).
         candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
-        phase2_pool = candidates[:25]
+        phase2_pool = candidates[:15]
 
         # ── Phase 2: kline deep score ──────────────────────────────────
         pool_syms  = [c["symbol"] for c in phase2_pool]

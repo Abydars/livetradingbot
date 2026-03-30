@@ -82,6 +82,7 @@ _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
+_htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
@@ -352,34 +353,49 @@ def _format_movers(top: list) -> list:
 
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
+    global _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
     try:
         top = await _rest.get_top_movers(n=10, timeframe=cfg.timeframe)
         if not top:
             return
 
-        # Batch HTF bias for all scanner symbols
+        # Per-symbol HTF bias with cache — HTF changes every 15+ minutes so
+        # there is no need to re-fetch on every 10-second scan cycle.
+        # Only symbols whose cache has expired trigger a real API call.
         try:
             from exchange.binance_rest import _scan_ema as _ema
-            htf_tf, _ = _htf_for_timeframe(cfg.timeframe)
-            syms = [t["symbol"] for t in top]
-            htf_klines_map = await _rest.get_klines_batch(syms, interval=htf_tf, limit=70)
-            for t in top:
-                kl = htf_klines_map.get(t["symbol"], [])
-                if len(kl) >= 50:
-                    closes = [float(k[4]) for k in kl]
-                    e21 = _ema(closes, 21)
-                    e50 = _ema(closes, 50)
-                    if e21 > e50 and closes[-1] > e21:
-                        t["_htf_bias"] = "LONG"
-                    elif e21 < e50 and closes[-1] < e21:
-                        t["_htf_bias"] = "SHORT"
+            htf_tf, htf_ttl = _htf_for_timeframe(cfg.timeframe)
+            now_ts = time.time()
+
+            stale_syms = [
+                t["symbol"] for t in top
+                if now_ts - _htf_scanner_cache.get(t["symbol"], ("", 0.0))[1] >= htf_ttl
+            ]
+
+            if stale_syms:
+                htf_klines_map = await _rest.get_klines_batch(
+                    stale_syms, interval=htf_tf, limit=70
+                )
+                for sym, kl in htf_klines_map.items():
+                    if len(kl) >= 50:
+                        closes = [float(k[4]) for k in kl]
+                        e21 = _ema(closes, 21)
+                        e50 = _ema(closes, 50)
+                        if e21 > e50 and closes[-1] > e21:
+                            bias = "LONG"
+                        elif e21 < e50 and closes[-1] < e21:
+                            bias = "SHORT"
+                        else:
+                            bias = "NEUTRAL"
                     else:
-                        t["_htf_bias"] = "NEUTRAL"
-                else:
-                    t["_htf_bias"] = ""
+                        bias = ""
+                    _htf_scanner_cache[sym] = (bias, now_ts)
+
+            for t in top:
+                cached = _htf_scanner_cache.get(t["symbol"])
+                t["_htf_bias"] = cached[0] if cached else ""
         except Exception as exc:
-            logger.debug("Scanner HTF batch failed: %s", exc)
+            logger.debug("Scanner HTF cache failed: %s", exc)
 
         _last_top_movers = _format_movers(top)
         await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
@@ -435,6 +451,7 @@ async def _scan_symbols(cfg) -> None:
         _last_switch_ts = time.time()
         _htf_bias = "NEUTRAL"
         _last_htf_fetch = 0.0
+        _htf_scanner_cache.pop(new_sym, None)   # force fresh HTF fetch for new symbol on next scan
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         if fresh_candles:
