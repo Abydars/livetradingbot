@@ -83,6 +83,9 @@ class TradingEngine:
         # does not treat them as external closes.
         self._bot_close_order_ids: set = set()
 
+        # Minimum time gate between DCAs — set on each DCA execution
+        self._last_dca_time: Optional[float] = None
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -753,6 +756,19 @@ class TradingEngine:
                                  "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
                 return  # hard return, not just else
 
+            # Gate 1b: Require minimum signal conviction for DCA.
+            # NEUTRAL signal (strength=0, no direction) means signal engine
+            # has no view — do not average down without any supporting evidence.
+            if signal["direction"] == "NEUTRAL" or signal["strength"] < cfg.min_signal_strength:
+                logger.info(
+                    "TradingEngine: DCA skipped — no signal conviction "
+                    "(dir=%s strength=%.2f)",
+                    signal["direction"], signal["strength"],
+                )
+                self._broadcast({"type": "notification",
+                                 "text": f"DCA skipped: no signal ({signal['direction']} str={signal['strength']:.2f})"})
+                return
+
             # Gate 2: Smart DCA reversal-indicator gate
             if cfg.smart_dca_gate:
                 reversal_count = self._count_reversal_signals(ind, direction)
@@ -763,6 +779,19 @@ class TradingEngine:
                     )
                     self._broadcast({"type": "notification",
                                      "text": f"DCA gated: {reversal_count}/{cfg.smart_dca_signals} reversal signals"})
+                    return
+
+            # Gate 3: Minimum time between DCAs (prevents rapid DCA burn)
+            # Even if all other gates pass, enforce a cooldown between DCAs.
+            now = time.time()
+            min_dca_gap_s = max(p["dca_step_pct"] * 60, 120)  # at least 2 min, scales with dca_step
+            if self._last_dca_time is not None:
+                elapsed = now - self._last_dca_time
+                if elapsed < min_dca_gap_s:
+                    logger.debug(
+                        "TradingEngine: DCA time-gated — %.0fs since last DCA (need %.0fs)",
+                        elapsed, min_dca_gap_s,
+                    )
                     return
 
             await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val)
@@ -926,6 +955,8 @@ class TradingEngine:
         if not confirmed:
             logger.debug("TradingEngine: DCA pending — adverse pressure not confirmed yet")
             return
+
+        self._last_dca_time = time.time()
 
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
@@ -1257,6 +1288,7 @@ class TradingEngine:
         self._partial_tp_done        = False
         self._last_stop_time         = None   # clear cooldown on normal close
         self._bot_close_order_ids.clear()
+        self._last_dca_time          = None
         self._push_session()
 
     async def _emergency_close(
