@@ -912,13 +912,15 @@ class BinanceRestClient:
         timeframe: str = "1m",
     ) -> List[Dict]:
         """
-        Trend pullback scanner — finds symbols in uptrend that pulled back to EMA.
-        Phase 1: same ticker filter.
+        Trend pullback scanner — LONG ONLY. Finds symbols in confirmed uptrend
+        (EMA9 > EMA21 > EMA50) where price has pulled back toward EMA21 and is
+        starting to bounce. Signal engine 'trendpull' weight profile used.
+        SHORT pullback setups are handled by get_top_movers_breakdown().
         Phase 2 score:
-          ema_align    (0.35) — EMA9 > EMA21 > EMA50 (clean trend structure)
-          pullback_pct (0.30) — price pulled back close to EMA21 (0.5-2× ATR from EMA21)
-          bounce       (0.25) — last 2-3 candles turning back in trend direction
-          trend_slope  (0.10) — EMA21 slope (trend strengthening)
+          ema_align    (0.35) — EMA9 > EMA21 > EMA50 uptrend structure
+          pullback_pct (0.30) — price near EMA21 (0.3-1.5× ATR below EMA9)
+          bounce       (0.25) — last 2-3 candles turning back UP
+          trend_slope  (0.10) — EMA21 slope pointing up (trend strengthening)
         """
         # ── Phase 1: same ticker filter ──
         tickers = await self._fetch_24h_tickers()
@@ -981,32 +983,29 @@ class BinanceRestClient:
                 continue
 
             rsi_val = _scan_rsi(closes, 14)
-            if rsi_val > 80 or rsi_val < 20:
-                rsi_penalty = 0.50
-            elif rsi_val > 70 or rsi_val < 30:
+            # For LONG pullback: overbought is dangerous, oversold is ok (bounce incoming)
+            if rsi_val > 75:
+                rsi_penalty = 0.50   # overbought — pullback may continue
+            elif rsi_val > 65:
                 rsi_penalty = 0.80
             else:
-                rsi_penalty = 1.0
+                rsi_penalty = 1.0    # neutral to oversold — fine for LONG pullback
 
             ema9  = _scan_ema(closes, 9)
             ema21 = _scan_ema(closes, 21)
             ema50 = _scan_ema(closes, 50)
 
-            # EMA alignment score
+            # EMA alignment score — LONG setups only (trendpull is buy-the-dip strategy).
+            # SHORT pullbacks in downtrends are handled by get_top_movers_breakdown().
             if ema9 > ema21 > ema50:
                 ema_align = 1.0
                 bias = "LONG"
-            elif ema9 < ema21 < ema50:
-                ema_align = 1.0
-                bias = "SHORT"
-            elif (ema21 > ema50 and ema9 > ema50) or (ema21 < ema50 and ema9 < ema50):
+            elif ema21 > ema50 and ema9 > ema50:
+                # Partial uptrend alignment (EMA9 not yet above EMA21 cleanly)
                 ema_align = 0.5
-                bias = "LONG" if ema21 > ema50 else "SHORT"
+                bias = "LONG"
             else:
-                ema_align = 0.0
-                bias = c["_bias"]
-
-            if ema_align == 0.0:
+                # Downtrend or mixed — skip, not a trendpull setup
                 c["_score"] = 0.0
                 continue
 
@@ -1025,20 +1024,15 @@ class BinanceRestClient:
             else:
                 pullback_score = 0.0
 
-            # Price should be on correct side approaching EMA21
-            approaching_ema = (bias == "LONG" and price < ema9 and price > ema21 * 0.99) or \
-                              (bias == "SHORT" and price > ema9 and price < ema21 * 1.01)
+            # Price approaching EMA21 from above (pulled back from EMA9 toward EMA21)
+            approaching_ema = price < ema9 and price > ema21 * 0.99
             if not approaching_ema:
                 pullback_score *= 0.5
 
-            # Bounce: last 3 candles turning back in trend direction
+            # Bounce: last 3 candles turning back UP (LONG only)
             if len(closes) >= 4:
-                if bias == "LONG":
-                    bounce = 1.0 if (closes[-1] > closes[-2] > closes[-3]) else \
-                             0.5 if closes[-1] > closes[-2] else 0.0
-                else:
-                    bounce = 1.0 if (closes[-1] < closes[-2] < closes[-3]) else \
-                             0.5 if closes[-1] < closes[-2] else 0.0
+                bounce = 1.0 if (closes[-1] > closes[-2] > closes[-3]) else \
+                         0.5 if closes[-1] > closes[-2] else 0.0
             else:
                 bounce = 0.0
 
@@ -1061,6 +1055,178 @@ class BinanceRestClient:
             c["_momentum"]  = round((closes[-1] - closes[-6]) / closes[-6] * 100, 3) if len(closes) >= 6 else 0.0
             c["_atr_pct"]   = round(atr_pct, 3)
             c["_scanner"]   = "trendpull"
+
+        phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
+        return phase2_pool[:n]
+
+    async def get_top_movers_breakdown(
+        self,
+        n: int = 5,
+        min_quote_volume: float = 20_000_000.0,
+        timeframe: str = "1m",
+    ) -> List[Dict]:
+        """
+        Breakdown scanner — SHORT ONLY. Finds symbols in confirmed downtrend
+        (EMA9 < EMA21 < EMA50) where price has rallied up toward EMA21 resistance
+        and is starting to fail/turn back down. Mirrors get_top_movers_trendpull
+        for the short side. Signal engine uses 'trendpull' weight profile.
+
+        Key difference from trendpull: RSI must NOT be oversold (35-65 range).
+        An oversold rally-failure in a downtrend has too much bounce risk.
+
+        Phase 2 score:
+          ema_align    (0.35) — EMA9 < EMA21 < EMA50 downtrend structure
+          rally_depth  (0.30) — price near EMA21 (0.3-1.5× ATR above EMA9)
+          failure      (0.25) — last 2-3 candles turning back DOWN
+          trend_slope  (0.10) — EMA21 slope pointing down (trend continuing)
+        """
+        # ── Phase 1: ticker filter (same as other scanners) ──
+        tickers = await self._fetch_24h_tickers()
+        if not tickers:
+            return []
+
+        import math
+        usdt_perps = await self.get_usdt_perp_symbols()
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT") or sym not in usdt_perps:
+                continue
+            try:
+                pcp = float(t.get("priceChangePercent", 0))
+                qv  = float(t.get("quoteVolume", 0))
+                hp  = float(t.get("highPrice", 0))
+                lp  = float(t.get("lowPrice", 0))
+                cp  = float(t.get("lastPrice", 0))
+            except (ValueError, TypeError):
+                continue
+            if qv < min_quote_volume or cp <= 0:
+                continue
+            vol_pct    = (hp - lp) / cp if cp > 0 else 0
+            range_pos  = (cp - lp) / (hp - lp) if (hp - lp) > 0 else 0.5
+            # Prefer symbols that were falling and are now near their high of day
+            # (weak rally in downtrend = short setup)
+            range_pos_short = 1 - range_pos  # high range_pos_short = near 24h high = rally
+            p1_score = (
+                abs(pcp)
+                * vol_pct
+                * math.log10(max(qv, 1))
+                * (0.4 + range_pos_short * 0.6)
+            )
+            # Pre-filter: only consider symbols down on the day (downtrend context)
+            if pcp >= 0:
+                continue
+            candidates.append({**t, "_p1_score": p1_score, "_score": p1_score,
+                                "_bias": "SHORT",
+                                "_scanner": "breakdown"})
+
+        candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
+        phase2_pool = candidates[:15]
+
+        # ── Phase 2: breakdown-specific scoring ──
+        pool_syms  = [c["symbol"] for c in phase2_pool]
+        klines_map = await self.get_klines_batch(pool_syms, interval=timeframe, limit=120)
+
+        for c in phase2_pool:
+            sym  = c["symbol"]
+            data = klines_map.get(sym)
+            if not data or len(data) < 55:
+                continue
+
+            highs  = [float(k[2]) for k in data]
+            lows   = [float(k[3]) for k in data]
+            closes = [float(k[4]) for k in data]
+            price  = closes[-1]
+            if price <= 0:
+                continue
+
+            atr     = _scan_atr(highs, lows, closes, 14)
+            atr_pct = (atr / price * 100) if price > 0 else 0.0
+            if atr_pct < 0.3:
+                continue
+
+            rsi_val = _scan_rsi(closes, 14)
+            # CRITICAL for breakdown: RSI must NOT be oversold.
+            # Oversold shorts in downtrends = rescue_trail risk (the exact
+            # problem we're trying to solve). Require RSI >= 32.
+            if rsi_val < 32:
+                c["_score"] = 0.0
+                continue
+            # Overbought rally = ideal short setup (RSI 55-70 = sweet spot)
+            if rsi_val > 75:
+                rsi_penalty = 0.70   # very overbought rally — still ok but risky
+            elif rsi_val >= 55:
+                rsi_penalty = 1.0    # ideal zone: rally into resistance
+            elif rsi_val >= 40:
+                rsi_penalty = 0.85   # mild rally — ok but not ideal
+            else:
+                rsi_penalty = 0.60   # RSI 32-40 — marginal, avoid
+
+            ema9  = _scan_ema(closes, 9)
+            ema21 = _scan_ema(closes, 21)
+            ema50 = _scan_ema(closes, 50)
+
+            # EMA alignment — SHORT setups only (downtrend structure required)
+            if ema9 < ema21 < ema50:
+                ema_align = 1.0
+            elif ema21 < ema50 and ema9 < ema50:
+                # Partial downtrend alignment
+                ema_align = 0.5
+            else:
+                # Uptrend or mixed — not a breakdown setup
+                c["_score"] = 0.0
+                continue
+
+            # Rally depth: price should have rallied near EMA21 (resistance)
+            # Price above EMA9 = has rallied past short-term average
+            # Price near EMA21 = approaching key resistance
+            dist_from_ema21 = abs(price - ema21)
+            if atr > 0:
+                dist_atrs = dist_from_ema21 / atr
+                if 0.3 <= dist_atrs <= 1.5:
+                    rally_score = 1.0 - abs(dist_atrs - 0.9) / 0.9
+                    rally_score = max(rally_score, 0.1)
+                elif dist_atrs < 0.3:
+                    rally_score = 0.4   # at EMA21 — ok but not ideal
+                else:
+                    rally_score = max(0, 1 - (dist_atrs - 1.5) / 1.5)
+            else:
+                rally_score = 0.0
+
+            # Price should have rallied above EMA9 but still below EMA21
+            at_resistance = price > ema9 and price < ema21 * 1.01
+            if not at_resistance:
+                rally_score *= 0.5
+
+            # Failure: last 2-3 candles turning back DOWN after rally
+            if len(closes) >= 4:
+                failure = 1.0 if (closes[-1] < closes[-2] < closes[-3]) else \
+                          0.5 if closes[-1] < closes[-2] else 0.0
+            else:
+                failure = 0.0
+
+            # Trend slope: EMA21 pointing DOWN (downtrend continuing)
+            ema21_old = _scan_ema(closes[:-10], 21) if len(closes) > 30 else ema21
+            slope_pct = (ema21 - ema21_old) / ema21_old if ema21_old > 0 else 0
+            trend_slope = min(abs(slope_pct) / (atr_pct / 100) if atr_pct > 0 else 0, 1.0)
+            # Slope should be negative (EMA21 falling) — penalize if slope is up
+            if slope_pct > 0:
+                trend_slope = 0.0
+
+            base_score  = (
+                ema_align  * 0.35
+                + rally_score  * 0.30
+                + failure      * 0.25
+                + trend_slope  * 0.10
+            )
+            final_score = base_score * rsi_penalty
+
+            c["_score"]     = final_score
+            c["_bias"]      = "SHORT"
+            c["_vol_surge"] = 1.0
+            c["_momentum"]  = round((closes[-1] - closes[-6]) / closes[-6] * 100, 3) if len(closes) >= 6 else 0.0
+            c["_atr_pct"]   = round(atr_pct, 3)
+            c["_scanner"]   = "breakdown"
 
         phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
         return phase2_pool[:n]

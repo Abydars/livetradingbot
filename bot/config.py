@@ -63,6 +63,7 @@ class BotConfig:
     scanner_momentum:  bool
     scanner_breakout:  bool
     scanner_trendpull: bool
+    scanner_breakdown: bool
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -149,6 +150,7 @@ async def load_config() -> BotConfig:
         scanner_momentum=_b("scanner_momentum",  True),
         scanner_breakout=_b("scanner_breakout",   True),
         scanner_trendpull=_b("scanner_trendpull", True),
+        scanner_breakdown=_b("scanner_breakdown", True),
         api_key=api_key,
         api_secret=api_secret,
     )

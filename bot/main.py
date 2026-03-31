@@ -458,7 +458,7 @@ async def _scan_symbols(cfg) -> None:
 
         # Only run enabled scanners. n_per scales with enabled count so
         # the merged pool always has enough candidates for scanner_top_n.
-        enabled_count = sum([cfg.scanner_momentum, cfg.scanner_breakout, cfg.scanner_trendpull])
+        enabled_count = sum([cfg.scanner_momentum, cfg.scanner_breakout, cfg.scanner_trendpull, cfg.scanner_breakdown])
         if not enabled_count:
             return   # all scanners disabled — nothing to do
 
@@ -470,6 +470,8 @@ async def _scan_symbols(cfg) -> None:
             scanner_calls.append(_rest.get_top_movers_breakout(n=n_per, timeframe=cfg.timeframe))
         if cfg.scanner_trendpull:
             scanner_calls.append(_rest.get_top_movers_trendpull(n=n_per, timeframe=cfg.timeframe))
+        if cfg.scanner_breakdown:
+            scanner_calls.append(_rest.get_top_movers_breakdown(n=n_per, timeframe=cfg.timeframe))
 
         scanner_results = await asyncio.gather(*scanner_calls, return_exceptions=True)
 

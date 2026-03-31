@@ -563,6 +563,7 @@
     #scanner-badge.momentum { display: none; }
     #scanner-badge.breakout  { display: inline; color: #f59e0b; border-color: #f59e0b; background: rgba(245,158,11,.08); }
     #scanner-badge.trendpull { display: inline; color: #8b5cf6; border-color: #8b5cf6; background: rgba(139,92,246,.08); }
+    #scanner-badge.breakdown { display: inline; color: #ec4899; border-color: #ec4899; background: rgba(236,72,153,.08); }
 
     #sig-strength { font-size: 12px; }
     #sig-reason   { font-size: 10px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
@@ -2145,7 +2146,10 @@ function updateSignalPanel(sig) {
   if (scanBadge) {
     const stype = sig.scanner_type || 'momentum';
     scanBadge.className = 'scanner-badge ' + stype;
-    scanBadge.textContent = stype === 'breakout' ? 'BREAKOUT' : stype === 'trendpull' ? 'TREND↗' : '';
+    scanBadge.textContent = stype === 'breakout' ? 'BREAKOUT'
+      : stype === 'trendpull' ? 'TREND↗'
+      : stype === 'breakdown' ? 'BRKDWN↘'
+      : '';
     scanBadge.title = 'Signal weights: ' + stype;
   }
 

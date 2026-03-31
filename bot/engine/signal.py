@@ -98,8 +98,11 @@ class SignalEngine:
         components = self._score_components(flow_summary, ind, prev_ind)
 
         # Select weight profile for the scanner type that found this symbol.
+        # breakdown uses trendpull weights — same EMA-heavy profile works for
+        # both "buy the dip in uptrend" and "sell the rally in downtrend".
         # Falls back to "momentum" (default weights) if type unknown.
-        W = _WEIGHT_PROFILES.get(scanner_type, _WEIGHT_PROFILES["momentum"])
+        effective_type = "trendpull" if scanner_type == "breakdown" else scanner_type
+        W = _WEIGHT_PROFILES.get(effective_type, _WEIGHT_PROFILES["momentum"])
         composite = (
             components["flow"]     * W["flow"]
             + components["trend"]    * W["trend"]
