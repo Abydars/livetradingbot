@@ -60,6 +60,9 @@ class BotConfig:
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
     entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
     scanner_top_n: int
+    scanner_momentum:  bool
+    scanner_breakout:  bool
+    scanner_trendpull: bool
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -143,6 +146,9 @@ async def load_config() -> BotConfig:
         switch_threshold=_f("switch_threshold", 1.1),
         entry_wait_candles=_i("entry_wait_candles", 3),
         scanner_top_n=_i("scanner_top_n", 10),
+        scanner_momentum=_b("scanner_momentum",  True),
+        scanner_breakout=_b("scanner_breakout",   True),
+        scanner_trendpull=_b("scanner_trendpull", True),
         api_key=api_key,
         api_secret=api_secret,
     )
