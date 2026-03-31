@@ -90,7 +90,6 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "discord_webhook":     "",
     "auto_switch":         "1",
     "scan_interval_s":     "5",
-    "adaptive_weights":    "1",     # dynamic mean_rev/RSI weights based on trend strength
     "timeframe":           "1m",
     "trading_active":      "0",
     "switch_threshold":    "1.1",

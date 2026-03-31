@@ -431,7 +431,7 @@ class TradingEngine:
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
-        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators, adaptive_weights=cfg.adaptive_weights)
+        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators)
         self.last_signal = signal
 
         # Broadcast signal to UI
