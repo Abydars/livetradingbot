@@ -823,7 +823,7 @@ class TradingEngine:
             elif signal["direction"] == "NEUTRAL":
                 rescue_mult = 0.5
             else:
-                rescue_mult = 0.3   # opposite — very tight
+                rescue_mult = 0.5   # opposite — tight but with room
             rescue_trail_pct = p["trail_pct"] * rescue_mult
             if direction == "LONG":
                 if price > self._rescue_trail_price:
@@ -1324,9 +1324,16 @@ class TradingEngine:
             if old_tp_pct is not None:
                 self._entry_adaptive["tp_pct"] = old_tp_pct
 
-        # Arm rescue trail from fill price — tracks best price from here
-        self._rescue_mode        = True
-        self._rescue_trail_price = fill_price
+        # Arm rescue trail. Initialize best price with a buffer so the trail
+        # doesn't fire on the very first tick due to spread/slippage.
+        # Buffer = 1 DCA step in favorable direction gives the position
+        # minimum room to breathe before trail can trigger.
+        dca_step_pct = self._entry_adaptive.get("dca_step_pct", 0.5)
+        if direction == "LONG":
+            self._rescue_trail_price = fill_price * (1 - dca_step_pct / 100 * 0.5)
+        else:
+            self._rescue_trail_price = fill_price * (1 + dca_step_pct / 100 * 0.5)
+        self._rescue_mode = True
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
