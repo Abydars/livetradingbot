@@ -534,6 +534,26 @@ class TradingEngine:
             )
             return
 
+        # Flow confirmation gate: real-time order flow must agree with direction.
+        # All other components (EMA, MACD, RSI) are historical — flow is right now.
+        # LONG needs taker buyers dominant (flow > 0).
+        # SHORT needs taker sellers dominant (flow < 0).
+        # Skipped during flow warmup window (after auto-switch, flow window is empty).
+        if not flow_warmup:
+            flow_score = signal["components"].get("flow", 0.0)
+            if direction == "LONG" and flow_score <= 0:
+                logger.debug(
+                    "TradingEngine: LONG blocked — flow negative (%.3f), sellers dominant",
+                    flow_score,
+                )
+                return
+            if direction == "SHORT" and flow_score >= 0:
+                logger.debug(
+                    "TradingEngine: SHORT blocked — flow positive (%.3f), buyers dominant",
+                    flow_score,
+                )
+                return
+
         # Stop cooldown: block re-entry for N seconds after a hard stop
         if self._last_stop_time is not None:
             elapsed = time.time() - self._last_stop_time
