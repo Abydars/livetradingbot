@@ -23,6 +23,30 @@ _W_MEAN_REV = 0.13
 _W_RSI      = 0.10
 _W_STOCH    = 0.07
 
+# Scanner-specific weight profiles.
+# Each scanner type finds symbols in a different market condition — the weights
+# must match what that condition looks like so the signal fires when expected.
+_WEIGHT_PROFILES: Dict[str, Dict[str, float]] = {
+    "momentum": {
+        # Default: balanced across all components
+        "flow": 0.28, "trend": 0.23, "momentum": 0.19,
+        "mean_rev": 0.13, "rsi": 0.10, "stoch": 0.07,
+    },
+    "breakout": {
+        # Price breaking above/below N-candle range — overbought RSI/BB is NORMAL
+        # at a breakout, not a warning. Remove mean_rev and rsi from composite.
+        # Flow and momentum confirmation are critical.
+        "flow": 0.30, "trend": 0.30, "momentum": 0.25,
+        "mean_rev": 0.00, "rsi": 0.00, "stoch": 0.15,
+    },
+    "trendpull": {
+        # Pullback to EMA21 in uptrend — mean_rev and trend are primary signals.
+        # Price near lower BB in an uptrend = ideal entry, not overbought risk.
+        "flow": 0.20, "trend": 0.30, "momentum": 0.15,
+        "mean_rev": 0.20, "rsi": 0.08, "stoch": 0.07,
+    },
+}
+
 # Decision thresholds
 _ENTRY_THRESHOLD = 0.20   # composite must exceed ±0.20 for a directional signal
 _RSI_OB = 75.0            # overbought block for LONG
@@ -46,6 +70,7 @@ class SignalEngine:
         flow_summary: Dict,
         ind: Dict,
         prev_ind: Optional[Dict] = None,
+        scanner_type: str = "momentum",
     ) -> Dict:
         """
         Parameters
@@ -72,13 +97,16 @@ class SignalEngine:
             prev_ind = {}
         components = self._score_components(flow_summary, ind, prev_ind)
 
+        # Select weight profile for the scanner type that found this symbol.
+        # Falls back to "momentum" (default weights) if type unknown.
+        W = _WEIGHT_PROFILES.get(scanner_type, _WEIGHT_PROFILES["momentum"])
         composite = (
-            components["flow"]     * _W_FLOW
-            + components["trend"]    * _W_TREND
-            + components["momentum"] * _W_MOMENTUM
-            + components["mean_rev"] * _W_MEAN_REV
-            + components["rsi"]      * _W_RSI
-            + components["stoch"]    * _W_STOCH
+            components["flow"]     * W["flow"]
+            + components["trend"]    * W["trend"]
+            + components["momentum"] * W["momentum"]
+            + components["mean_rev"] * W["mean_rev"]
+            + components["rsi"]      * W["rsi"]
+            + components["stoch"]    * W["stoch"]
         )
 
         # Preliminary direction from composite
@@ -111,6 +139,7 @@ class SignalEngine:
             "composite":      round(composite, 4),
             "filters_passed": filters_passed,
             "reason":         reason,
+            "scanner_type":   scanner_type,
         }
 
     # ------------------------------------------------------------------
