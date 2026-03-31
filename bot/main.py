@@ -84,6 +84,7 @@ _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow 
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
+_current_scanner_type: str = "momentum"   # scanner type that found active symbol
 _entry_start_candle:   int = 0        # candle close time when we switched to current candidate (0 = not waiting)
 _neutral_since_candle: int = 0        # candle close time when signal went NEUTRAL (0 = directional)
 _ENTRY_HARD_MAX_CANDLES = 10          # hard max candles on one symbol regardless of signal direction
@@ -604,6 +605,13 @@ async def _scan_symbols(cfg) -> None:
         _entry_start_candle   = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
         _neutral_since_candle = 0   # reset neutral clock for the new symbol
         _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
+        global _current_scanner_type
+        # Find scanner type for the new symbol from top movers list
+        new_sym_data = next((t for t in _last_top_movers if t.get("symbol") == new_sym), {})
+        _current_scanner_type = new_sym_data.get("scanner_type", "momentum")
+        if _engine:
+            _engine.set_scanner_type(_current_scanner_type)
+        logger.info("Auto-switch scanner type: %s → %s", new_sym, _current_scanner_type)
         global _last_switch_ts, _htf_bias, _last_htf_fetch
         _last_switch_ts = time.time()
         _htf_bias = "NEUTRAL"
@@ -1616,12 +1624,15 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             cfg2 = await load_config()
             await _executor.prepare_symbol(new_sym, cfg2.leverage)
             # Reset auto-switch cycle — manual override starts fresh on chosen symbol
-            global _entry_start_candle, _neutral_since_candle, _tried_syms, _htf_bias, _last_htf_fetch
+            global _entry_start_candle, _neutral_since_candle, _tried_syms, _htf_bias, _last_htf_fetch, _current_scanner_type
             _entry_start_candle   = 0
             _neutral_since_candle = 0
             _tried_syms.clear()
             _htf_bias        = "NEUTRAL"
             _last_htf_fetch  = 0.0
+            _current_scanner_type = "momentum"   # manual switch: reset to default
+            if _engine:
+                _engine.set_scanner_type("momentum")
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         # Re-apply leverage immediately if it was changed

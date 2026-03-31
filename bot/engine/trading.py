@@ -126,6 +126,7 @@ class TradingEngine:
 
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
+        self._scanner_type: str = "momentum"   # scanner type that found current symbol
         self.last_indicators:  Dict = {}
         self._prev_indicators: Dict = {}   # indicators from the tick before last — used for slope checks
         self.candles: List[Dict] = []
@@ -393,6 +394,10 @@ class TradingEngine:
     # Candle feed
     # ------------------------------------------------------------------
 
+    def set_scanner_type(self, scanner_type: str) -> None:
+        """Set which scanner type found the current symbol — affects signal weights."""
+        self._scanner_type = scanner_type
+
     def update_candles(self, candles: List[Dict]) -> None:
         prev_last_time = self.candles[-1]["time"] if self.candles else 0
         self.candles = candles
@@ -431,7 +436,7 @@ class TradingEngine:
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
         ind = self.last_indicators
         flow_summary = self._flow.summarize()
-        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators)
+        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators, scanner_type=self._scanner_type)
         self.last_signal = signal
 
         # Broadcast signal to UI
