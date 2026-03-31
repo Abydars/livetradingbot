@@ -87,7 +87,12 @@ _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-sym
 _current_scanner_type: str = "momentum"   # scanner type that found active symbol
 _entry_start_candle:   int = 0        # candle close time when we switched to current candidate (0 = not waiting)
 _neutral_since_candle: int = 0        # candle close time when signal went NEUTRAL (0 = directional)
-_ENTRY_HARD_MAX_CANDLES = 10          # hard max candles on one symbol regardless of signal direction
+_ENTRY_HARD_MAX_CANDLES = 6           # hard max candles on one symbol regardless of signal direction
+
+# Cooldown tracking: {symbol: timestamp_of_rescue_trail_exit}
+# Auto-switch skips symbols whose cooldown has not expired.
+_symbol_cooldowns: dict = {}
+_RESCUE_COOLDOWN_S = 20 * 60          # 20 minutes cooldown after rescue_trail exit
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
@@ -129,6 +134,20 @@ async def _do_broadcast(msg: Dict) -> None:
     if msg.get("type") == "session" and msg.get("session") is None:
         try:
             sessions     = await get_sessions(200)
+            # Record cooldown if the most recent session exited via rescue_trail.
+            # This prevents auto-switch from immediately re-trying the same symbol
+            # that just caused a loss.
+            if sessions:
+                last = sessions[0]   # most recent (get_sessions orders DESC)
+                if last.get("exit_reason") == "rescue_trail":
+                    sym = last.get("symbol", "")
+                    if sym:
+                        _symbol_cooldowns[sym] = time.time()
+                        logger.info(
+                            "Auto-switch: cooldown started for %s (rescue_trail exit) — "
+                            "skipping for %.0f minutes",
+                            sym, _RESCUE_COOLDOWN_S / 60,
+                        )
             hedge_trades = await get_all_closed_hedges(200)
             perf         = await get_performance()
             hist_msg = json.dumps({"type": "sessions", "sessions": sessions,
@@ -382,6 +401,55 @@ async def _scanner_loop() -> None:
         await asyncio.sleep(1.0)
 
 
+def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
+    """
+    Re-rank a scanner candidate using a composite quality score.
+
+    Starts from the raw scanner score and applies multipliers:
+
+    HTF alignment bonus (+20%):
+      If the symbol's HTF EMA bias agrees with the scanner's directional bias
+      (both LONG or both SHORT), the signal engine is much more likely to fire
+      an entry. Reward this alignment.
+
+    Scanner type bonus (+15% trendpull, +5% breakout):
+      Trend pullback scanner has the highest alignment with the signal engine's
+      weight profile. Momentum is the baseline. Breakout gets a small bonus
+      because it catches fresh moves early.
+
+    Rescue trail penalty (-30%):
+      If this symbol caused a rescue_trail exit recently (within cooldown window)
+      and the cooldown hasn't fully expired yet, penalise the score so it ranks
+      lower than fresh symbols. The symbol is not removed from candidates here —
+      that happens in the hard filter below — but scoring it lower prevents it
+      from winning threshold comparisons.
+    """
+    base = sym_data.get("_score", 0.0)
+
+    # HTF alignment bonus
+    htf_bias     = sym_data.get("_htf_bias", "")   # "LONG", "SHORT", or ""
+    scanner_bias = sym_data.get("_bias", "")        # "LONG" or "SHORT"
+    if htf_bias and scanner_bias and htf_bias == scanner_bias:
+        base *= 1.20   # HTF and scanner agree → high quality setup
+
+    # Scanner type bonus
+    scanner_type = sym_data.get("_scanner", "momentum")
+    if scanner_type == "trendpull":
+        base *= 1.15   # best signal engine alignment
+    elif scanner_type == "breakout":
+        base *= 1.05   # fresh moves, reasonable alignment
+
+    # Rescue trail penalty (soft — still in candidates but ranked lower)
+    last_rescue = _symbol_cooldowns.get(sym_data.get("symbol", ""), 0.0)
+    if last_rescue > 0:
+        elapsed = now_ts - last_rescue
+        if elapsed < _RESCUE_COOLDOWN_S:
+            remaining_frac = 1 - (elapsed / _RESCUE_COOLDOWN_S)
+            base *= (1 - 0.30 * remaining_frac)   # up to -30% penalty, fades over time
+
+    return base
+
+
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
     global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts, _last_symbol_scan
@@ -461,6 +529,16 @@ async def _scan_symbols(cfg) -> None:
         _last_top_movers = _format_movers(top)
         await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
+        # Re-rank top list by composite switch score so auto-switch uses
+        # a smarter quality metric than raw scanner score alone.
+        now_ts = time.time()
+        for t in top:
+            t["_switch_score"] = _composite_switch_score(t, now_ts)
+        top_by_switch = sorted(top, key=lambda x: x["_switch_score"], reverse=True)
+
+        # Build symbol → full data lookup for O(1) access in auto-switch
+        top_data = {t["symbol"]: t for t in top}
+
         # Auto-switch only when enabled and no open position
         if not cfg.auto_switch or not _trading_active:
             _entry_start_candle   = 0
@@ -474,42 +552,80 @@ async def _scan_symbols(cfg) -> None:
             _tried_syms.clear()
             return
 
-        top_syms = [t["symbol"] for t in top]   # ordered best → worst
+        # Use composite-score ordering for switching decisions.
+        # top_syms_raw = scanner rank, top_syms = composite rank for switching.
+        top_syms_raw = [t["symbol"] for t in top]
+        top_syms     = [t["symbol"] for t in top_by_switch]
 
         # Current candle close time (int seconds) — used for candle-based counting
         cur_candle = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
         tf_secs    = cfg.tf_minutes * 60 if cfg.tf_minutes > 0 else 60
 
-        # If current symbol dropped off the top list entirely, mark it as tried
-        if cfg.symbol not in top_syms:
+        # If current symbol dropped off the scanner list entirely, mark as tried
+        if cfg.symbol not in top_syms_raw:
             _tried_syms.add(cfg.symbol)
 
-        # Build candidate list: top symbols not yet tried, preserving rank order
-        candidates = [s for s in top_syms if s not in _tried_syms]
+        def _is_eligible(sym: str) -> bool:
+            """
+            A candidate is eligible if:
+            1. Not already tried in this cycle.
+            2. Not in active rescue_trail cooldown.
+            3. HTF bias does NOT directly contradict scanner bias.
+               (NEUTRAL htf = always allowed; matching or unknown = allowed)
+            """
+            if sym in _tried_syms:
+                return False
+            # Hard cooldown filter: symbol caused rescue_trail recently
+            last_rescue = _symbol_cooldowns.get(sym, 0.0)
+            if last_rescue > 0 and (now_ts - last_rescue) < _RESCUE_COOLDOWN_S:
+                return False
+            # HTF hard filter: never enter against the higher timeframe trend
+            d = top_data.get(sym, {})
+            htf  = d.get("_htf_bias", "")
+            bias = d.get("_bias", "")
+            if htf and bias:
+                opposites = {"LONG": "SHORT", "SHORT": "LONG"}
+                if htf == opposites.get(bias, ""):
+                    return False   # HTF directly contradicts scanner bias
+            return True
 
-        # All top symbols have been tried with no entry — reset and start over
+        # Build candidate list ordered by composite switch score
+        candidates = [s for s in top_syms if _is_eligible(s)]
+
+        # All eligible candidates exhausted — reset tried set and retry.
+        # Cooldown filter is NOT reset (symbols still cooling down stay out).
         if not candidates:
-            logger.info("Auto-switch: all top symbols tried with no entry — resetting cycle")
+            logger.info(
+                "Auto-switch: all eligible candidates tried — resetting cycle "
+                "(cooldowns still active: %s)",
+                [s for s in _symbol_cooldowns
+                 if now_ts - _symbol_cooldowns[s] < _RESCUE_COOLDOWN_S]
+            )
             _tried_syms.clear()
-            candidates = top_syms[:]
+            candidates = [s for s in top_syms if _is_eligible(s)]
+            if not candidates:
+                return   # everything is cooling down — nothing to switch to
 
         # Current symbol is still an active candidate — apply candle-based wait
         if cfg.symbol in candidates:
             next_candidate = next((s for s in candidates if s != cfg.symbol), None)
 
-            # Check if #1 symbol is switch_threshold× better — immediate switch,
+            # Check if #1 eligible symbol is switch_threshold× better — immediate switch,
             # bypasses candle timer entirely.
-            top_score = top[0]["_score"]
-            cur_score = next((t["_score"] for t in top if t["symbol"] == cfg.symbol), 0.0)
-            top_sym   = top[0]["symbol"]
+            # Use composite switch score (not raw scanner score) for threshold comparison.
+            # This means HTF-aligned trendpull symbols can trigger immediate switch
+            # even if their raw scanner score is lower than the current symbol.
+            top_candidate = next((t for t in top_by_switch if _is_eligible(t["symbol"])), None)
+            top_sym       = top_candidate["symbol"] if top_candidate else None
+            top_score     = top_candidate["_switch_score"] if top_candidate else 0.0
+            cur_score     = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
 
-            if (top_sym != cfg.symbol
-                    and top_sym not in _tried_syms
+            if (top_sym and top_sym != cfg.symbol
                     and cur_score > 0
                     and top_score >= cur_score * cfg.switch_threshold):
                 # Immediate switch — do not touch candle timer state
                 logger.info(
-                    "Auto-switch: %s (score %.1f) is %.0f%% better than %s (score %.1f)"
+                    "Auto-switch: %s (quality %.2f) is %.0f%% better than %s (quality %.2f)"
                     " — switching immediately (threshold %.2f×)",
                     top_sym, top_score, (top_score / cur_score - 1) * 100,
                     cfg.symbol, cur_score, cfg.switch_threshold,
