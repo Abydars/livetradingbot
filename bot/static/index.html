@@ -1741,8 +1741,14 @@ function updateSymSidebar(movers) {
       ? `<span class="sym-htf ${htfB.toLowerCase()}">HTF ${htfB}</span>`
       : '';
     const scanType = m.scanner_type || '';
-    const scanBadge = scanType && scanType !== 'momentum'
-      ? `<span class="sym-htf" style="background:rgba(139,92,246,.2);color:#a78bfa">${scanType}</span>`
+    const scanColors = {
+      momentum:  'rgba(88,166,255,.2);color:#58a6ff',
+      breakout:  'rgba(245,158,11,.2);color:#f59e0b',
+      trendpull: 'rgba(139,92,246,.2);color:#a78bfa',
+    };
+    const scanLabel = { momentum: 'MOM', breakout: 'BRK', trendpull: 'PULL' };
+    const scanBadge = scanType
+      ? `<span class="sym-htf" style="background:${scanColors[scanType] || scanColors.momentum}">${scanLabel[scanType] || scanType}</span>`
       : '';
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
