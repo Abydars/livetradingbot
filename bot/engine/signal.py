@@ -27,8 +27,8 @@ _W_STOCH    = 0.07
 _ENTRY_THRESHOLD = 0.25   # composite must exceed ±0.25 for a directional signal
 _RSI_OB = 75.0            # overbought block for LONG
 _RSI_OS = 25.0            # oversold block for SHORT
-_RSI_EXTREME_OB = 75.0    # above this = mean-reversion SHORT allowed
-_RSI_EXTREME_OS = 25.0    # below this = mean-reversion LONG allowed
+_RSI_EXTREME_OB = 68.0    # above this = mean-reversion SHORT allowed
+_RSI_EXTREME_OS = 32.0    # below this = mean-reversion LONG allowed
 
 
 def _clamp(v: float, lo: float = -1.0, hi: float = 1.0) -> float:
