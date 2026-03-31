@@ -24,7 +24,7 @@ _W_RSI      = 0.10
 _W_STOCH    = 0.07
 
 # Decision thresholds
-_ENTRY_THRESHOLD = 0.25   # composite must exceed ±0.25 for a directional signal
+_ENTRY_THRESHOLD = 0.20   # composite must exceed ±0.20 for a directional signal
 _RSI_OB = 75.0            # overbought block for LONG
 _RSI_OS = 25.0            # oversold block for SHORT
 _RSI_EXTREME_OB = 75.0    # above this = mean-reversion SHORT allowed
@@ -46,7 +46,6 @@ class SignalEngine:
         flow_summary: Dict,
         ind: Dict,
         prev_ind: Optional[Dict] = None,
-        adaptive_weights: bool = True,
     ) -> Dict:
         """
         Parameters
@@ -73,26 +72,12 @@ class SignalEngine:
             prev_ind = {}
         components = self._score_components(flow_summary, ind, prev_ind)
 
-        if adaptive_weights:
-            # In strong trends, reduce mean_rev and RSI weight so they don't
-            # cancel trend/momentum signals. Ranging markets: weights unchanged.
-            # Trending markets: trend + momentum dominate naturally.
-            trend_str   = abs(components["trend"])           # 0 = flat, 1 = max trend
-            mr_w        = max(_W_MEAN_REV * (1 - trend_str * 0.70), 0.04)
-            rsi_w       = max(_W_RSI      * (1 - trend_str * 0.60), 0.04)
-            freed       = (_W_MEAN_REV - mr_w) + (_W_RSI - rsi_w)
-            flow_w      = _W_FLOW     + freed * 0.40
-            momentum_w  = _W_MOMENTUM + freed * 0.60
-        else:
-            mr_w = _W_MEAN_REV; rsi_w = _W_RSI
-            flow_w = _W_FLOW;   momentum_w = _W_MOMENTUM
-
         composite = (
-            components["flow"]     * flow_w
+            components["flow"]     * _W_FLOW
             + components["trend"]    * _W_TREND
-            + components["momentum"] * momentum_w
-            + components["mean_rev"] * mr_w
-            + components["rsi"]      * rsi_w
+            + components["momentum"] * _W_MOMENTUM
+            + components["mean_rev"] * _W_MEAN_REV
+            + components["rsi"]      * _W_RSI
             + components["stoch"]    * _W_STOCH
         )
 
@@ -213,18 +198,6 @@ class SignalEngine:
         norm    = (hist / ema50) / max(atr_pct, 1e-6)
         score   = _clamp(norm)
 
-        # Slope check using previous tick histogram
-        prev_hist = (prev_ind.get("macd") or {}).get("hist")
-        if prev_hist is not None and abs(prev_hist) > 1e-12:
-            same_sign    = (hist > 0) == (prev_hist > 0)
-            accelerating = same_sign and abs(hist) > abs(prev_hist)
-            if not same_sign:
-                score *= 0.60   # histogram reversed sign — momentum flipping
-            elif accelerating:
-                score = _clamp(score * 1.20)   # momentum building
-            else:
-                score *= 0.80   # momentum fading
-
         return score
 
     def _score_mean_reversion(self, ind: Dict) -> float:
@@ -246,44 +219,37 @@ class SignalEngine:
 
     def _score_rsi(self, ind: Dict, prev_ind: Dict) -> float:
         """
-        Smooth monotonic RSI scoring from -1 to +1, with slope confirmation.
+        Zone-based RSI scoring aligned with _apply_filters():
+          > 75        → -0.5  (filter blocks LONG here anyway)
+          70–75       → -0.1 to -0.5  approaching block
+          60–70       → +0.5 to 0.0   momentum zone, confirms trend (not overbought)
+          40–60       → linear -0.5 to +0.5  neutral confirmation
+          30–40       → 0.0 to -0.5   bearish momentum weakening
+          25–30       → +0.1 to +0.5  approaching oversold block
+          < 25        → +0.5  (filter blocks SHORT here anyway)
 
-        Zone scoring (unchanged):
-          RSI < 30  → strongly oversold → +0.8 to +1.0
-          RSI 30–40 → mildly oversold   → +0.2 to +0.8
-          RSI 40–60 → neutral           → -0.2 to +0.2
-          RSI 60–70 → mildly overbought → -0.2 to -0.8
-          RSI > 70  → strongly overbought → -0.8 to -1.0
-
-        Slope multiplier:
-          RSI rising  + positive zone score → 1.15× (recovering oversold — confirmed)
-          RSI falling + positive zone score → 0.85× (entering oversold — wait)
-          RSI falling + negative zone score → 1.15× (confirmed overbought selling)
-          RSI rising  + negative zone score → 0.85× (overbought bouncing — wait)
+        Key design: RSI 60-70 gives POSITIVE score — RSI at 65 in an uptrend
+        is normal momentum, not overbought. Original monotonic scorer
+        gave RSI 65 = -0.62 which actively fought trend signals.
         """
         rsi_val = ind.get("rsi")
         if rsi_val is None:
             return 0.0
 
-        if rsi_val <= 30:
-            score = 0.8 + 0.2 * (30 - rsi_val) / 30.0
-        elif rsi_val <= 40:
-            score = 0.2 + 0.6 * (40 - rsi_val) / 10.0
-        elif rsi_val <= 60:
-            score = 0.2 - 0.4 * (rsi_val - 40) / 20.0
-        elif rsi_val <= 70:
-            score = -0.2 - 0.6 * (rsi_val - 60) / 10.0
+        if rsi_val > 75:
+            score = -0.5
+        elif rsi_val >= 70:
+            score = -0.1 - 0.4 * (rsi_val - 70) / 5.0
+        elif rsi_val >= 60:
+            score = 0.5 * (70 - rsi_val) / 10.0
+        elif rsi_val >= 40:
+            score = (rsi_val - 50.0) / 20.0
+        elif rsi_val >= 30:
+            score = -0.5 * (40 - rsi_val) / 10.0
+        elif rsi_val >= 25:
+            score = 0.1 + 0.4 * (30 - rsi_val) / 5.0
         else:
-            score = -0.8 - 0.2 * (rsi_val - 70) / 30.0
-
-        # Slope confirmation: does RSI direction match the zone signal?
-        prev_rsi = prev_ind.get("rsi")
-        if prev_rsi is not None:
-            rsi_rising = rsi_val > prev_rsi
-            if (score > 0 and rsi_rising) or (score < 0 and not rsi_rising):
-                score = _clamp(score * 1.15)   # direction confirms zone
-            else:
-                score *= 0.85                  # direction contradicts zone — reduce
+            score = 0.5
 
         return _clamp(score)
 
