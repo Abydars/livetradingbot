@@ -38,6 +38,7 @@ class BotConfig:
     partial_tp_ratio: float
     taker_fee_pct: float
     paper_slippage_pct: float
+    adaptive_weights: bool
     strength_sizing: bool
     strength_size_min: float
     stoch_signal: bool
@@ -131,6 +132,7 @@ async def load_config() -> BotConfig:
         partial_tp_ratio=_f("partial_tp_ratio", 0.5),
         taker_fee_pct=_f("taker_fee_pct", 0.04),
         paper_slippage_pct=_f("paper_slippage_pct", 0.05),
+        adaptive_weights=_b("adaptive_weights", True),
         strength_sizing=_b("strength_sizing", True),
         strength_size_min=_f("strength_size_min", 0.5),
         stoch_signal=_b("stoch_signal", True),

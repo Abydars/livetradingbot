@@ -46,6 +46,7 @@ class SignalEngine:
         flow_summary: Dict,
         ind: Dict,
         prev_ind: Optional[Dict] = None,
+        adaptive_weights: bool = True,
     ) -> Dict:
         """
         Parameters
@@ -71,12 +72,27 @@ class SignalEngine:
         if prev_ind is None:
             prev_ind = {}
         components = self._score_components(flow_summary, ind, prev_ind)
+
+        if adaptive_weights:
+            # In strong trends, reduce mean_rev and RSI weight so they don't
+            # cancel trend/momentum signals. Ranging markets: weights unchanged.
+            # Trending markets: trend + momentum dominate naturally.
+            trend_str   = abs(components["trend"])           # 0 = flat, 1 = max trend
+            mr_w        = max(_W_MEAN_REV * (1 - trend_str * 0.70), 0.04)
+            rsi_w       = max(_W_RSI      * (1 - trend_str * 0.60), 0.04)
+            freed       = (_W_MEAN_REV - mr_w) + (_W_RSI - rsi_w)
+            flow_w      = _W_FLOW     + freed * 0.40
+            momentum_w  = _W_MOMENTUM + freed * 0.60
+        else:
+            mr_w = _W_MEAN_REV; rsi_w = _W_RSI
+            flow_w = _W_FLOW;   momentum_w = _W_MOMENTUM
+
         composite = (
-            components["flow"]     * _W_FLOW
+            components["flow"]     * flow_w
             + components["trend"]    * _W_TREND
-            + components["momentum"] * _W_MOMENTUM
-            + components["mean_rev"] * _W_MEAN_REV
-            + components["rsi"]      * _W_RSI
+            + components["momentum"] * momentum_w
+            + components["mean_rev"] * mr_w
+            + components["rsi"]      * rsi_w
             + components["stoch"]    * _W_STOCH
         )
 
