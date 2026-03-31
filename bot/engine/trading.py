@@ -464,11 +464,13 @@ class TradingEngine:
 
         # During flow warmup window after auto-switch, the flow component (28% weight)
         # is zero because the WebSocket just subscribed and has no trade history yet.
-        # Re-normalise the composite using only the 5 non-flow components so a strong
-        # technical signal is not blocked by an artificially empty flow window.
-        if flow_warmup and direction != "NEUTRAL":
-            comps      = signal["components"]
-            non_flow_w = 0.72   # 1.0 - flow weight (0.28)
+        # BUG FIX: previous code checked `direction != "NEUTRAL"` first, but flow=0
+        # is exactly what causes direction to become NEUTRAL (composite below threshold).
+        # Fix: always recompute from non-flow components during warmup, determine
+        # direction from adj_composite directly — do not rely on signal["direction"].
+        if flow_warmup:
+            comps         = signal["components"]
+            non_flow_w    = 0.72   # 1.0 - flow weight (0.28)
             adj_composite = (
                 comps.get("trend",    0.0) * 0.23 +
                 comps.get("momentum", 0.0) * 0.19 +
@@ -476,15 +478,18 @@ class TradingEngine:
                 comps.get("rsi",      0.0) * 0.10 +
                 comps.get("stoch",    0.0) * 0.07
             ) / non_flow_w
+
             if abs(adj_composite) >= 0.25:
+                # Non-flow technicals are directional — derive direction and strength
+                direction    = "LONG" if adj_composite > 0 else "SHORT"
                 adj_strength = min((abs(adj_composite) - 0.25) / 0.75, 1.0)
                 logger.info(
-                    "TradingEngine: flow warmup — adj composite=%.3f strength %.2f→%.2f",
-                    adj_composite, strength, adj_strength,
+                    "TradingEngine: flow warmup — adj composite=%.3f dir=%s strength=%.2f",
+                    adj_composite, direction, adj_strength,
                 )
                 strength = adj_strength
             else:
-                # Non-flow components alone are not directional enough — skip
+                # Non-flow components not directional enough — skip entry
                 return
 
         if direction == "NEUTRAL":
