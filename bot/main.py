@@ -390,12 +390,18 @@ async def _scan_symbols(cfg) -> None:
 
         # Run all enabled scanner types in parallel — no extra delay vs single scanner
         n_per = max(cfg.scanner_top_n // 3 + 1, 5)
-        scanner_results = await asyncio.gather(
-            _rest.get_top_movers(n=n_per, timeframe=cfg.timeframe),
-            _rest.get_top_movers_breakout(n=n_per, timeframe=cfg.timeframe),
-            _rest.get_top_movers_trendpull(n=n_per, timeframe=cfg.timeframe),
-            return_exceptions=True,
-        )
+        scanner_calls = []
+        if cfg.scanner_momentum:
+            scanner_calls.append(_rest.get_top_movers(n=n_per, timeframe=cfg.timeframe))
+        if cfg.scanner_breakout:
+            scanner_calls.append(_rest.get_top_movers_breakout(n=n_per, timeframe=cfg.timeframe))
+        if cfg.scanner_trendpull:
+            scanner_calls.append(_rest.get_top_movers_trendpull(n=n_per, timeframe=cfg.timeframe))
+
+        if not scanner_calls:
+            return   # all scanners disabled
+
+        scanner_results = await asyncio.gather(*scanner_calls, return_exceptions=True)
 
         # Merge results: keep best score per symbol, preserve scanner type
         seen: dict = {}
