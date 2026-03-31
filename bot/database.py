@@ -95,9 +95,9 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "switch_threshold":    "1.1",
     "entry_wait_candles":  "3",     # candles to wait (NEUTRAL) before trying next symbol
     "scanner_top_n":       "10",   # how many symbols to show in the scanner sidebar
-    "scanner_momentum":    "1",   # enable momentum scanner
-    "scanner_breakout":    "1",   # enable breakout scanner
-    "scanner_trendpull":   "1",   # enable trend pullback scanner
+    "scanner_momentum":    "1",   # enable momentum scanner (vol surge + acceleration)
+    "scanner_breakout":    "1",   # enable breakout scanner (BB squeeze + N-candle high/low)
+    "scanner_trendpull":   "1",   # enable trend pullback scanner (EMA bounce setups)
     "cooldown_after_stop_s": "300",
     "max_daily_loss_usdt":   "0",
     "dca_multiplier":        "1.0",
