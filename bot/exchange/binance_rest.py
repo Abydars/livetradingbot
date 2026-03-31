@@ -778,10 +778,11 @@ class BinanceRestClient:
             return []
 
         import math
+        usdt_perps = await self.get_usdt_perp_symbols()
         candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT") or any(x in sym for x in ["_", "USDC", "BUSD"]):
+            if not sym.endswith("USDT") or sym not in usdt_perps:
                 continue
             try:
                 pcp = float(t.get("priceChangePercent", 0))
@@ -925,10 +926,11 @@ class BinanceRestClient:
             return []
 
         import math
+        usdt_perps = await self.get_usdt_perp_symbols()
         candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT") or any(x in sym for x in ["_", "USDC", "BUSD"]):
+            if not sym.endswith("USDT") or sym not in usdt_perps:
                 continue
             try:
                 pcp = float(t.get("priceChangePercent", 0))
