@@ -1590,8 +1590,7 @@ function dispatch(msg) {
       if (ema50S)   { ema50S.setData([]);   }
       if (bbUp)     { bbUp.setData([]);     }
       if (bbDn)     { bbDn.setData([]);     }
-      document.getElementById('sym-loader-text').textContent =
-        `Loading ${msg.symbol} data…`;
+      showSymLoader(msg.symbol);
       break;
     }
 
