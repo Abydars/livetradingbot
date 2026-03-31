@@ -524,6 +524,13 @@ class BinanceRestClient:
     # Top movers for auto-switch
     # ------------------------------------------------------------------
 
+    async def _fetch_24h_tickers(self) -> List[Dict]:
+        """Fetch all USDT-M 24h tickers (shared by all scanner types)."""
+        await self._market_limiter.acquire()
+        resp = await self._client.get("/fapi/v1/ticker/24hr")
+        resp.raise_for_status()
+        return resp.json()
+
     async def get_top_movers(
         self,
         n: int = 5,
@@ -559,7 +566,7 @@ class BinanceRestClient:
         import math
 
         # ── Phase 1: ticker quick-filter ───────────────────────────────
-        tickers   = await self.get_ticker_24hr()
+        tickers   = await self._fetch_24h_tickers()
         usdt_perps = {
             s for s, info in self.symbol_info.items()
             if info.status == "TRADING"
@@ -608,6 +615,7 @@ class BinanceRestClient:
                 "_vol_surge": 1.0,
                 "_momentum":  abs(pcp),
                 "_atr_pct":   vol_pct * 100,
+                "_scanner":   "momentum",
             })
 
         # Keep top 15 for phase 2 — Phase 1 already filters well enough.
@@ -748,3 +756,310 @@ class BinanceRestClient:
         # Re-sort by final score and return top n
         phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
         return phase2_pool[:n]
+
+    async def get_top_movers_breakout(
+        self,
+        n: int = 5,
+        min_quote_volume: float = 20_000_000.0,
+        timeframe: str = "1m",
+    ) -> List[Dict]:
+        """
+        Breakout scanner — finds symbols showing compression then expansion.
+        Phase 1: same ticker filter as get_top_movers.
+        Phase 2 score:
+          bb_squeeze   (0.35) — BB width shrinking then expanding (compression → breakout)
+          vol_confirm  (0.30) — volume spike on breakout candle vs baseline
+          atr_expand   (0.20) — ATR increasing (volatility expanding, confirms breakout)
+          price_break  (0.15) — price outside N-candle high/low
+        """
+        # ── Phase 1: same ticker filter ──
+        tickers = await self._fetch_24h_tickers()
+        if not tickers:
+            return []
+
+        import math
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT") or any(x in sym for x in ["_", "USDC", "BUSD"]):
+                continue
+            try:
+                pcp = float(t.get("priceChangePercent", 0))
+                qv  = float(t.get("quoteVolume", 0))
+                hp  = float(t.get("highPrice", 0))
+                lp  = float(t.get("lowPrice", 0))
+                cp  = float(t.get("lastPrice", 0))
+            except (ValueError, TypeError):
+                continue
+            if qv < min_quote_volume or cp <= 0:
+                continue
+            vol_pct = (hp - lp) / cp if cp > 0 else 0
+            range_pos  = (cp - lp) / (hp - lp) if (hp - lp) > 0 else 0.5
+            trend_fresh = range_pos if pcp >= 0 else (1 - range_pos)
+            p1_score = (
+                abs(pcp)
+                * vol_pct
+                * math.log10(max(qv, 1))
+                * (0.4 + trend_fresh * 0.6)
+            )
+            candidates.append({**t, "_p1_score": p1_score, "_score": p1_score,
+                                "_bias": "LONG" if pcp >= 0 else "SHORT",
+                                "_scanner": "breakout"})
+
+        candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
+        phase2_pool = candidates[:15]
+
+        # ── Phase 2: breakout-specific scoring ──
+        pool_syms  = [c["symbol"] for c in phase2_pool]
+        klines_map = await self.get_klines_batch(pool_syms, interval=timeframe, limit=25)
+
+        for c in phase2_pool:
+            sym  = c["symbol"]
+            data = klines_map.get(sym)
+            if not data or len(data) < 15:
+                continue
+
+            highs  = [float(k[2]) for k in data]
+            lows   = [float(k[3]) for k in data]
+            closes = [float(k[4]) for k in data]
+            vols   = [float(k[5]) for k in data]
+            price  = closes[-1]
+            if price <= 0:
+                continue
+
+            atr     = _scan_atr(highs, lows, closes, 14)
+            atr_pct = (atr / price * 100) if price > 0 else 0.0
+            if atr_pct < 0.3:
+                continue
+            rsi_val = _scan_rsi(closes, 14)
+            if rsi_val > 80 or rsi_val < 20:
+                rsi_penalty = 0.50
+            elif rsi_val > 70 or rsi_val < 30:
+                rsi_penalty = 0.80
+            else:
+                rsi_penalty = 1.0
+
+            # BB squeeze: compare current BB width to recent average
+            from statistics import mean as _mean, stdev as _stdev
+            bb_width_series = []
+            for i in range(5, len(closes)):
+                w = closes[i-5:i]
+                if len(w) >= 5:
+                    try:
+                        sd = _stdev(w)
+                        mid = _mean(w)
+                        bb_width_series.append(sd * 4 / mid if mid > 0 else 0)
+                    except Exception:
+                        pass
+            current_bb_w = bb_width_series[-1] if bb_width_series else 0
+            avg_bb_w     = _mean(bb_width_series[-10:]) if len(bb_width_series) >= 10 else current_bb_w
+            # Squeeze: width was below avg, now expanding
+            squeeze_score = min((current_bb_w / avg_bb_w) if avg_bb_w > 0 else 1.0, 3.0) / 3.0
+
+            # Volume confirmation on last candle
+            baseline_vol  = _mean(vols[-11:-1]) if len(vols) >= 11 else (sum(vols)/len(vols))
+            vol_spike     = min(vols[-1] / baseline_vol if baseline_vol > 0 else 1.0, 5.0) / 5.0
+
+            # ATR expansion (current ATR vs recent)
+            # Use simple proxy: last candle range vs ATR
+            last_range = highs[-1] - lows[-1]
+            atr_expand = min(last_range / atr if atr > 0 else 1.0, 3.0) / 3.0
+
+            # Price breaking N-candle high/low (last 20 candles)
+            lookback = min(20, len(closes) - 1)
+            recent_high = max(highs[-lookback-1:-1])
+            recent_low  = min(lows[-lookback-1:-1])
+            if closes[-1] > recent_high:
+                price_break = 1.0
+                bias = "LONG"
+            elif closes[-1] < recent_low:
+                price_break = 1.0
+                bias = "SHORT"
+            else:
+                # Proximity to breakout
+                dist_up   = (recent_high - closes[-1]) / atr if atr > 0 else 1.0
+                dist_down = (closes[-1] - recent_low)  / atr if atr > 0 else 1.0
+                if dist_up < dist_down:
+                    price_break = max(0, 1 - dist_up / 2)
+                    bias = "LONG"
+                else:
+                    price_break = max(0, 1 - dist_down / 2)
+                    bias = "SHORT"
+
+            base_score  = (
+                squeeze_score * 0.35
+                + vol_spike   * 0.30
+                + atr_expand  * 0.20
+                + price_break * 0.15
+            )
+            final_score = base_score * rsi_penalty
+
+            c["_score"]     = final_score
+            c["_bias"]      = bias
+            c["_vol_surge"] = round(vols[-1] / (baseline_vol or 1), 2)
+            c["_momentum"]  = round((closes[-1] - closes[-2]) / closes[-2] * 100, 3) if len(closes) >= 2 else 0.0
+            c["_atr_pct"]   = round(atr_pct, 3)
+            c["_scanner"]   = "breakout"
+
+        phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
+        return phase2_pool[:n]
+
+    async def get_top_movers_trendpull(
+        self,
+        n: int = 5,
+        min_quote_volume: float = 20_000_000.0,
+        timeframe: str = "1m",
+    ) -> List[Dict]:
+        """
+        Trend pullback scanner — finds symbols in uptrend that pulled back to EMA.
+        Phase 1: same ticker filter.
+        Phase 2 score:
+          ema_align    (0.35) — EMA9 > EMA21 > EMA50 (clean trend structure)
+          pullback_pct (0.30) — price pulled back close to EMA21 (0.5-2× ATR from EMA21)
+          bounce       (0.25) — last 2-3 candles turning back in trend direction
+          trend_slope  (0.10) — EMA21 slope (trend strengthening)
+        """
+        # ── Phase 1: same ticker filter ──
+        tickers = await self._fetch_24h_tickers()
+        if not tickers:
+            return []
+
+        import math
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT") or any(x in sym for x in ["_", "USDC", "BUSD"]):
+                continue
+            try:
+                pcp = float(t.get("priceChangePercent", 0))
+                qv  = float(t.get("quoteVolume", 0))
+                hp  = float(t.get("highPrice", 0))
+                lp  = float(t.get("lowPrice", 0))
+                cp  = float(t.get("lastPrice", 0))
+            except (ValueError, TypeError):
+                continue
+            if qv < min_quote_volume or cp <= 0:
+                continue
+            vol_pct    = (hp - lp) / cp if cp > 0 else 0
+            range_pos  = (cp - lp) / (hp - lp) if (hp - lp) > 0 else 0.5
+            trend_fresh = range_pos if pcp >= 0 else (1 - range_pos)
+            p1_score = (
+                abs(pcp)
+                * vol_pct
+                * math.log10(max(qv, 1))
+                * (0.4 + trend_fresh * 0.6)
+            )
+            candidates.append({**t, "_p1_score": p1_score, "_score": p1_score,
+                                "_bias": "LONG" if pcp >= 0 else "SHORT",
+                                "_scanner": "trendpull"})
+
+        candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
+        phase2_pool = candidates[:15]
+
+        # ── Phase 2: trend pullback scoring ──
+        pool_syms  = [c["symbol"] for c in phase2_pool]
+        klines_map = await self.get_klines_batch(pool_syms, interval=timeframe, limit=120)
+
+        for c in phase2_pool:
+            sym  = c["symbol"]
+            data = klines_map.get(sym)
+            if not data or len(data) < 55:
+                continue
+
+            highs  = [float(k[2]) for k in data]
+            lows   = [float(k[3]) for k in data]
+            closes = [float(k[4]) for k in data]
+            price  = closes[-1]
+            if price <= 0:
+                continue
+
+            atr     = _scan_atr(highs, lows, closes, 14)
+            atr_pct = (atr / price * 100) if price > 0 else 0.0
+            if atr_pct < 0.3:
+                continue
+
+            rsi_val = _scan_rsi(closes, 14)
+            if rsi_val > 80 or rsi_val < 20:
+                rsi_penalty = 0.50
+            elif rsi_val > 70 or rsi_val < 30:
+                rsi_penalty = 0.80
+            else:
+                rsi_penalty = 1.0
+
+            ema9  = _scan_ema(closes, 9)
+            ema21 = _scan_ema(closes, 21)
+            ema50 = _scan_ema(closes, 50)
+
+            # EMA alignment score
+            if ema9 > ema21 > ema50:
+                ema_align = 1.0
+                bias = "LONG"
+            elif ema9 < ema21 < ema50:
+                ema_align = 1.0
+                bias = "SHORT"
+            elif (ema21 > ema50 and ema9 > ema50) or (ema21 < ema50 and ema9 < ema50):
+                ema_align = 0.5
+                bias = "LONG" if ema21 > ema50 else "SHORT"
+            else:
+                ema_align = 0.0
+                bias = c["_bias"]
+
+            if ema_align == 0.0:
+                c["_score"] = 0.0
+                continue
+
+            # Pullback depth: price should be near EMA21 (0.3 to 2.0 × ATR away)
+            dist_from_ema21 = abs(price - ema21)
+            if atr > 0:
+                dist_atrs = dist_from_ema21 / atr
+                # Ideal pullback: 0.3-1.5 ATR from EMA21
+                if 0.3 <= dist_atrs <= 1.5:
+                    pullback_score = 1.0 - abs(dist_atrs - 0.9) / 0.9
+                    pullback_score = max(pullback_score, 0.1)
+                elif dist_atrs < 0.3:
+                    pullback_score = 0.4  # at EMA21 — ok but not ideal
+                else:
+                    pullback_score = max(0, 1 - (dist_atrs - 1.5) / 1.5)  # fades as distance grows
+            else:
+                pullback_score = 0.0
+
+            # Price should be on correct side approaching EMA21
+            approaching_ema = (bias == "LONG" and price < ema9 and price > ema21 * 0.99) or \
+                              (bias == "SHORT" and price > ema9 and price < ema21 * 1.01)
+            if not approaching_ema:
+                pullback_score *= 0.5
+
+            # Bounce: last 3 candles turning back in trend direction
+            if len(closes) >= 4:
+                if bias == "LONG":
+                    bounce = 1.0 if (closes[-1] > closes[-2] > closes[-3]) else \
+                             0.5 if closes[-1] > closes[-2] else 0.0
+                else:
+                    bounce = 1.0 if (closes[-1] < closes[-2] < closes[-3]) else \
+                             0.5 if closes[-1] < closes[-2] else 0.0
+            else:
+                bounce = 0.0
+
+            # Trend slope: EMA21 now vs EMA21 10 candles ago
+            ema21_old = _scan_ema(closes[:-10], 21) if len(closes) > 30 else ema21
+            slope_pct = (ema21 - ema21_old) / ema21_old if ema21_old > 0 else 0
+            trend_slope = min(abs(slope_pct) / (atr_pct / 100) if atr_pct > 0 else 0, 1.0)
+
+            base_score  = (
+                ema_align     * 0.35
+                + pullback_score * 0.30
+                + bounce         * 0.25
+                + trend_slope    * 0.10
+            )
+            final_score = base_score * rsi_penalty
+
+            c["_score"]     = final_score
+            c["_bias"]      = bias
+            c["_vol_surge"] = 1.0
+            c["_momentum"]  = round((closes[-1] - closes[-6]) / closes[-6] * 100, 3) if len(closes) >= 6 else 0.0
+            c["_atr_pct"]   = round(atr_pct, 3)
+            c["_scanner"]   = "trendpull"
+
+        phase2_pool.sort(key=lambda x: x["_score"], reverse=True)
+        return phase2_pool[:n]
+

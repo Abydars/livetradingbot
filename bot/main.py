@@ -76,6 +76,7 @@ _clients: Set[WebSocket] = set()
 _last_price: float = 0.0
 _last_candles_fetch: float = 0.0
 _last_symbol_scan: float = 0.0
+_force_scan: bool = False   # set True to trigger scanner immediately (e.g. after trade close)
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _trading_active: bool = False          # persisted in config.trading_active
@@ -207,7 +208,7 @@ async def _sync_position_rest(cfg) -> None:
 
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_symbol_scan, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch
+    global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch
     cfg = await load_config()
 
     while True:
@@ -298,17 +299,13 @@ async def _ticker_loop() -> None:
 
                 await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
-            # Detect trade close → trigger immediate symbol scan (auto_switch only)
+            # Detect trade close → signal scanner to run immediately
             cur_session_open = _engine._session is not None
             if _prev_session_open and not cur_session_open and cfg.auto_switch:
                 logger.info("Trade closed — triggering immediate symbol scan")
-                _last_symbol_scan = 0.0
+                global _force_scan
+                _force_scan = True
             _prev_session_open = cur_session_open
-
-            # Symbol scan — always runs for sidebar; auto-switch is conditional
-            if now - _last_symbol_scan >= cfg.scan_interval_s:
-                _last_symbol_scan = now
-                await _scan_symbols(cfg)
 
             # REST position sync — catch external closes missed by user data stream
             if _engine._session and now - _last_position_check >= _POSITION_CHECK_S:
@@ -353,16 +350,64 @@ def _format_movers(top: list) -> list:
             "vol_surge": t.get("_vol_surge", 1.0),
             "momentum":  t.get("_momentum", 0.0),
             "atr_pct":   t.get("_atr_pct", 0.0),
-            "htf_bias":  t.get("_htf_bias", ""),
+            "htf_bias":    t.get("_htf_bias", ""),
+            "scanner_type": t.get("_scanner", "momentum"),
         })
     return out
 
 
+async def _scanner_loop() -> None:
+    """
+    Background scanner task — runs independently from _ticker_loop.
+    Scanner delay never blocks entry/exit decisions.
+    All three scanner types run in parallel via asyncio.gather.
+    """
+    global _force_scan
+    while True:
+        try:
+            cfg = await load_config()
+            now = time.time()
+
+            should_scan = _force_scan or (now - _last_symbol_scan >= cfg.scan_interval_s)
+            if should_scan:
+                _force_scan = False
+                await _scan_symbols(cfg)
+
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("_scanner_loop error: %s", exc)
+
+        await asyncio.sleep(1.0)
+
+
 async def _scan_symbols(cfg) -> None:
     """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts
+    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts, _last_symbol_scan
     try:
-        top = await _rest.get_top_movers(n=cfg.scanner_top_n, timeframe=cfg.timeframe)
+        _last_symbol_scan = time.time()
+
+        # Run all enabled scanner types in parallel — no extra delay vs single scanner
+        n_per = max(cfg.scanner_top_n // 3 + 1, 5)
+        scanner_results = await asyncio.gather(
+            _rest.get_top_movers(n=n_per, timeframe=cfg.timeframe),
+            _rest.get_top_movers_breakout(n=n_per, timeframe=cfg.timeframe),
+            _rest.get_top_movers_trendpull(n=n_per, timeframe=cfg.timeframe),
+            return_exceptions=True,
+        )
+
+        # Merge results: keep best score per symbol, preserve scanner type
+        seen: dict = {}
+        for result in scanner_results:
+            if isinstance(result, Exception) or not result:
+                continue
+            for sym_data in result:
+                sym = sym_data["symbol"]
+                if sym not in seen or sym_data["_score"] > seen[sym]["_score"]:
+                    seen[sym] = sym_data
+
+        # Sort merged pool by score, take top N
+        top = sorted(seen.values(), key=lambda x: x["_score"], reverse=True)[:cfg.scanner_top_n]
         if not top:
             return
 
@@ -1152,6 +1197,7 @@ async def lifespan(app: FastAPI):
     await _ws.start()
 
     ticker_task = asyncio.create_task(_ticker_loop())
+    asyncio.create_task(_scanner_loop())
 
     # Graceful shutdown on SIGTERM
     loop = asyncio.get_running_loop()

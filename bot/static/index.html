@@ -1735,11 +1735,15 @@ function updateSymSidebar(movers) {
     const htfBadge = (htfB === 'LONG' || htfB === 'SHORT')
       ? `<span class="sym-htf ${htfB.toLowerCase()}">HTF ${htfB}</span>`
       : '';
+    const scanType = m.scanner_type || '';
+    const scanBadge = scanType && scanType !== 'momentum'
+      ? `<span class="sym-htf" style="background:rgba(139,92,246,.2);color:#a78bfa">${scanType}</span>`
+      : '';
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
     const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
-    const tagRow = (biasBadge || htfBadge)
-      ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}</div>`
+    const tagRow = (biasBadge || htfBadge || scanBadge)
+      ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}${scanBadge}</div>`
       : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
       <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span></div>
