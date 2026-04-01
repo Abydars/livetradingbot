@@ -417,6 +417,12 @@ def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
       weight profile. Momentum is the baseline. Breakout gets a small bonus
       because it catches fresh moves early.
 
+    Large-cap volume bonus (+30% or +15%):
+      Coins with >= 500M daily quoteVolume (BTC, ETH, XRP, SOL) get a 30% bonus.
+      Coins with >= 100M volume get 15%. This ensures large caps are preferred
+      when signal quality is similar — log10(volume) in Phase 1 alone only gives
+      a 28% range which is insufficient to consistently rank them above altcoins.
+
     Rescue trail penalty (-30%):
       If this symbol caused a rescue_trail exit recently (within cooldown window)
       and the cooldown hasn't fully expired yet, penalise the score so it ranks
@@ -438,6 +444,28 @@ def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
         base *= 1.15   # best signal engine alignment
     elif scanner_type == "breakout":
         base *= 1.05   # fresh moves, reasonable alignment
+
+    # Large-cap volume bonus — prefer high-liquidity coins (BTC, ETH, XRP, SOL etc.)
+    # when signal quality is otherwise similar.
+    #
+    # Problem with current Phase 1 scoring: log10(quoteVolume) only gives a ~28%
+    # score range between BTC (3B daily vol) and a minimum-threshold altcoin (25M).
+    # That's not enough to consistently prefer large caps over small coins that
+    # happen to have stronger momentum scores.
+    #
+    # Solution: explicit volume tier multiplier applied to the composite switch score,
+    # so large caps win tie-breakers and are preferred unless a smaller coin has a
+    # meaningfully stronger setup (>15-30% better scanner score).
+    #
+    # Tiers based on 24h quoteVolume in USDT:
+    #   >= 500M  → × 1.30  (BTC, ETH, XRP, SOL — always prefer if signals are similar)
+    #   >= 100M  → × 1.15  (BNB, DOGE, ADA, LINK — mild preference)
+    #   <  100M  → × 1.00  (small altcoins — no bonus, compete purely on signal quality)
+    qv = float(sym_data.get("quoteVolume", 0))
+    if qv >= 500_000_000:
+        base *= 1.30
+    elif qv >= 100_000_000:
+        base *= 1.15
 
     # Rescue trail penalty (soft — still in candidates but ranked lower)
     last_rescue = _symbol_cooldowns.get(sym_data.get("symbol", ""), 0.0)
