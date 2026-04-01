@@ -554,10 +554,12 @@ class TradingEngine:
         # one tick and disappears is likely noise. N scales with timeframe so that
         # on 1m the filter is 3 seconds and on 15m it is 45 seconds.
         persist_needed = max(3, cfg.tf_minutes * 3)
-        if direction == self._entry_signal_dir:
+        if direction == "NEUTRAL":
+            pass  # NEUTRAL doesn't reset the counter — signal is still leaning
+        elif direction == self._entry_signal_dir:
             self._entry_signal_ticks += 1
         else:
-            # Direction changed — reset counter and start fresh
+            # Opposite direction — reset counter and start fresh
             self._entry_signal_dir   = direction
             self._entry_signal_ticks = 1
 
