@@ -411,12 +411,29 @@ class TradingEngine:
     def _adjust_trail_on_candle_close(self) -> None:
         """
         Called on every confirmed candle close while trail is active.
-        Tightens _trail_pct_mult based on current momentum — never widens.
-        Only the multiplier changes; the ratcheted trail_price is untouched.
-        """
-        direction = self._session["direction"]
-        new_mult  = self._momentum_trail_mult(self.last_indicators, direction)
 
+        Two adjustments per candle close:
+
+        1. Trail Stop tightening (_trail_pct_mult):
+           Tighten-only multiplier based on momentum state (RSI/MACD).
+           Never widens — only the next ratchet will be tighter.
+
+        2. Trail Arm (tp_pct) live recalculation:
+           Recalculate tp_pct from current ATR so the Trail Arm breathes
+           with market volatility. No directional lock — both tighter and
+           wider moves are allowed. Hard floor: Trail Arm must never enter
+           the loss zone (LONG: must stay above entry + min_profit_pct;
+           SHORT: must stay below entry - min_profit_pct).
+        """
+        if not self._session or not self._entry_adaptive:
+            return
+
+        direction = self._session["direction"]
+        entry     = self._session["entry_price"]
+        ind       = self.last_indicators
+
+        # ── 1. Trail Stop tightening (existing logic) ──
+        new_mult = self._momentum_trail_mult(ind, direction)
         if new_mult < self._trail_pct_mult:
             old_mult = self._trail_pct_mult
             self._trail_pct_mult = new_mult
@@ -425,9 +442,52 @@ class TradingEngine:
                 "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
                 old_mult,
                 new_mult,
-                self.last_indicators.get("rsi") or 0.0,
-                (self.last_indicators.get("macd") or {}).get("hist", 0.0),
+                ind.get("rsi") or 0.0,
+                (ind.get("macd") or {}).get("hist", 0.0),
             )
+
+        # ── 2. Trail Arm (tp_pct) live recalculation ──
+        atr_val = ind.get("atr")
+        price   = ind.get("price") or entry
+        if not atr_val or atr_val <= 0 or price <= 0:
+            return
+
+        atr_pct     = atr_val / price * 100
+        min_profit  = self._entry_adaptive.get("min_profit_pct", 0.10)
+        old_tp_pct  = self._entry_adaptive["tp_pct"]
+
+        # Recalculate tp_pct from current ATR using same formula as _compute_adaptive.
+        # Preserve the original strength-based scale that was applied at entry.
+        # Extract implied scale from original tp_pct vs baseline so we don't need
+        # to store strength separately.
+        baseline_tp = max(atr_pct * 2.5, 0.8)   # unscaled baseline
+        new_tp_pct  = baseline_tp
+
+        # Floor: Trail Arm must stay in profit zone.
+        # LONG: tp_pct >= min_profit_pct (trail arm above entry)
+        # SHORT: tp_pct >= min_profit_pct (trail arm below entry, same math)
+        new_tp_pct = max(new_tp_pct, min_profit)
+
+        if abs(new_tp_pct - old_tp_pct) >= 0.05:   # only update if meaningful change (>0.05%)
+            self._entry_adaptive["tp_pct"] = new_tp_pct
+
+            # Recompute trail_pct proportionally (keep same ratio as original)
+            old_trail = self._entry_adaptive.get("trail_pct", max(atr_pct * 1.0, 0.25))
+            ratio      = old_trail / old_tp_pct if old_tp_pct > 0 else 0.40
+            new_trail  = max(new_tp_pct * ratio, 0.10)
+            self._entry_adaptive["trail_pct"] = new_trail
+
+            direction_label = "UP" if new_tp_pct > old_tp_pct else "DOWN"
+            new_arm = entry * (1 + new_tp_pct / 100) if direction == "LONG" \
+                      else entry * (1 - new_tp_pct / 100)
+            logger.info(
+                "TradingEngine: Trail Arm recalculated on candle close %s "
+                "tp_pct %.3f%% → %.3f%%  arm=%.6f  (atr_pct=%.3f%%)",
+                direction_label, old_tp_pct, new_tp_pct, new_arm, atr_pct,
+            )
+            # Push updated tp_price to UI — _push_session reads from _entry_adaptive
+            self._push_session()
+
 
     # ------------------------------------------------------------------
     # Main tick — called every N seconds by the scheduler
