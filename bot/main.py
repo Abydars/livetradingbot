@@ -1770,7 +1770,6 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         if "timeframe" in updates:
             _last_candles_fetch = 0.0
         if "htf_timeframe" in updates:
-            global _htf_bias, _last_htf_fetch
             _htf_bias = "NEUTRAL"
             _last_htf_fetch = 0.0
             new_tf  = updates["timeframe"]
