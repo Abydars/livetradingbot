@@ -293,7 +293,7 @@ async def _ticker_loop() -> None:
                         err = _exchange_error or "Exchange client unavailable — check API keys"
                         _on_exchange_error(err)
             else:
-                flow_warmup_s = _flow_window_for_timeframe(cfg.timeframe)
+                flow_warmup_s = _flow_window_for_timeframe(cfg.timeframe) * cfg.flow_warmup_mult
                 in_flow_warmup = (time.time() - _last_switch_ts) < flow_warmup_s
 
                 # HTF EMA bias — refresh once per TTL; cheap (1 REST call, 70 candles)
