@@ -58,6 +58,7 @@ class BotConfig:
     auto_switch: bool
     scan_interval_s: int
     htf_filter: bool
+    htf_timeframe: str   # empty = auto, otherwise e.g. "4h", "1d"
     flow_warmup_mult: float
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
     entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
@@ -147,6 +148,7 @@ async def load_config() -> BotConfig:
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 10),
         htf_filter=_b("htf_filter", True),
+        htf_timeframe=_s("htf_timeframe", ""),
         flow_warmup_mult=_f("flow_warmup_mult", 1.0),
         switch_threshold=_f("switch_threshold", 1.1),
         entry_wait_candles=_i("entry_wait_candles", 3),
