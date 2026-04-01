@@ -297,7 +297,7 @@ async def _ticker_loop() -> None:
                 in_flow_warmup = (time.time() - _last_switch_ts) < flow_warmup_s
 
                 # HTF EMA bias — refresh once per TTL; cheap (1 REST call, 70 candles)
-                htf_tf, htf_ttl = _htf_for_timeframe(cfg.timeframe)
+                htf_tf, htf_ttl = (cfg.htf_timeframe, 15 * 60) if cfg.htf_timeframe else _htf_for_timeframe(cfg.timeframe)
                 if now - _last_htf_fetch >= htf_ttl:
                     try:
                         htf_raw = await _rest.get_klines(cfg.symbol, interval=htf_tf, limit=70)
@@ -1769,6 +1769,10 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         # Reset candle fetch and re-create flow analyser if timeframe changed
         if "timeframe" in updates:
             _last_candles_fetch = 0.0
+        if "htf_timeframe" in updates:
+            global _htf_bias, _last_htf_fetch
+            _htf_bias = "NEUTRAL"
+            _last_htf_fetch = 0.0
             new_tf  = updates["timeframe"]
             new_win = _flow_window_for_timeframe(new_tf)
             _flow   = OrderFlowAnalyzer(window_seconds=new_win, depth_levels=5)

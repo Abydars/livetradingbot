@@ -90,6 +90,8 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "discord_webhook":     "",
     "auto_switch":         "1",
     "scan_interval_s":     "5",
+    "htf_filter":          "1",   # block entries when HTF EMA bias contradicts signal direction
+    "htf_timeframe":       "",    # override HTF timeframe (empty = auto based on trading TF)
     "flow_warmup_mult":    "1.0",   # flow warmup window multiplier (1.0 = default ~50% of candle period, 2.0 = double)
     "timeframe":           "1m",
     "trading_active":      "0",
