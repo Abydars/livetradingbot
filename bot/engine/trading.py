@@ -28,7 +28,7 @@ from database import (
 )
 from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
-from engine.signal import SignalEngine
+from engine.signal import SignalEngine, _ENTRY_THRESHOLD
 from exchange.order_executor import OrderExecutor
 from notifications import notify
 
@@ -591,19 +591,34 @@ class TradingEngine:
                 return
 
         if direction == "NEUTRAL":
-            self._entry_signal_ticks = 0
-            self._entry_signal_dir   = "NEUTRAL"
-            _blocked("signal NEUTRAL — no directional edge")
+            # Smart counter handling: preserve the persistence counter if the composite
+            # is leaning toward a direction (near threshold) and filters didn't block it.
+            # Only reset if signal is genuinely flat or a filter hard-blocked the entry.
+            #
+            # Case A: composite near threshold (>60% of threshold) → signal is leaning,
+            #         may cross next tick — preserve counter so we don't lose progress.
+            # Case B: composite is flat (near zero) or filters blocked → reset counter,
+            #         signal has no real edge right now.
+            comp       = signal.get("composite", 0.0)
+            leaning    = abs(comp) >= (_ENTRY_THRESHOLD * 0.6)   # within 60% of ±0.20
+            filter_ok  = signal.get("filters_passed", True)       # True = not filter-blocked
+            if not leaning or not filter_ok:
+                self._entry_signal_ticks = 0
+                self._entry_signal_dir   = "NEUTRAL"
+            _blocked(f"NEUTRAL composite {comp:+.3f} — {'leaning, holding counter' if leaning and filter_ok else 'no edge'}")
             return
+
         if strength < cfg.min_signal_strength:
-            self._entry_signal_ticks = 0
-            self._entry_signal_dir   = "NEUTRAL"
+            # Preserve counter — signal is directional but weak.
+            # It may strengthen next tick without changing direction.
             _blocked(f"strength {strength*100:.0f}% < min {cfg.min_signal_strength*100:.0f}%")
             return
 
         # filters_passed check: during warmup, already re-applied above with correct direction.
         # For normal (non-warmup) path, use original signal's filters_passed.
         if not flow_warmup and not signal["filters_passed"]:
+            # Filter hard-blocked — fundamental market condition wrong (RSI extreme,
+            # counter-trend). Reset counter because entry won't happen until condition changes.
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
             _blocked(signal.get("reason", "entry filter blocked"))
