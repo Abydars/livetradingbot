@@ -632,7 +632,7 @@ class BinanceRestClient:
         for c in phase2_pool:
             sym  = c["symbol"]
             data = klines_map.get(sym)
-            if not data or len(data) < 15:
+            if not data or len(data) < 60:
                 continue
 
             highs  = [float(k[2]) for k in data]
@@ -817,7 +817,7 @@ class BinanceRestClient:
         for c in phase2_pool:
             sym  = c["symbol"]
             data = klines_map.get(sym)
-            if not data or len(data) < 15:
+            if not data or len(data) < 60:
                 continue
 
             highs  = [float(k[2]) for k in data]
@@ -967,7 +967,7 @@ class BinanceRestClient:
         for c in phase2_pool:
             sym  = c["symbol"]
             data = klines_map.get(sym)
-            if not data or len(data) < 55:
+            if not data or len(data) < 60:
                 continue
 
             highs  = [float(k[2]) for k in data]
@@ -1130,7 +1130,7 @@ class BinanceRestClient:
         for c in phase2_pool:
             sym  = c["symbol"]
             data = klines_map.get(sym)
-            if not data or len(data) < 55:
+            if not data or len(data) < 60:
                 continue
 
             highs  = [float(k[2]) for k in data]
