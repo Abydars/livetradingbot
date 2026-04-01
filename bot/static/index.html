@@ -1634,6 +1634,9 @@ function dispatch(msg) {
     case 'signal':
       if (msg.data) updateSignalPanel(msg.data);
       break;
+    case 'entry_blocked':
+      if (msg.reason) updateEntryBlockedReason(msg.reason);
+      break;
 
     case 'level_overrides_cleared':
       _overrideTpPrice = null;
@@ -2122,6 +2125,13 @@ function setInd(id, text, cls) {
 /* ═══════════════════════════════════════════════════════
    SIGNAL PANEL — Step 7
 ═══════════════════════════════════════════════════════ */
+function updateEntryBlockedReason(reason) {
+  const el = document.getElementById('sig-reason');
+  if (!el) return;
+  el.textContent = '⏸ ' + reason;
+  el.style.color = 'rgba(240,180,41,0.85)';
+}
+
 function updateSignalPanel(sig) {
   const dir = (sig.direction || 'NEUTRAL').toUpperCase();
 
@@ -2153,8 +2163,12 @@ function updateSignalPanel(sig) {
     reasonEl.textContent = `⏳ flow warming up — technical only${ws}`;
     reasonEl.style.color = 'var(--amber, #f59e0b)';
   } else {
-    reasonEl.textContent = sig.reason || '';
-    reasonEl.style.color = '';
+    // Only replace reason text if signal engine has a reason — otherwise keep
+    // the last entry_blocked reason visible so user knows what's being waited for.
+    if (sig.reason) {
+      reasonEl.textContent = sig.reason;
+      reasonEl.style.color = '';
+    }
   }
 
   // Scanner type badge
