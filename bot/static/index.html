@@ -1597,6 +1597,7 @@ function dispatch(msg) {
       if (bbUp)     { bbUp.setData([]);     }
       if (bbDn)     { bbDn.setData([]);     }
       showSymLoader(msg.symbol);
+      window._pendingChartFit = true;
       break;
     }
 
@@ -1604,8 +1605,8 @@ function dispatch(msg) {
       if (msg.candles?.length) {
         processCandleUpdate(msg.candles);
         hideSymLoader();   // data arrived — switch complete
-        // Fit chart to show last ~80 candles and scroll to latest candle
-        if (chart) {
+        if (chart && window._pendingChartFit) {
+          window._pendingChartFit = false;
           chart.timeScale().fitContent();
           chart.timeScale().scrollToRealTime();
         }
