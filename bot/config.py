@@ -57,6 +57,7 @@ class BotConfig:
     # Auto-switch
     auto_switch: bool
     scan_interval_s: int
+    flow_warmup_mult: float
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
     entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
     scanner_top_n: int
@@ -144,6 +145,7 @@ async def load_config() -> BotConfig:
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 10),
+        flow_warmup_mult=_f("flow_warmup_mult", 1.0),
         switch_threshold=_f("switch_threshold", 1.1),
         entry_wait_candles=_i("entry_wait_candles", 3),
         scanner_top_n=_i("scanner_top_n", 10),

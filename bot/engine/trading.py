@@ -440,7 +440,11 @@ class TradingEngine:
         self.last_signal = signal
 
         # Broadcast signal to UI
-        self._broadcast({"type": "signal", "data": {**signal, "flow_warmup": flow_warmup}})
+        self._broadcast({"type": "signal", "data": {
+            **signal,
+            "flow_warmup":     flow_warmup,
+            "warmup_strength": None,   # filled in by re-broadcast in _try_entry if warmup fires
+        }})
 
         atr_val = ind.get("atr") or 0.0
 
@@ -488,11 +492,19 @@ class TradingEngine:
                 # Non-flow technicals are directional — derive direction and strength
                 direction    = "LONG" if adj_composite > 0 else "SHORT"
                 adj_strength = min((abs(adj_composite) - 0.25) / 0.75, 1.0)
-                logger.info(
+                logger.debug(
                     "TradingEngine: flow warmup — adj composite=%.3f dir=%s strength=%.2f",
                     adj_composite, direction, adj_strength,
                 )
                 strength = adj_strength
+                # Re-broadcast signal with warmup_strength so UI can display it.
+                # tick() already broadcast the signal before _try_entry was called,
+                # but at that point warmup_strength wasn't computed yet.
+                self._broadcast({"type": "signal", "data": {
+                    **signal,
+                    "flow_warmup":     True,
+                    "warmup_strength": round(adj_strength, 4),
+                }})
             else:
                 # Non-flow components not directional enough — skip entry
                 return
