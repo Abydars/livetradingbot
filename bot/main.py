@@ -390,7 +390,7 @@ async def _scanner_loop() -> None:
             now = time.time()
 
             should_scan = _force_scan or (now - _last_symbol_scan >= cfg.scan_interval_s)
-            if should_scan:
+            if should_scan and cfg.auto_switch:
                 _force_scan = False
                 await _scan_symbols(cfg)
 
