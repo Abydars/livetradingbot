@@ -756,6 +756,20 @@ async def _scan_symbols(cfg) -> None:
             for k in raw_candles
         ] if raw_candles else []
 
+        # Guard: require at least 60 candles for reliable indicator computation.
+        # EMA50 needs 50+, MACD needs 35+ — below 60 the signal engine produces
+        # NEUTRAL on every tick regardless of price action (new listings, thin markets).
+        # Skip this symbol and let auto-switch try the next candidate instead.
+        _MIN_CANDLES_FOR_ENTRY = 60
+        if len(fresh_candles) < _MIN_CANDLES_FOR_ENTRY:
+            logger.warning(
+                "Auto-switch: %s skipped — only %d candles available (need %d). "
+                "New listing or thin market — marking as tried.",
+                new_sym, len(fresh_candles), _MIN_CANDLES_FOR_ENTRY,
+            )
+            _tried_syms.add(new_sym)
+            return
+
         # WS resubscribe and Binance symbol prep are independent — run in parallel.
         await asyncio.gather(
             _ws.switch_symbol(new_sym),
