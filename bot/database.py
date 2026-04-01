@@ -93,6 +93,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "htf_filter":          "1",   # block entries when HTF EMA bias contradicts signal direction
     "htf_timeframe":       "",    # override HTF timeframe (empty = auto based on trading TF)
     "flow_warmup_mult":    "1.0",   # flow warmup window multiplier (1.0 = default ~50% of candle period, 2.0 = double)
+    "signal_persist_ticks": "2",   # ticks signal must hold before entry (0 = disabled)
     "timeframe":           "1m",
     "trading_active":      "0",
     "switch_threshold":    "1.1",

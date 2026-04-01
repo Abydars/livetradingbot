@@ -628,7 +628,9 @@ class TradingEngine:
         # for N consecutive ticks before allowing entry. A signal that appears for
         # one tick and disappears is likely noise. N scales with timeframe so that
         # on 1m the filter is 3 seconds and on 15m it is 45 seconds.
-        persist_needed = max(2, cfg.tf_minutes)
+        persist_needed = cfg.signal_persist_ticks
+        if persist_needed <= 0:
+            persist_needed = 0   # disabled — skip persistence check entirely
         if direction == "NEUTRAL":
             pass  # NEUTRAL doesn't reset the counter — signal is still leaning
         elif direction == self._entry_signal_dir:
@@ -638,7 +640,7 @@ class TradingEngine:
             self._entry_signal_dir   = direction
             self._entry_signal_ticks = 1
 
-        if self._entry_signal_ticks < persist_needed:
+        if persist_needed > 0 and self._entry_signal_ticks < persist_needed:
             logger.debug(
                 "TradingEngine: entry pending — signal %s confirmed %d/%d ticks",
                 direction, self._entry_signal_ticks, persist_needed,
