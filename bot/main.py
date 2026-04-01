@@ -9,6 +9,7 @@ or:
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -1375,7 +1376,7 @@ async def lifespan(app: FastAPI):
 
     signal.signal(signal.SIGTERM, _shutdown)
 
-    logger.info("=== Bot ready on :8765 ===")
+    logger.info("=== Bot ready on :%d ===", int(os.environ.get("PORT", 8765)))
     yield
 
     # Cleanup
@@ -1851,7 +1852,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8765,
+        port=int(os.environ.get("PORT", 8765)),
         log_level="info",
         access_log=False,
     )
