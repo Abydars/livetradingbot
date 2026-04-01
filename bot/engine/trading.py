@@ -471,6 +471,10 @@ class TradingEngine:
         direction = signal["direction"]
         strength  = signal["strength"]
 
+        def _blocked(reason: str) -> None:
+            """Broadcast why entry was blocked so UI can display it."""
+            self._broadcast({"type": "entry_blocked", "reason": reason})
+
         # During flow warmup window after auto-switch, the flow component (28% weight)
         # is zero because the WebSocket just subscribed and has no trade history yet.
         # BUG FIX: previous code checked `direction != "NEUTRAL"` first, but flow=0
@@ -529,10 +533,12 @@ class TradingEngine:
         if direction == "NEUTRAL":
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
+            _blocked("signal NEUTRAL — no directional edge")
             return
         if strength < cfg.min_signal_strength:
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
+            _blocked(f"strength {strength*100:.0f}% < min {cfg.min_signal_strength*100:.0f}%")
             return
 
         # filters_passed check: during warmup, already re-applied above with correct direction.
@@ -540,6 +546,7 @@ class TradingEngine:
         if not flow_warmup and not signal["filters_passed"]:
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
+            _blocked(signal.get("reason", "entry filter blocked"))
             return
 
         # Signal persistence filter: require the same directional signal to hold
@@ -559,6 +566,7 @@ class TradingEngine:
                 "TradingEngine: entry pending — signal %s confirmed %d/%d ticks",
                 direction, self._entry_signal_ticks, persist_needed,
             )
+            _blocked(f"waiting signal persistence {self._entry_signal_ticks}/{persist_needed} ticks")
             return
 
         # HTF confirmation: if the higher timeframe has a clear directional bias,
@@ -569,6 +577,7 @@ class TradingEngine:
                 "TradingEngine: entry blocked — HTF bias %s disagrees with signal %s",
                 htf_bias, direction,
             )
+            _blocked(f"HTF {htf_bias} contradicts signal {direction}")
             return
 
         # Flow confirmation gate: real-time order flow must agree with direction.
@@ -583,22 +592,26 @@ class TradingEngine:
                     "TradingEngine: LONG blocked — flow negative (%.3f), sellers dominant",
                     flow_score,
                 )
+                _blocked(f"flow {flow_score:+.2f} — sellers dominant, waiting for buyers")
                 return
             if direction == "SHORT" and flow_score >= 0:
                 logger.debug(
                     "TradingEngine: SHORT blocked — flow positive (%.3f), buyers dominant",
                     flow_score,
                 )
+                _blocked(f"flow {flow_score:+.2f} — buyers dominant, waiting for sellers")
                 return
 
         # Stop cooldown: block re-entry for N seconds after a hard stop
         if self._last_stop_time is not None:
             elapsed = time.time() - self._last_stop_time
             if elapsed < cfg.cooldown_after_stop_s:
+                remaining = cfg.cooldown_after_stop_s - elapsed
                 logger.debug(
                     "TradingEngine: entry blocked — stop cooldown %.0fs remaining",
-                    cfg.cooldown_after_stop_s - elapsed,
+                    remaining,
                 )
+                _blocked(f"stop cooldown — {remaining:.0f}s remaining")
                 return
 
         # Daily loss circuit breaker
@@ -609,6 +622,7 @@ class TradingEngine:
                     "TradingEngine: entry blocked — daily loss limit "
                     "(today=%.4f, limit=-%.4f)", today_pnl, cfg.max_daily_loss_usdt,
                 )
+                _blocked(f"daily loss limit reached ({today_pnl:.2f} USDT)")
                 return
 
         # Validate market conditions before committing to a trade
@@ -621,6 +635,7 @@ class TradingEngine:
                 "TradingEngine: skipping entry — TP too tight (%.3f%% < 0.40%%)",
                 entry_adaptive["tp_pct"],
             )
+            _blocked(f"TP too tight ({entry_adaptive['tp_pct']:.2f}% < 0.40%)")
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
