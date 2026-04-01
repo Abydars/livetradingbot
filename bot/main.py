@@ -582,6 +582,11 @@ async def _scan_symbols(cfg) -> None:
             _tried_syms.clear()
             return
 
+        # Signal persistence is actively building toward entry — hold on current symbol.
+        # Switching now would waste a signal that's about to fire.
+        if _engine._entry_signal_ticks > 0:
+            return
+
         # Use composite-score ordering for switching decisions.
         # top_syms_raw = scanner rank, top_syms = composite rank for switching.
         top_syms_raw = [t["symbol"] for t in top]
