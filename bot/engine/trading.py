@@ -497,13 +497,30 @@ class TradingEngine:
                     adj_composite, direction, adj_strength,
                 )
                 strength = adj_strength
-                # Re-broadcast signal with warmup_strength so UI can display it.
-                # tick() already broadcast the signal before _try_entry was called,
-                # but at that point warmup_strength wasn't computed yet.
+
+                # Re-apply entry filters using the warmup-derived direction.
+                # The original signal had filters_passed=False because its direction
+                # was NEUTRAL (flow=0 pulled composite below threshold) — not because
+                # RSI/EMA filters failed. We must re-check with the corrected direction.
+                _, warmup_filters_ok, warmup_reason = self._signal_engine._apply_filters(
+                    direction, adj_composite, ind
+                )
+                if not warmup_filters_ok:
+                    logger.debug(
+                        "TradingEngine: flow warmup entry blocked by filter — %s",
+                        warmup_reason,
+                    )
+                    return
+
+                # Re-broadcast corrected signal so UI shows warmup direction/strength
+                # instead of the original NEUTRAL/0% that was sent before _try_entry.
                 self._broadcast({"type": "signal", "data": {
                     **signal,
+                    "direction":       direction,
+                    "strength":        round(adj_strength, 4),
                     "flow_warmup":     True,
                     "warmup_strength": round(adj_strength, 4),
+                    "reason":          f"warmup: {warmup_reason}",
                 }})
             else:
                 # Non-flow components not directional enough — skip entry
@@ -517,7 +534,10 @@ class TradingEngine:
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
             return
-        if not signal["filters_passed"]:
+
+        # filters_passed check: during warmup, already re-applied above with correct direction.
+        # For normal (non-warmup) path, use original signal's filters_passed.
+        if not flow_warmup and not signal["filters_passed"]:
             self._entry_signal_ticks = 0
             self._entry_signal_dir   = "NEUTRAL"
             return
