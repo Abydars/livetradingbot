@@ -440,7 +440,7 @@ class TradingEngine:
         self.last_signal = signal
 
         # Broadcast signal to UI
-        self._broadcast({"type": "signal", "data": signal})
+        self._broadcast({"type": "signal", "data": {**signal, "flow_warmup": flow_warmup}})
 
         atr_val = ind.get("atr") or 0.0
 

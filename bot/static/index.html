@@ -2138,8 +2138,15 @@ function updateSignalPanel(sig) {
     strEl.title = '';
   }
 
-  // Reason text
-  document.getElementById('sig-reason').textContent = sig.reason || '';
+  // Reason text — show warmup indicator if flow window is filling up
+  const reasonEl = document.getElementById('sig-reason');
+  if (sig.flow_warmup) {
+    reasonEl.textContent = '⏳ flow warming up — using technical signals only';
+    reasonEl.style.color = 'var(--amber, #f59e0b)';
+  } else {
+    reasonEl.textContent = sig.reason || '';
+    reasonEl.style.color = '';
+  }
 
   // Scanner type badge
   const scanBadge = document.getElementById('scanner-badge');
