@@ -60,6 +60,7 @@ class BotConfig:
     htf_filter: bool
     htf_timeframe: str   # empty = auto, otherwise e.g. "4h", "1d"
     flow_warmup_mult: float
+    auto_leverage: bool
     signal_persist_ticks: int
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
     entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
@@ -151,6 +152,7 @@ async def load_config() -> BotConfig:
         htf_filter=_b("htf_filter", True),
         htf_timeframe=_s("htf_timeframe", ""),
         flow_warmup_mult=_f("flow_warmup_mult", 1.0),
+        auto_leverage=_b("auto_leverage", True),
         signal_persist_ticks=_i("signal_persist_ticks", 2),
         switch_threshold=_f("switch_threshold", 1.1),
         entry_wait_candles=_i("entry_wait_candles", 3),
