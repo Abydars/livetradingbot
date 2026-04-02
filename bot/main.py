@@ -1847,6 +1847,11 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 "candles": _engine.candles[-100:],
             }))
 
+    elif mtype == "force_scan":
+        global _force_scan
+        _force_scan = True
+        await ws.send_text(json.dumps({"type": "force_scan_ack"}))
+
     elif mtype == "get_top_movers":
         if _last_top_movers:
             await ws.send_text(json.dumps({
