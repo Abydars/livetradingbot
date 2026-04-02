@@ -807,8 +807,10 @@ class TradingEngine:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
-        # Sync leverage to Binance before opening
-        await self._executor.ensure_leverage(cfg.symbol, effective_leverage)
+        # Leverage already set at symbol switch time (auto_leverage calculated from ATR).
+        # Only re-sync if auto_leverage is OFF (manual mode, leverage may have changed).
+        if not cfg.auto_leverage:
+            await self._executor.ensure_leverage(cfg.symbol, effective_leverage)
 
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(

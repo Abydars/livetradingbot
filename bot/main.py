@@ -770,10 +770,32 @@ async def _scan_symbols(cfg) -> None:
             _tried_syms.add(new_sym)
             return
 
-        # WS resubscribe and Binance symbol prep are independent — run in parallel.
+        # Calculate ATR-based safe leverage from fresh candles before setting on exchange.
+        # This avoids setting leverage at entry time (which adds latency to order placement).
+        smart_leverage = cfg.leverage
+        if cfg.auto_leverage and fresh_candles and len(fresh_candles) >= 15:
+            from exchange.binance_rest import _scan_atr as _atr
+            highs  = [c["high"]  for c in fresh_candles[-15:]]
+            lows   = [c["low"]   for c in fresh_candles[-15:]]
+            closes = [c["close"] for c in fresh_candles[-15:]]
+            last_price = closes[-1]
+            if last_price > 0:
+                atr_val   = _atr(highs, lows, closes, 14)
+                atr_pct   = atr_val / last_price * 100
+                buffer    = cfg.last_resort_sl_buffer
+                max_lev   = (buffer * 100) / (atr_pct * 1.5) * 0.85
+                safe_lev  = max(1, int(max_lev))
+                smart_leverage = min(cfg.leverage, safe_lev)
+                if smart_leverage < cfg.leverage:
+                    logger.info(
+                        "Auto-switch: %s ATR=%.2f%% → leverage %dx → %dx",
+                        new_sym, atr_pct, cfg.leverage, smart_leverage,
+                    )
+
+        # WS resubscribe and Binance symbol prep run in parallel.
         await asyncio.gather(
             _ws.switch_symbol(new_sym),
-            _executor.prepare_symbol(new_sym, cfg.leverage),
+            _executor.prepare_symbol(new_sym, smart_leverage),
         )
 
         # Reset stale price so the next tick gets a fresh mark-price for new symbol.
