@@ -515,6 +515,20 @@
     .cfg-btn:hover { filter: brightness(1.1); }
     .cfg-btn.danger { background: var(--red); color: #fff; margin-left: 8px; }
 
+    /* ── telegram auth ── */
+    .tg-auth-btn {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      color: var(--blue);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 4px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .tg-auth-btn:hover { border-color: var(--blue); }
+    .tg-auth-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
     /* ═══════════════════════════════ RIGHT COLUMN ══ */
     #right-col {
       width: 295px;
@@ -1304,6 +1318,7 @@
       <button id="cfg-modal-close" onclick="closeCfgModal()">✕</button>
     </div>
     <div id="cfg-form"><!-- rendered by JS --></div>
+    <div id="tg-auth-section"></div>
     <div id="cfg-modal-foot">
       <button class="cfg-btn" onclick="saveConfig()">SAVE</button>
       <button class="cfg-btn danger" onclick="resetBot()">RESET BOT</button>
@@ -1798,15 +1813,10 @@ function updateSymSidebar(movers) {
     const htfBadge = (htfB === 'LONG' || htfB === 'SHORT')
       ? `<span class="sym-htf ${htfB.toLowerCase()}">HTF ${htfB}</span>`
       : '';
-    const scanType = m.scanner_type || '';
-    const scanColors = {
-      momentum:  'rgba(88,166,255,.2);color:#58a6ff',
-      breakout:  'rgba(245,158,11,.2);color:#f59e0b',
-      trendpull: 'rgba(139,92,246,.2);color:#a78bfa',
-    };
-    const scanLabel = { momentum: 'MOM', breakout: 'BRK', trendpull: 'PULL' };
-    const scanBadge = scanType
-      ? `<span class="sym-htf" style="background:${scanColors[scanType] || scanColors.momentum}">${scanLabel[scanType] || scanType}</span>`
+    const chanName  = m.scanner_type || '';
+    const chanLabel = chanName.length > 12 ? chanName.slice(0, 12) + '\u2026' : chanName;
+    const scanBadge = chanName
+      ? `<span class="sym-htf" style="background:rgba(64,196,128,.15);color:#40c480">\uD83D\uDCE1 ${chanLabel}</span>`
       : '';
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
@@ -2718,8 +2728,6 @@ const CFG_SCHEMA = [
   ]},
   { section: 'Signal', fields: [
     { key: 'min_signal_strength', label: 'Min Signal Strength', type: 'number' },
-    { key: 'htf_filter',          label: 'HTF Filter',          type: 'toggle' },
-    { key: 'htf_timeframe', label: 'HTF Timeframe (empty=auto)', type: 'text' },
     { key: 'strength_sizing',     label: 'Strength Sizing',     type: 'toggle' },
     { key: 'strength_size_min',   label: 'Min Size Scale',      type: 'number' },
   ]},
@@ -2732,19 +2740,15 @@ const CFG_SCHEMA = [
     { key: 'paper_slippage_pct',    label: 'Paper Slippage (%)',     type: 'number' },
   ]},
   { section: 'System', fields: [
-    { key: 'trading_mode',     label: 'Trading Mode',             type: 'select', options: ['paper','demo','live'] },
-    { key: 'auto_switch',      label: 'Auto Symbol Switch',       type: 'toggle' },
-    { key: 'scan_interval_s',  label: 'Scan Interval (s)',        type: 'number' },
-    { key: 'flow_warmup_mult', label: 'Flow Warmup Multiplier',   type: 'number' },
-    { key: 'auto_leverage',      label: 'Auto Leverage (ATR-based)', type: 'toggle' },
+    { key: 'trading_mode',         label: 'Trading Mode',                  type: 'select', options: ['paper','demo','live'] },
+    { key: 'auto_leverage',        label: 'Auto Leverage (ATR-based)',     type: 'toggle' },
     { key: 'signal_persist_ticks', label: 'Signal Persist Ticks (0=off)', type: 'number' },
-    { key: 'switch_threshold', label: 'Switch Threshold (ratio)', type: 'number' },
-    { key: 'entry_wait_candles', label: 'Entry Wait (candles)',   type: 'number' },
-    { key: 'scanner_top_n',    label: 'Scanner Top N',            type: 'number' },
-    { key: 'scanner_momentum',  label: 'Scanner: Momentum',        type: 'toggle' },
-    { key: 'scanner_breakout',  label: 'Scanner: Breakout',        type: 'toggle' },
-    { key: 'scanner_trendpull', label: 'Scanner: Trend Pullback',  type: 'toggle' },
-    { key: 'discord_webhook',  label: 'Discord Webhook',          type: 'text', wide: true },
+    { key: 'discord_webhook',      label: 'Discord Webhook',               type: 'text', wide: true },
+  ]},
+  { section: 'Telegram', fields: [
+    { key: 'telegram_api_id',   label: 'API ID',                     type: 'text',     placeholder: '12345678' },
+    { key: 'telegram_api_hash', label: 'API Hash',                   type: 'password', placeholder: 'abc123…' },
+    { key: 'telegram_channels', label: 'Channels (comma-separated)', type: 'textarea', placeholder: '@channel1, -1001234567890', rows: 3 },
   ]},
 ];
 
@@ -2752,8 +2756,14 @@ function renderConfig(cfg) {
   let html = '';
   for (const section of CFG_SCHEMA) {
     html += `<div class="cs-title">${section.section}</div>`;
+    if (section.section === 'Telegram') {
+      html += `<div style="font-size:10px;color:var(--muted);padding:2px 0 6px;line-height:1.5">
+        Get API ID &amp; Hash from <b style="color:var(--text)">my.telegram.org</b> → App configuration
+      </div>`;
+    }
     for (const f of section.fields) {
       const val = cfg[f.key] ?? '';
+      const ph  = f.placeholder ? ` placeholder="${f.placeholder}"` : '';
       if (f.type === 'toggle') {
         const chk = parseInt(val) === 1 ? 'checked' : '';
         html += `<div class="cr-row">
@@ -2770,20 +2780,32 @@ function renderConfig(cfg) {
           <select class="cr-input" id="cfg-${f.key}" data-key="${f.key}"
             style="cursor:pointer" onchange="onSelectCfg(this)">${opts}</select>
         </div>`;
+      } else if (f.type === 'textarea') {
+        html += `<div class="cr-row cr-wide">
+          <span class="cr-label">${f.label}</span>
+          <textarea class="cr-input wide" id="cfg-${f.key}" data-key="${f.key}"
+            rows="${f.rows || 3}" style="resize:vertical"${ph}>${val}</textarea>
+        </div>`;
       } else if (f.wide) {
         html += `<div class="cr-row cr-wide">
           <span class="cr-label">${f.label}</span>
-          <input type="text" class="cr-input wide" id="cfg-${f.key}" data-key="${f.key}" value="${val}">
+          <input type="text" class="cr-input wide" id="cfg-${f.key}" data-key="${f.key}" value="${val}"${ph}>
+        </div>`;
+      } else if (f.type === 'password') {
+        html += `<div class="cr-row">
+          <span class="cr-label">${f.label}</span>
+          <input type="password" class="cr-input" id="cfg-${f.key}" data-key="${f.key}" value="${val}" autocomplete="off"${ph}>
         </div>`;
       } else {
         html += `<div class="cr-row">
           <span class="cr-label">${f.label}</span>
-          <input type="${f.type}" class="cr-input" id="cfg-${f.key}" data-key="${f.key}" value="${val}" step="any">
+          <input type="${f.type}" class="cr-input" id="cfg-${f.key}" data-key="${f.key}" value="${val}" step="any"${ph}>
         </div>`;
       }
     }
   }
   document.getElementById('cfg-form').innerHTML = html;
+  renderTgAuth(cfg);
 }
 
 function onToggle(el) {
@@ -2827,6 +2849,126 @@ function saveConfig() {
       btn.style.opacity = '';
     }
   }, 5000);
+}
+
+/* ═══════════════════════════════════════════════════════
+   TELEGRAM AUTH — Step 13
+═══════════════════════════════════════════════════════ */
+let _tgStep = 'idle'; // idle | sending | code | password | done
+
+function renderTgAuth(cfg) {
+  const el = document.getElementById('tg-auth-section');
+  if (!el) return;
+  const hasCredentials = (cfg.telegram_api_id || '').trim() && (cfg.telegram_api_hash || '').trim();
+  if (!hasCredentials) { el.innerHTML = ''; return; }
+
+  const sessionOk = (cfg.telegram_session || '').trim().length > 20;
+  const statusHtml = sessionOk
+    ? `<span style="color:var(--green)">&#x2705; Telegram Connected</span>`
+    : `<span style="color:var(--gold)">&#x26A0; Not authenticated</span>`;
+
+  let formHtml = '';
+  if (_tgStep === 'idle' || _tgStep === 'done') {
+    formHtml = `<button class="tg-auth-btn" onclick="tgStartAuth()">Connect Telegram Account</button>`;
+  } else if (_tgStep === 'sending') {
+    formHtml = `<span style="color:var(--muted);font-size:11px">Sending code…</span>`;
+  } else if (_tgStep === 'code') {
+    formHtml = `
+      <div class="tg-auth-row">
+        <input id="tg-phone" type="tel" class="cr-input" placeholder="+923001234567" style="flex:1" />
+        <input id="tg-code"  type="text" class="cr-input" placeholder="OTP code" style="width:90px" />
+        <button class="tg-auth-btn" onclick="tgVerifyCode()">Verify</button>
+      </div>
+      <div id="tg-msg" style="font-size:10px;color:var(--muted);margin-top:4px"></div>`;
+  } else if (_tgStep === 'password') {
+    formHtml = `
+      <div class="tg-auth-row">
+        <input id="tg-password" type="password" class="cr-input" placeholder="2FA password" style="flex:1" autocomplete="off" />
+        <button class="tg-auth-btn" onclick="tgVerifyPassword()">Submit</button>
+      </div>
+      <div id="tg-msg" style="font-size:10px;color:var(--muted);margin-top:4px">Two-factor authentication required</div>`;
+  }
+
+  el.innerHTML = `
+    <div class="cs-title" style="margin-top:14px">Telegram Auth</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <span style="font-size:11px">${statusHtml}</span>
+    </div>
+    ${formHtml}`;
+}
+
+async function tgStartAuth() {
+  const cfg = configData;
+  const phone = prompt('Enter phone number with country code (e.g. +923001234567):');
+  if (!phone) return;
+  _tgStep = 'sending';
+  renderTgAuth(cfg);
+  try {
+    const r = await fetch('/api/telegram/send_code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'send_code failed');
+    _tgStep = 'code';
+    renderTgAuth(cfg);
+    // pre-fill phone
+    const phoneEl = document.getElementById('tg-phone');
+    if (phoneEl) phoneEl.value = phone;
+  } catch (e) {
+    _tgStep = 'idle';
+    renderTgAuth(cfg);
+    alert('Error: ' + e.message);
+  }
+}
+
+async function tgVerifyCode() {
+  const phone = (document.getElementById('tg-phone')?.value || '').trim();
+  const code  = (document.getElementById('tg-code')?.value  || '').trim();
+  const msgEl = document.getElementById('tg-msg');
+  if (!phone || !code) { if (msgEl) msgEl.textContent = 'Phone and code required'; return; }
+  if (msgEl) msgEl.textContent = 'Verifying…';
+  try {
+    const r = await fetch('/api/telegram/verify_code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, code }),
+    });
+    const data = await r.json();
+    if (data.needs_password) {
+      _tgStep = 'password';
+      renderTgAuth(configData);
+      return;
+    }
+    if (!r.ok || !data.ok) throw new Error(data.error || 'verify failed');
+    _tgStep = 'done';
+    configData.telegram_session = '__set__'; // trigger "Connected" status without page reload
+    renderTgAuth(configData);
+  } catch (e) {
+    if (msgEl) msgEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function tgVerifyPassword() {
+  const password = (document.getElementById('tg-password')?.value || '');
+  const msgEl = document.getElementById('tg-msg');
+  if (!password) { if (msgEl) msgEl.textContent = 'Password required'; return; }
+  if (msgEl) msgEl.textContent = 'Verifying…';
+  try {
+    const r = await fetch('/api/telegram/verify_password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || 'verify failed');
+    _tgStep = 'done';
+    configData.telegram_session = '__set__';
+    renderTgAuth(configData);
+  } catch (e) {
+    if (msgEl) msgEl.textContent = 'Error: ' + e.message;
+  }
 }
 
 function resetBot() {
