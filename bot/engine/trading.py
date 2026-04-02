@@ -405,7 +405,7 @@ class TradingEngine:
         self.last_indicators  = compute_all(candles)
 
         new_last_time = candles[-1]["time"] if candles else 0
-        if new_last_time != prev_last_time and self._trail_activated and self._session:
+        if new_last_time != prev_last_time and self._session:
             self._adjust_trail_on_candle_close()
 
     def _adjust_trail_on_candle_close(self) -> None:
@@ -432,19 +432,22 @@ class TradingEngine:
         entry     = self._session["entry_price"]
         ind       = self.last_indicators
 
-        # ── 1. Trail Stop tightening (existing logic) ──
-        new_mult = self._momentum_trail_mult(ind, direction)
-        if new_mult < self._trail_pct_mult:
-            old_mult = self._trail_pct_mult
-            self._trail_pct_mult = new_mult
-            logger.info(
-                "TradingEngine: trail tightened on candle close  "
-                "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
-                old_mult,
-                new_mult,
-                ind.get("rsi") or 0.0,
-                (ind.get("macd") or {}).get("hist", 0.0),
-            )
+        # ── 1. Trail Stop tightening — only when trail is armed ──
+        # _trail_pct_mult tightens the gap between price and trail_stop on the
+        # next ratchet. No point running this before trail is active.
+        if self._trail_activated:
+            new_mult = self._momentum_trail_mult(ind, direction)
+            if new_mult < self._trail_pct_mult:
+                old_mult = self._trail_pct_mult
+                self._trail_pct_mult = new_mult
+                logger.info(
+                    "TradingEngine: trail tightened on candle close  "
+                    "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
+                    old_mult,
+                    new_mult,
+                    ind.get("rsi") or 0.0,
+                    (ind.get("macd") or {}).get("hist", 0.0),
+                )
 
         # ── 2. Trail Arm (tp_pct) live recalculation ──
         atr_val = ind.get("atr")
@@ -463,10 +466,22 @@ class TradingEngine:
         baseline_tp = max(atr_pct * 2.5, 0.8)   # unscaled baseline
         new_tp_pct  = baseline_tp
 
-        # Floor: Trail Arm must stay in profit zone.
-        # LONG: tp_pct >= min_profit_pct (trail arm above entry)
-        # SHORT: tp_pct >= min_profit_pct (trail arm below entry, same math)
+        # Floor 1: Trail Arm must stay in profit zone (above entry for LONG).
         new_tp_pct = max(new_tp_pct, min_profit)
+
+        # Floor 2: Trail Arm must always be ABOVE current price for LONG,
+        # BELOW current price for SHORT. If ATR shrinks so much that the
+        # computed Trail Arm would be at or below current price, force it
+        # at least 1×ATR beyond current price so trail can't fire immediately.
+        if price > 0 and atr_pct > 0:
+            if direction == "LONG":
+                min_arm_price  = price * (1 + atr_pct / 100)   # at least 1 ATR above current
+                min_arm_tp_pct = (min_arm_price / entry - 1) * 100 if entry > 0 else new_tp_pct
+                new_tp_pct     = max(new_tp_pct, min_arm_tp_pct)
+            else:  # SHORT
+                min_arm_price  = price * (1 - atr_pct / 100)   # at least 1 ATR below current
+                min_arm_tp_pct = (1 - min_arm_price / entry) * 100 if entry > 0 else new_tp_pct
+                new_tp_pct     = max(new_tp_pct, min_arm_tp_pct)
 
         if abs(new_tp_pct - old_tp_pct) >= 0.05:   # only update if meaningful change (>0.05%)
             self._entry_adaptive["tp_pct"] = new_tp_pct
@@ -1267,6 +1282,14 @@ class TradingEngine:
                     self._push_session()
 
         if self._trail_activated and self._trail_price is not None:
+            # Safety: trail_price should never be above current price for SHORT
+            # or below current price for LONG — guard against any edge case.
+            if direction == "LONG" and self._trail_price >= price:
+                # Trail stop is at or above current price — ratchet it down to safe level
+                self._trail_price = price * (1 - max(p["trail_pct"] * self._trail_pct_mult, 0.10) / 100)
+            elif direction == "SHORT" and self._trail_price <= price:
+                self._trail_price = price * (1 + max(p["trail_pct"] * self._trail_pct_mult, 0.10) / 100)
+
             trail_hit = (
                 (direction == "LONG"  and price <= self._trail_price)
                 or (direction == "SHORT" and price >= self._trail_price)
