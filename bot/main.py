@@ -1530,6 +1530,30 @@ async def ws_endpoint(websocket: WebSocket):
         if sess:
             hedges = await get_open_hedges(sess["id"])
             tp_price, sl_price = _engine.get_level_prices() if _engine else (None, None)
+            # Compute DCA prices for chart display on reconnect
+            dca_prices_init = []
+            if _engine and _engine._entry_adaptive and sl_price is not None:
+                s_avg      = sess.get("avg_price", 0)
+                s_dir      = sess.get("direction", "LONG")
+                s_dca_done = sess.get("dca_count", 0)
+                s_leverage = sess.get("leverage", cfg.leverage)
+                step_pct   = _engine._entry_adaptive.get("dca_step_pct", 0)
+                remaining  = max(0, cfg.max_dca - s_dca_done)
+                if s_avg > 0 and step_pct > 0 and remaining > 0:
+                    _liq_pct  = (1.0 / s_leverage) * 100 if s_leverage > 0 else 10.0
+                    _sl_pct   = _liq_pct * cfg.last_resort_sl_buffer
+                    _safe     = _sl_pct * 0.85
+                    _max_step = _safe / remaining
+                    _eff_step = min(step_pct, _max_step)
+                    for i in range(1, remaining + 1):
+                        dist = s_avg * _eff_step / 100 * i
+                        p_dca = s_avg - dist if s_dir == "LONG" else s_avg + dist
+                        if s_dir == "LONG" and sl_price and p_dca <= sl_price:
+                            break
+                        if s_dir == "SHORT" and sl_price and p_dca >= sl_price:
+                            break
+                        dca_prices_init.append(round(p_dca, 8))
+
             await websocket.send_text(json.dumps({
                 "type":               "session",
                 "session":            sess,
@@ -1540,6 +1564,7 @@ async def ws_endpoint(websocket: WebSocket):
                 "sl_price":           sl_price,
                 "override_tp_price":  _engine._override_tp_price if _engine else None,
                 "override_sl_price":  _engine._override_sl_price if _engine else None,
+                "dca_prices":         dca_prices_init,
             }))
 
         # Surface any stored exchange startup error immediately
