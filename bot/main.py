@@ -83,6 +83,8 @@ _trading_active: bool = False          # persisted in config.trading_active
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _telegram_listener: TelegramListener | None = None
+_tg_auth_state: Dict[str, str] = {}   # transient: {"phone": ..., "phone_code_hash": ...}
+_tg_auth_client = None                 # temporary TelegramClient used only during auth flow
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
 _last_position_check: float = 0.0     # throttle REST position sync
@@ -1045,6 +1047,121 @@ async def api_reset(body: Dict):
     price = _last_price or await _rest.get_mark_price(cfg.symbol)
     await _engine.force_close_all(cfg, price)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Telegram auth endpoints (one-time phone auth to generate session string)
+# ---------------------------------------------------------------------------
+
+async def _restart_telegram_listener(cfg) -> None:
+    """Stop the current listener (if any) and start a fresh one from config."""
+    global _telegram_listener
+    if _telegram_listener:
+        await _telegram_listener.stop()
+        _telegram_listener = None
+    if cfg.telegram_api_id and cfg.telegram_api_hash and cfg.telegram_channels:
+        channel_ids = [c.strip() for c in cfg.telegram_channels.split(",") if c.strip()]
+        _telegram_listener = TelegramListener(
+            api_id=int(cfg.telegram_api_id),
+            api_hash=cfg.telegram_api_hash,
+            session_str=cfg.telegram_session,
+            channel_ids=channel_ids,
+            on_signal_update=_on_telegram_signals,
+            on_session_save=_on_session_save,
+        )
+        asyncio.create_task(_telegram_listener.start())
+
+
+@app.post("/api/telegram/send_code")
+async def api_tg_send_code(body: Dict):
+    global _tg_auth_client, _tg_auth_state
+    phone = (body.get("phone") or "").strip()
+    if not phone:
+        return JSONResponse(status_code=400, content={"error": "phone required"})
+
+    cfg = await load_config()
+    if not cfg.telegram_api_id or not cfg.telegram_api_hash:
+        return JSONResponse(status_code=400, content={"error": "telegram_api_id / telegram_api_hash not configured"})
+
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+
+        if _tg_auth_client:
+            await _tg_auth_client.disconnect()
+
+        _tg_auth_client = TelegramClient(
+            StringSession(),
+            int(cfg.telegram_api_id),
+            cfg.telegram_api_hash,
+        )
+        await _tg_auth_client.connect()
+        result = await _tg_auth_client.send_code_request(phone)
+        _tg_auth_state = {"phone": phone, "phone_code_hash": result.phone_code_hash}
+        return {"ok": True}
+    except Exception as exc:
+        logger.error("Telegram send_code failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/api/telegram/verify_code")
+async def api_tg_verify_code(body: Dict):
+    global _tg_auth_client, _tg_auth_state, _telegram_listener
+    phone = (body.get("phone") or "").strip()
+    code  = str(body.get("code") or "").strip()
+    if not phone or not code:
+        return JSONResponse(status_code=400, content={"error": "phone and code required"})
+    if not _tg_auth_state.get("phone_code_hash"):
+        return JSONResponse(status_code=400, content={"error": "send_code must be called first"})
+
+    try:
+        from telethon.errors import SessionPasswordNeededError
+
+        await _tg_auth_client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=_tg_auth_state["phone_code_hash"],
+        )
+        session_str = _tg_auth_client.session.save()
+        await _tg_auth_client.disconnect()
+        _tg_auth_client = None
+        _tg_auth_state.clear()
+
+        await _on_session_save(session_str)
+        cfg = await load_config()
+        await _restart_telegram_listener(cfg)
+        return {"ok": True, "message": "Authenticated successfully"}
+
+    except SessionPasswordNeededError:
+        return {"ok": False, "needs_password": True}
+    except Exception as exc:
+        logger.error("Telegram verify_code failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.post("/api/telegram/verify_password")
+async def api_tg_verify_password(body: Dict):
+    global _tg_auth_client, _tg_auth_state, _telegram_listener
+    password = body.get("password") or ""
+    if not password:
+        return JSONResponse(status_code=400, content={"error": "password required"})
+    if not _tg_auth_client:
+        return JSONResponse(status_code=400, content={"error": "no active auth session — call send_code first"})
+
+    try:
+        await _tg_auth_client.sign_in(password=password)
+        session_str = _tg_auth_client.session.save()
+        await _tg_auth_client.disconnect()
+        _tg_auth_client = None
+        _tg_auth_state.clear()
+
+        await _on_session_save(session_str)
+        cfg = await load_config()
+        await _restart_telegram_listener(cfg)
+        return {"ok": True}
+    except Exception as exc:
+        logger.error("Telegram verify_password failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 # ---------------------------------------------------------------------------
