@@ -1157,17 +1157,17 @@ class TradingEngine:
                                  "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
                 return  # hard return, not just else
 
-            # Gate 1b: Require minimum signal conviction for DCA.
-            # NEUTRAL signal (strength=0, no direction) means signal engine
-            # has no view — do not average down without any supporting evidence.
-            if signal["direction"] == "NEUTRAL" or signal["strength"] < cfg.min_signal_strength * 1.2:
+            # Gate 1b: Block DCA only when signal is completely NEUTRAL (no direction at all).
+            # Strength is NOT checked here — when price is falling, signal naturally weakens
+            # but that is exactly when DCA is needed. Blocking on low strength would prevent
+            # averaging down at the right moment (as seen in practice: 5.1% strength blocked
+            # a valid DCA when price was -9% from entry with LONG signal still intact).
+            if signal["direction"] == "NEUTRAL":
                 logger.info(
-                    "TradingEngine: DCA skipped — no signal conviction "
-                    "(dir=%s strength=%.2f)",
-                    signal["direction"], signal["strength"],
+                    "TradingEngine: DCA skipped — signal fully NEUTRAL, no supporting evidence"
                 )
                 self._broadcast({"type": "notification",
-                                 "text": f"DCA skipped: no signal ({signal['direction']} str={signal['strength']:.2f})"})
+                                 "text": "DCA skipped: signal NEUTRAL"})
                 return
 
             # Gate 2: Smart DCA reversal-indicator gate
