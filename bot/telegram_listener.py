@@ -51,32 +51,6 @@ class TelegramListener:
             self._api_hash,
         )
 
-        # Resolve channel identifiers: numeric strings → int, @username → str
-        chats = []
-        for entry in self._channel_ids:
-            entry = entry.strip()
-            if not entry:
-                continue
-            try:
-                chats.append(int(entry))
-            except ValueError:
-                chats.append(entry)  # @username or plain username
-
-        @self._client.on(events.NewMessage(chats=chats if chats else None))
-        async def _on_new_message(event: events.NewMessage.Event) -> None:
-            try:
-                chat = await event.get_chat()
-                channel_name = getattr(chat, "username", None) or str(chat.id)
-            except Exception:
-                channel_name = "unknown"
-
-            signal = self._parse_signal(event.raw_text or "", channel_name)
-            if signal is None:
-                return
-
-            self._upsert_signal(signal)
-            await self._on_signal_update(self.signals)
-
         try:
             await self._client.connect()
         except (AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError) as exc:
@@ -96,6 +70,43 @@ class TelegramListener:
 
         # Persist the (potentially refreshed) session string
         await self._on_session_save(self._client.session.save())
+
+        # Resolve channel identifiers to entity objects so Telethon never
+        # tries to look up "@me" (which does not exist as a public username).
+        me = await self._client.get_me()
+        me_username = (me.username or "").lower() if me else ""
+
+        resolved = []
+        for entry in self._channel_ids:
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                if entry.lower() == "me":
+                    resolved.append(me)
+                else:
+                    resolved.append(await self._client.get_entity(entry))
+            except Exception as exc:
+                logger.warning("Could not resolve Telegram channel %r: %s", entry, exc)
+
+        @self._client.on(events.NewMessage(chats=resolved if resolved else None))
+        async def _on_new_message(event: events.NewMessage.Event) -> None:
+            try:
+                chat = await event.get_chat()
+                uname = getattr(chat, "username", None)
+                if me_username and (uname or "").lower() == me_username:
+                    channel_name = "Saved Messages"
+                else:
+                    channel_name = uname or getattr(chat, "title", None) or "me"
+            except Exception:
+                channel_name = "unknown"
+
+            signal = self._parse_signal(event.raw_text or "", channel_name)
+            if signal is None:
+                return
+
+            self._upsert_signal(signal)
+            await self._on_signal_update(self.signals)
 
         try:
             await self._client.run_until_disconnected()
