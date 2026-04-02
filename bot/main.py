@@ -140,7 +140,7 @@ async def _do_broadcast(msg: Dict) -> None:
             # that just caused a loss.
             if sessions:
                 last = sessions[0]   # most recent (get_sessions orders DESC)
-                if last.get("exit_reason") == "rescue_trail":
+                if last.get("exit_reason") in ("rescue_trail", "rescue_adverse"):
                     sym = last.get("symbol", "")
                     if sym:
                         _symbol_cooldowns[sym] = time.time()
