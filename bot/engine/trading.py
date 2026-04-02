@@ -171,23 +171,31 @@ class TradingEngine:
         # Compute DCA level prices for chart display.
         # Shows next 3 potential DCA levels from current avg price.
         dca_prices = []
-        if self._session and self._entry_adaptive:
-            s_avg    = self._session.get("avg_price", 0)
-            s_dir    = self._session.get("direction", "LONG")
-            step_pct = self._entry_adaptive.get("dca_step_pct", 0)
-            remaining = max(1, 3)   # show next 3 levels
-            if s_avg > 0 and step_pct > 0:
-                # Mirror actual execution: compress step if it would exceed SL
-                _liq_pct_display  = (1.0 / leverage) * 100 if leverage > 0 else 10.0
-                _sl_pct_display   = _liq_pct_display * self._last_resort_buffer_cache
-                _safe_display     = _sl_pct_display * 0.85
-                _max_step_display = (_safe_display / remaining) if remaining > 0 else step_pct
-                eff_step_pct      = min(step_pct, _max_step_display)
-                for i in range(1, 4):
+        if self._session and self._entry_adaptive and sl_price is not None:
+            s_avg      = self._session.get("avg_price", 0)
+            s_dir      = self._session.get("direction", "LONG")
+            s_dca_done = self._session.get("dca_count", 0)
+            step_pct   = self._entry_adaptive.get("dca_step_pct", 0)
+            max_dca    = self._entry_adaptive.get("max_dca", 3)
+            remaining  = max(0, max_dca - s_dca_done)
+
+            if s_avg > 0 and step_pct > 0 and remaining > 0:
+                _liq_pct  = (1.0 / leverage) * 100 if leverage > 0 else 10.0
+                _sl_pct   = _liq_pct * self._last_resort_buffer_cache
+                _safe     = _sl_pct * 0.85
+                _max_step = _safe / remaining if remaining > 0 else step_pct
+                eff_step  = min(step_pct, _max_step)
+
+                for i in range(1, remaining + 1):
+                    dist = s_avg * eff_step / 100 * i
                     if s_dir == "LONG":
-                        dca_price = s_avg * (1 - eff_step_pct / 100 * i)
+                        dca_price = s_avg - dist
+                        if dca_price <= sl_price:
+                            break
                     else:
-                        dca_price = s_avg * (1 + eff_step_pct / 100 * i)
+                        dca_price = s_avg + dist
+                        if dca_price >= sl_price:
+                            break
                     dca_prices.append(round(dca_price, 8))
 
         self._broadcast({
@@ -835,6 +843,7 @@ class TradingEngine:
         self._trail_activated = False
         self._trail_price = None
         self._entry_adaptive = entry_adaptive  # locked for life of this trade
+        self._entry_adaptive["max_dca"] = cfg.max_dca  # stored for _push_session access
         self._last_resort_buffer_cache = cfg.last_resort_sl_buffer  # needed by first _push_session
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
