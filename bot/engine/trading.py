@@ -168,6 +168,22 @@ class TradingEngine:
                     sl_price = avg * (1 - sl_pct)
                 else:
                     sl_price = avg * (1 + sl_pct)
+        # Compute DCA level prices for chart display.
+        # Shows next 3 potential DCA levels from current avg price.
+        dca_prices = []
+        if self._session and self._entry_adaptive:
+            s_avg    = self._session.get("avg_price", 0)
+            s_dir    = self._session.get("direction", "LONG")
+            step_pct = self._entry_adaptive.get("dca_step_pct", 0)
+            if s_avg > 0 and step_pct > 0:
+                # Show next 3 potential DCA levels from current avg
+                for i in range(1, 4):
+                    if s_dir == "LONG":
+                        dca_price = s_avg * (1 - step_pct / 100 * i)
+                    else:
+                        dca_price = s_avg * (1 + step_pct / 100 * i)
+                    dca_prices.append(round(dca_price, 8))
+
         self._broadcast({
             "type":                  "session",
             "session":               self._session,
@@ -179,6 +195,7 @@ class TradingEngine:
             "override_tp_price":     self._override_tp_price,
             "override_sl_price":     self._override_sl_price,
             "breakeven_stop_price":  self._breakeven_stop_price,
+            "dca_prices":            dca_prices,
         })
 
     def _pos_log(self, event: str, **kw) -> None:

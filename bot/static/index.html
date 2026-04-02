@@ -1396,6 +1396,7 @@ let _tpLine    = null;
 let _slLine    = null;
 let _trailLine = null;
 let _hedgeLines = [];   // one price line per open hedge
+let _dcaLines   = [];   // DCA trigger level lines on chart
 
 // entry/exit markers [ {time, position, color, shape, text} ]
 let _markers = [];
@@ -1685,6 +1686,22 @@ function dispatch(msg) {
       curTrailActive = !!msg.trail_active;
       curTpPrice     = msg.tp_price  ?? null;
       curSlPrice     = msg.sl_price  ?? null;
+      // Draw DCA level lines
+      _dcaLines.forEach(l => _removeLine(l));
+      _dcaLines = [];
+      if (msg.dca_prices?.length && csSeries) {
+        msg.dca_prices.forEach((p, i) => {
+          const line = csSeries.createPriceLine({
+            price:            p,
+            color:            'rgba(240,180,41,0.50)',
+            lineWidth:        1,
+            lineStyle:        LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title:            i === 0 ? 'DCA 1' : i === 1 ? 'DCA 2' : 'DCA 3',
+          });
+          _dcaLines.push(line);
+        });
+      }
       // Sync manual overrides from engine (keeps other tabs in sync too)
       if (msg.override_tp_price !== undefined) _overrideTpPrice = msg.override_tp_price;
       if (msg.override_sl_price !== undefined) _overrideSlPrice = msg.override_sl_price;
@@ -1998,6 +2015,8 @@ function clearTradeLevels() {
   _trailLine = _removeLine(_trailLine);
   _hedgeLines.forEach(l => _removeLine(l));
   _hedgeLines = [];
+  _dcaLines.forEach(l => _removeLine(l));
+  _dcaLines = [];
 }
 
 function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
