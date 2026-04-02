@@ -405,7 +405,7 @@ class TradingEngine:
         self.last_indicators  = compute_all(candles)
 
         new_last_time = candles[-1]["time"] if candles else 0
-        if new_last_time != prev_last_time and self._trail_activated and self._session:
+        if new_last_time != prev_last_time and self._session:
             self._adjust_trail_on_candle_close()
 
     def _adjust_trail_on_candle_close(self) -> None:
@@ -432,19 +432,22 @@ class TradingEngine:
         entry     = self._session["entry_price"]
         ind       = self.last_indicators
 
-        # ── 1. Trail Stop tightening (existing logic) ──
-        new_mult = self._momentum_trail_mult(ind, direction)
-        if new_mult < self._trail_pct_mult:
-            old_mult = self._trail_pct_mult
-            self._trail_pct_mult = new_mult
-            logger.info(
-                "TradingEngine: trail tightened on candle close  "
-                "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
-                old_mult,
-                new_mult,
-                ind.get("rsi") or 0.0,
-                (ind.get("macd") or {}).get("hist", 0.0),
-            )
+        # ── 1. Trail Stop tightening — only when trail is armed ──
+        # _trail_pct_mult tightens the gap between price and trail_stop on the
+        # next ratchet. No point running this before trail is active.
+        if self._trail_activated:
+            new_mult = self._momentum_trail_mult(ind, direction)
+            if new_mult < self._trail_pct_mult:
+                old_mult = self._trail_pct_mult
+                self._trail_pct_mult = new_mult
+                logger.info(
+                    "TradingEngine: trail tightened on candle close  "
+                    "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
+                    old_mult,
+                    new_mult,
+                    ind.get("rsi") or 0.0,
+                    (ind.get("macd") or {}).get("hist", 0.0),
+                )
 
         # ── 2. Trail Arm (tp_pct) live recalculation ──
         atr_val = ind.get("atr")
