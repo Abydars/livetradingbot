@@ -755,20 +755,6 @@ class TradingEngine:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
             return
 
-        # High ATR guard: on high-leverage isolated margin, a large ATR means
-        # DCA step will exceed liquidation distance — DCA can never fire before liq.
-        # Block entry when ATR% exceeds the Last Resort SL distance.
-        liq_pct        = (1.0 / cfg.leverage) * 100 if cfg.leverage > 0 else 10.0
-        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
-        atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
-        dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
-        if dca_step_would_be >= last_resort_pct:
-            _blocked(
-                f"ATR too high ({atr_pct_cur:.1f}%) — DCA step ({dca_step_would_be:.1f}%) "
-                f"would exceed SL distance ({last_resort_pct:.1f}%) at {cfg.leverage}x leverage"
-            )
-            return
-
         entry_adaptive = self._compute_adaptive(atr_val, price, strength)
         if entry_adaptive["tp_pct"] < 0.4:
             logger.info(
@@ -780,15 +766,11 @@ class TradingEngine:
             return
 
         # Auto leverage: adjust leverage downward so DCA step fits within
-        # Last Resort SL distance. On high-ATR coins, the configured leverage
-        # can cause the DCA trigger to fall below liquidation price — meaning
-        # DCA can never fire. Auto-leverage prevents this.
-        #
-        # Formula: leverage < (buffer × 100) / (atr_pct × 1.5)
-        # With 15% safety margin and capped at configured leverage.
+        # Last Resort SL distance. Must run BEFORE the ATR guard so the guard
+        # uses the reduced leverage when checking if DCA fits.
+        atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
         effective_leverage = cfg.leverage
         if cfg.auto_leverage and atr_val > 0:
-            atr_pct_cur   = (atr_val / price * 100) if price > 0 else 1.0
             buffer        = cfg.last_resort_sl_buffer
             max_safe_lev  = (buffer * 100) / (atr_pct_cur * 1.5)
             max_safe_lev  = max_safe_lev * 0.85   # 15% safety margin
@@ -800,7 +782,19 @@ class TradingEngine:
                     "(ATR=%.2f%%, DCA step would exceed SL at %dx)",
                     cfg.leverage, effective_leverage, atr_pct_cur, cfg.leverage,
                 )
-                _blocked_msg = None  # not blocked, just adjusted
+
+        # High ATR guard: after auto-leverage adjustment, verify DCA step still
+        # fits within Last Resort SL distance. Uses effective_leverage (reduced).
+        # Only blocks if auto-leverage couldn't fix the mismatch (leverage already at min).
+        liq_pct         = (1.0 / effective_leverage) * 100 if effective_leverage > 0 else 10.0
+        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
+        dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
+        if dca_step_would_be >= last_resort_pct:
+            _blocked(
+                f"ATR too high ({atr_pct_cur:.1f}%) — DCA step ({dca_step_would_be:.1f}%) "
+                f"would exceed SL distance ({last_resort_pct:.1f}%) at {effective_leverage}x leverage"
+            )
+            return
 
         # Strength-based sizing: scale margin by signal strength (floored at strength_size_min)
         if cfg.strength_sizing:
