@@ -723,6 +723,21 @@ class TradingEngine:
         if atr_val <= 0:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
             return
+
+        # High ATR guard: on high-leverage isolated margin, a large ATR means
+        # DCA step will exceed liquidation distance — DCA can never fire before liq.
+        # Block entry when ATR% exceeds the Last Resort SL distance.
+        liq_pct        = (1.0 / cfg.leverage) * 100 if cfg.leverage > 0 else 10.0
+        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
+        atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
+        dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
+        if dca_step_would_be >= last_resort_pct:
+            _blocked(
+                f"ATR too high ({atr_pct_cur:.1f}%) — DCA step ({dca_step_would_be:.1f}%) "
+                f"would exceed SL distance ({last_resort_pct:.1f}%) at {cfg.leverage}x leverage"
+            )
+            return
+
         entry_adaptive = self._compute_adaptive(atr_val, price, strength)
         if entry_adaptive["tp_pct"] < 0.4:
             logger.info(
@@ -733,21 +748,42 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
+        # Auto leverage: adjust leverage downward so DCA step fits within
+        # Last Resort SL distance. On high-ATR coins, the configured leverage
+        # can cause the DCA trigger to fall below liquidation price — meaning
+        # DCA can never fire. Auto-leverage prevents this.
+        #
+        # Formula: leverage < (buffer × 100) / (atr_pct × 1.5)
+        # With 15% safety margin and capped at configured leverage.
+        effective_leverage = cfg.leverage
+        if cfg.auto_leverage and atr_val > 0:
+            atr_pct_cur   = (atr_val / price * 100) if price > 0 else 1.0
+            buffer        = cfg.last_resort_sl_buffer
+            max_safe_lev  = (buffer * 100) / (atr_pct_cur * 1.5)
+            max_safe_lev  = max_safe_lev * 0.85   # 15% safety margin
+            safe_lev      = max(1, int(max_safe_lev))
+            if safe_lev < cfg.leverage:
+                effective_leverage = safe_lev
+                logger.info(
+                    "TradingEngine: auto-leverage reduced %dx → %dx "
+                    "(ATR=%.2f%%, DCA step would exceed SL at %dx)",
+                    cfg.leverage, effective_leverage, atr_pct_cur, cfg.leverage,
+                )
+                _blocked_msg = None  # not blocked, just adjusted
+
         # Strength-based sizing: scale margin by signal strength (floored at strength_size_min)
         if cfg.strength_sizing:
             scale = max(strength, cfg.strength_size_min)
             effective_margin = cfg.margin_usdt * scale
         else:
             effective_margin = cfg.margin_usdt
-        qty = self._executor.calc_qty(cfg.symbol, effective_margin, cfg.leverage, price)
+        qty = self._executor.calc_qty(cfg.symbol, effective_margin, effective_leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
-        # Sync leverage to Binance before opening — Binance keeps its own
-        # per-symbol leverage setting that defaults to 20x and must be set
-        # explicitly, otherwise the exchange margin display will be wrong.
-        await self._executor.ensure_leverage(cfg.symbol, cfg.leverage)
+        # Sync leverage to Binance before opening
+        await self._executor.ensure_leverage(cfg.symbol, effective_leverage)
 
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(
@@ -766,7 +802,7 @@ class TradingEngine:
             entry_price=fill_price,
             qty=qty,
             margin=effective_margin,
-            leverage=cfg.leverage,
+            leverage=effective_leverage,
             entry_reason=signal["reason"],
             signal_strength=strength,
             signal_price=price,
