@@ -175,13 +175,19 @@ class TradingEngine:
             s_avg    = self._session.get("avg_price", 0)
             s_dir    = self._session.get("direction", "LONG")
             step_pct = self._entry_adaptive.get("dca_step_pct", 0)
+            remaining = max(1, 3)   # show next 3 levels
             if s_avg > 0 and step_pct > 0:
-                # Show next 3 potential DCA levels from current avg
+                # Mirror actual execution: compress step if it would exceed SL
+                _liq_pct_display  = (1.0 / leverage) * 100 if leverage > 0 else 10.0
+                _sl_pct_display   = _liq_pct_display * self._last_resort_buffer_cache
+                _safe_display     = _sl_pct_display * 0.85
+                _max_step_display = (_safe_display / remaining) if remaining > 0 else step_pct
+                eff_step_pct      = min(step_pct, _max_step_display)
                 for i in range(1, 4):
                     if s_dir == "LONG":
-                        dca_price = s_avg * (1 - step_pct / 100 * i)
+                        dca_price = s_avg * (1 - eff_step_pct / 100 * i)
                     else:
-                        dca_price = s_avg * (1 + step_pct / 100 * i)
+                        dca_price = s_avg * (1 + eff_step_pct / 100 * i)
                     dca_prices.append(round(dca_price, 8))
 
         self._broadcast({
@@ -1197,7 +1203,22 @@ class TradingEngine:
                 # next tick when price_pct > 0 and dca_count > 0.
 
         # ---- DCA ------------------------------------------------------------
-        if dca_count < cfg.max_dca and price_pct <= -p["dca_step_pct"] and not self._hedges:
+        # Compute SL-aware effective DCA step.
+        # Distribute remaining DCAs evenly within the safe zone (85% of distance
+        # from avg_price to Last Resort SL). If ATR-based step fits, use it as-is.
+        # If not, compress spacing so all DCAs fit before the SL fires.
+        _liq_pct      = (1.0 / leverage) * 100 if leverage > 0 else 10.0
+        _sl_pct       = _liq_pct * cfg.last_resort_sl_buffer
+        _remaining    = cfg.max_dca - dca_count
+        _SAFETY       = 0.85
+        _safe_zone    = _sl_pct * _SAFETY   # % distance available (safe)
+        if _remaining > 0:
+            _max_step = _safe_zone / _remaining   # compress if needed
+            _eff_step = min(p["dca_step_pct"], _max_step)
+        else:
+            _eff_step = p["dca_step_pct"]
+
+        if dca_count < cfg.max_dca and price_pct <= -_eff_step and not self._hedges:
             opposite = "SHORT" if direction == "LONG" else "LONG"
 
             # Gate 1: Signal must not actively disagree with main direction
@@ -1238,7 +1259,7 @@ class TradingEngine:
             # Gate 3: Minimum time between DCAs (prevents rapid DCA burn)
             # Even if all other gates pass, enforce a cooldown between DCAs.
             now = time.time()
-            min_dca_gap_s = max(p["dca_step_pct"] * 60, 120)  # at least 2 min, scales with dca_step
+            min_dca_gap_s = max(_eff_step * 60, 120)  # at least 2 min, scales with effective step
             if self._last_dca_time is not None:
                 elapsed = now - self._last_dca_time
                 if elapsed < min_dca_gap_s:
