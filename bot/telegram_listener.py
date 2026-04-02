@@ -15,8 +15,18 @@ from telethon.sessions import StringSession
 
 logger = logging.getLogger("telegram_listener")
 
-_SYMBOL_RE = re.compile(r'\b([A-Z]{2,10}USDT)\b')
+# Priority-1: pair with separator  e.g. "KAT USDT", "BTC/USDT", "ETH-USDT"
+_PAIR_SEP_RE = re.compile(
+    r'\b([A-Z]{2,10})\s*[/\-_ ]\s*(USDT|BTC|ETH|BNB|BUSD)\b',
+    re.IGNORECASE,
+)
+# Priority-2: direct pair already joined  e.g. "KATUSDT", "BTCUSDT"
+_PAIR_DIRECT_RE = re.compile(
+    r'\b([A-Z]{2,10}(USDT|BTC|ETH|BNB|BUSD))\b',
+    re.IGNORECASE,
+)
 _DIRECTION_RE = re.compile(r'\b(LONG|SHORT|BUY|SELL)\b', re.IGNORECASE)
+_STABLECOIN_BASE = {"USDT", "BUSD"}   # bases that are obviously not a real coin
 
 _MAX_SIGNALS = 20
 
@@ -123,17 +133,45 @@ class TelegramListener:
     # ------------------------------------------------------------------
 
     def _parse_signal(self, text: str, channel: str) -> dict | None:
-        upper = text.upper()
+        # --- symbol extraction (priority 1: separated pair) ---
+        symbol: str | None = None
+        m = _PAIR_SEP_RE.search(text)
+        if m:
+            base  = m.group(1).upper()
+            quote = m.group(2).upper()
+            symbol = base + quote
+        else:
+            m = _PAIR_DIRECT_RE.search(text)
+            if m:
+                symbol = m.group(1).upper()
 
-        symbol_match = _SYMBOL_RE.search(upper)
-        if not symbol_match:
+        if not symbol:
+            logger.debug("Telegram parse failed | channel=%s | text=%s", channel, text[:100])
             return None
 
-        direction_match = _DIRECTION_RE.search(upper)
+        # strip quote currency then re-attach cleanly (handles double-quote edge cases)
+        for q in ("USDT", "BTC", "ETH", "BNB", "BUSD"):
+            if symbol.endswith(q) and symbol != q:
+                base_part = symbol[: -len(q)]
+                symbol = base_part + q
+                break
+
+        # validation: 4-12 chars total, base must not be empty or quote-only
+        base_only = symbol
+        for q in ("USDT", "BTC", "ETH", "BNB", "BUSD"):
+            if base_only.endswith(q):
+                base_only = base_only[: -len(q)]
+                break
+        if not (4 <= len(symbol) <= 12) or base_only in _STABLECOIN_BASE or not base_only:
+            logger.debug("Telegram parse failed | channel=%s | text=%s", channel, text[:100])
+            return None
+
+        # --- direction extraction ---
+        direction_match = _DIRECTION_RE.search(text)
         if not direction_match:
+            logger.debug("Telegram parse failed | channel=%s | text=%s", channel, text[:100])
             return None
 
-        symbol = symbol_match.group(1)
         raw_dir = direction_match.group(1).upper()
         bias = "LONG" if raw_dir in ("LONG", "BUY") else "SHORT"
 
