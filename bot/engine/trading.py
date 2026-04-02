@@ -723,6 +723,21 @@ class TradingEngine:
         if atr_val <= 0:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
             return
+
+        # High ATR guard: on high-leverage isolated margin, a large ATR means
+        # DCA step will exceed liquidation distance — DCA can never fire before liq.
+        # Block entry when ATR% exceeds the Last Resort SL distance.
+        liq_pct        = (1.0 / cfg.leverage) * 100 if cfg.leverage > 0 else 10.0
+        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
+        atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
+        dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
+        if dca_step_would_be >= last_resort_pct:
+            _blocked(
+                f"ATR too high ({atr_pct_cur:.1f}%) — DCA step ({dca_step_would_be:.1f}%) "
+                f"would exceed SL distance ({last_resort_pct:.1f}%) at {cfg.leverage}x leverage"
+            )
+            return
+
         entry_adaptive = self._compute_adaptive(atr_val, price, strength)
         if entry_adaptive["tp_pct"] < 0.4:
             logger.info(
