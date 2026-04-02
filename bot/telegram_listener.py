@@ -4,12 +4,16 @@ telegram_listener.py — Listens to Telegram channels for trading signals.
 Uses Telethon with StringSession so no session file is written to disk.
 The session string is persisted back to the DB via on_session_save callback.
 """
+import logging
 import re
 import time
 from typing import Callable, Awaitable
 
 from telethon import TelegramClient, events
+from telethon.errors import AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError
 from telethon.sessions import StringSession
+
+logger = logging.getLogger("telegram_listener")
 
 _SYMBOL_RE = re.compile(r'\b([A-Z]{2,10}USDT)\b')
 _DIRECTION_RE = re.compile(r'\b(LONG|SHORT|BUY|SELL)\b', re.IGNORECASE)
@@ -73,17 +77,30 @@ class TelegramListener:
             self._upsert_signal(signal)
             await self._on_signal_update(self.signals)
 
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            raise RuntimeError(
-                "Telegram session is not authorised. "
-                "Complete phone-number auth and store the session string in DB."
+        try:
+            await self._client.connect()
+        except (AuthKeyError, AuthKeyUnregisteredError, UserDeactivatedBanError) as exc:
+            logger.warning(
+                "Telegram not authenticated — use /api/telegram/send_code to authenticate (%s)", exc
             )
+            self._client = None
+            return
+
+        if not await self._client.is_user_authorized():
+            logger.warning(
+                "Telegram not authenticated — use /api/telegram/send_code to authenticate"
+            )
+            await self._client.disconnect()
+            self._client = None
+            return
 
         # Persist the (potentially refreshed) session string
         await self._on_session_save(self._client.session.save())
 
-        await self._client.run_until_disconnected()
+        try:
+            await self._client.run_until_disconnected()
+        except (AuthKeyError, AuthKeyUnregisteredError) as exc:
+            logger.warning("Telegram session invalidated: %s", exc)
 
     async def stop(self) -> None:
         if self._client is not None:

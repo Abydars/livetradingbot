@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -44,13 +43,11 @@ from database import (
     set_config_bulk,
     update_session,
 )
-from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
 from engine.trading import TradingEngine
 from exchange.binance_rest import BinanceRestClient
 from exchange.binance_ws import BinanceWebSocket
 from exchange.order_executor import OrderExecutor
-from notifications import notify
 from telegram_listener import TelegramListener
 
 logging.basicConfig(

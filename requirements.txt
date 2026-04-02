@@ -8,3 +8,4 @@ pydantic-settings>=2.2.0
 aiohttp
 python-dotenv>=1.0.0
 cryptography
+telethon>=1.36.0
