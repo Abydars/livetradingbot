@@ -392,12 +392,12 @@ async def _scanner_loop() -> None:
             position_open = _engine is not None and _engine._session is not None
             should_scan   = _force_scan or (now - _last_symbol_scan >= cfg.scan_interval_s)
 
-            if _force_scan and cfg.auto_switch:
-                # Position just closed — scan immediately regardless of position state
+            if _force_scan:
+                # Manual Scan Now button or trade close — always run regardless of auto_switch
                 _force_scan = False
                 await _scan_symbols(cfg)
             elif should_scan and cfg.auto_switch and not position_open:
-                # Regular interval scan — skip if position is open
+                # Regular interval scan — only when auto_switch enabled and no position
                 await _scan_symbols(cfg)
 
         except asyncio.CancelledError:
