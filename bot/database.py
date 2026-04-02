@@ -88,22 +88,14 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "min_signal_strength": "0.25",
     "trading_mode":        "paper",
     "discord_webhook":     "",
-    "auto_switch":         "1",
-    "scan_interval_s":     "5",
-    "htf_filter":          "1",   # block entries when HTF EMA bias contradicts signal direction
-    "htf_timeframe":       "",    # override HTF timeframe (empty = auto based on trading TF)
-    "flow_warmup_mult":    "1.0",   # flow warmup window multiplier (1.0 = default ~50% of candle period, 2.0 = double)
-    "auto_leverage":       "1",    # auto-adjust leverage based on ATR so DCA fits within SL distance
-    "signal_persist_ticks": "2",   # ticks signal must hold before entry (0 = disabled)
+    "auto_leverage":       "1",
+    "signal_persist_ticks": "2",
     "timeframe":           "1m",
     "trading_active":      "0",
-    "switch_threshold":    "1.1",
-    "entry_wait_candles":  "3",     # candles to wait (NEUTRAL) before trying next symbol
-    "scanner_top_n":       "10",   # how many symbols to show in the scanner sidebar
-    "scanner_momentum":    "1",   # enable momentum scanner (vol surge + acceleration)
-    "scanner_breakout":    "1",   # enable breakout scanner (BB squeeze + N-candle high/low)
-    "scanner_trendpull":   "1",   # enable trend pullback scanner (EMA bounce setups)
-    "scanner_breakdown":   "1",   # enable breakdown scanner (SHORT: sell rally in downtrend)
+    "telegram_api_id":     "",
+    "telegram_api_hash":   "",
+    "telegram_channels":   "",
+    "telegram_session":    "",
     "cooldown_after_stop_s": "300",
     "max_daily_loss_usdt":   "0",
     "dca_multiplier":        "1.0",

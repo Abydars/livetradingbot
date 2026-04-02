@@ -54,21 +54,14 @@ class BotConfig:
     # Chart / candle timeframe
     timeframe: str
 
-    # Auto-switch
-    auto_switch: bool
-    scan_interval_s: int
-    htf_filter: bool
-    htf_timeframe: str   # empty = auto, otherwise e.g. "4h", "1d"
-    flow_warmup_mult: float
     auto_leverage: bool
     signal_persist_ticks: int
-    switch_threshold: float  # min score ratio for #1 vs current to trigger switch
-    entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
-    scanner_top_n: int
-    scanner_momentum:  bool
-    scanner_breakout:  bool
-    scanner_trendpull: bool
-    scanner_breakdown: bool
+
+    # Telegram User API
+    telegram_api_id: str
+    telegram_api_hash: str
+    telegram_channels: str
+    telegram_session: str
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -147,20 +140,12 @@ async def load_config() -> BotConfig:
         trading_mode=trading_mode,
         key_type=key_type,
         discord_webhook=_s("discord_webhook", ""),
-        auto_switch=_b("auto_switch", True),
-        scan_interval_s=_i("scan_interval_s", 10),
-        htf_filter=_b("htf_filter", True),
-        htf_timeframe=_s("htf_timeframe", ""),
-        flow_warmup_mult=_f("flow_warmup_mult", 1.0),
         auto_leverage=_b("auto_leverage", True),
         signal_persist_ticks=_i("signal_persist_ticks", 2),
-        switch_threshold=_f("switch_threshold", 1.1),
-        entry_wait_candles=_i("entry_wait_candles", 3),
-        scanner_top_n=_i("scanner_top_n", 10),
-        scanner_momentum=_b("scanner_momentum",  True),
-        scanner_breakout=_b("scanner_breakout",   True),
-        scanner_trendpull=_b("scanner_trendpull", True),
-        scanner_breakdown=_b("scanner_breakdown", True),
+        telegram_api_id=_s("telegram_api_id", ""),
+        telegram_api_hash=_s("telegram_api_hash", ""),
+        telegram_channels=_s("telegram_channels", ""),
+        telegram_session=_s("telegram_session", ""),
         api_key=api_key,
         api_secret=api_secret,
     )
