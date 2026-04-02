@@ -1110,7 +1110,14 @@
   <div id="sym-sidebar">
     <div id="sym-sidebar-head">
       WATCHLIST
-      <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button id="scan-now-btn" onclick="triggerScan()" title="Run scanner now"
+          style="font-size:9px;padding:2px 7px;border:1px solid var(--muted);border-radius:3px;
+                 background:transparent;color:var(--muted);cursor:pointer;letter-spacing:.05em">
+          SCAN NOW
+        </button>
+        <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
+      </div>
     </div>
     <div id="entry-wait-bar">
       <div id="ew-row1">
@@ -1503,6 +1510,17 @@ function wsSend(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+function triggerScan() {
+  const btn = document.getElementById('scan-now-btn');
+  if (btn) {
+    btn.textContent = 'SCANNING…';
+    btn.disabled = true;
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+  }
+  wsSend({ type: 'force_scan' });
+}
+
 function setWsDot(state) {
   document.getElementById('ws-dot').className   = state;
   document.getElementById('ws-label').textContent = state === 'connected' ? 'connected' : 'disconnected';
@@ -1536,9 +1554,22 @@ function dispatch(msg) {
       showToast(tradingActive ? 'Trading started' : 'Trading stopped', tradingActive ? 'ok' : '');
       break;
 
-    case 'top_movers':
+    case 'force_scan_ack':
+      // Scanner triggered — button resets when top_movers results arrive
+      break;
+
+    case 'top_movers': {
+      // Reset scan button if it was manually triggered
+      const scanBtn = document.getElementById('scan-now-btn');
+      if (scanBtn && scanBtn.disabled) {
+        scanBtn.textContent = 'SCAN NOW';
+        scanBtn.disabled = false;
+        scanBtn.style.color = '';
+        scanBtn.style.borderColor = '';
+      }
       if (msg.movers?.length) updateSymSidebar(msg.movers);
       break;
+    }
 
     case 'entry_wait': {
       const bar   = document.getElementById('entry-wait-bar');
