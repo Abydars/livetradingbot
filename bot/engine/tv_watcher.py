@@ -102,8 +102,7 @@ class TvWatcher:
             }
 
             # Set scanner type and compute signal
-            self._signal_eng.set_scanner_type(scanner)
-            signal = self._signal_eng.compute(candles, flow, ind)
+            signal = self._signal_eng.compute(candles, flow, ind, scanner_type=scanner)
 
             direction = signal["direction"]
             strength  = signal["strength"]
@@ -203,8 +202,7 @@ class TvWatcher:
                 "trade_count": 30,
             }
 
-            self._signal_eng.set_scanner_type(scanner)
-            signal    = self._signal_eng.compute(candles, flow, ind)
+            signal    = self._signal_eng.compute(candles, flow, ind, scanner_type=scanner)
             direction = signal["direction"]
             strength  = signal["strength"]
             composite = signal.get("composite", 0.0)
