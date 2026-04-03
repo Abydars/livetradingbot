@@ -57,6 +57,8 @@ class BotConfig:
     # Auto-switch
     auto_switch: bool
     scan_interval_s: int
+    tv_scanner_enabled: bool
+    tv_secret:          str
     htf_filter: bool
     htf_timeframe: str   # empty = auto, otherwise e.g. "4h", "1d"
     flow_warmup_mult: float
@@ -149,6 +151,8 @@ async def load_config() -> BotConfig:
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", True),
         scan_interval_s=_i("scan_interval_s", 10),
+        tv_scanner_enabled=_b("tv_scanner_enabled", False),
+        tv_secret=_s("tv_secret", ""),
         htf_filter=_b("htf_filter", True),
         htf_timeframe=_s("htf_timeframe", ""),
         flow_warmup_mult=_f("flow_warmup_mult", 1.0),

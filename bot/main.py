@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -396,8 +396,8 @@ async def _scanner_loop() -> None:
                 # Manual Scan Now button or trade close — always run regardless of auto_switch
                 _force_scan = False
                 await _scan_symbols(cfg)
-            elif should_scan and cfg.auto_switch and not position_open:
-                # Regular interval scan — only when auto_switch enabled and no position
+            elif should_scan and cfg.auto_switch and not position_open and not cfg.tv_scanner_enabled:
+                # Skip internal scanner when TradingView scanner is active
                 await _scan_symbols(cfg)
 
         except asyncio.CancelledError:
@@ -1482,6 +1482,89 @@ async def api_sessions(limit: int = 100):
 async def api_signal_log(limit: int = 100):
     rows = await get_signal_log(limit)
     return {"signal_log": rows}
+
+
+@app.post("/api/tv-signal")
+async def tv_signal(request: Request):
+    """
+    TradingView webhook endpoint. Receives alert and switches bot to that symbol.
+
+    Expected JSON body:
+    {
+        "symbol":    "BTCUSDT",       # Binance USDT-M symbol
+        "direction": "LONG",          # "LONG" or "SHORT"
+        "scanner":   "trendpull",     # optional: "momentum", "breakout", "trendpull", "breakdown"
+        "secret":    "your_secret"    # must match tv_secret config
+    }
+
+    Bot behavior:
+      1. Verifies secret key
+      2. If tv_scanner_enabled: switches to symbol immediately
+      3. Signal engine still verifies before entry (double confirmation)
+    """
+    cfg = await load_config()
+
+    if not cfg.tv_scanner_enabled:
+        return {"ok": False, "error": "TV scanner disabled"}
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+
+    # Security: verify shared secret
+    if cfg.tv_secret and body.get("secret") != cfg.tv_secret:
+        logger.warning("TV webhook: invalid secret from %s", request.client.host)
+        return {"ok": False, "error": "unauthorized"}
+
+    symbol    = str(body.get("symbol", "")).upper().strip()
+    direction = str(body.get("direction", "")).upper().strip()
+    scanner   = str(body.get("scanner", "momentum")).lower().strip()
+
+    if not symbol or not symbol.endswith("USDT"):
+        return {"ok": False, "error": f"invalid symbol: {symbol}"}
+
+    if direction not in ("LONG", "SHORT"):
+        return {"ok": False, "error": f"invalid direction: {direction}"}
+
+    logger.info(
+        "TV webhook: %s %s scanner=%s — switching symbol",
+        direction, symbol, scanner,
+    )
+
+    # Reset auto-switch cycle and switch to TV-suggested symbol
+    global _entry_start_candle, _neutral_since_candle, _tried_syms, _current_scanner_type
+    _entry_start_candle   = 0
+    _neutral_since_candle = 0
+    _tried_syms.clear()
+    _current_scanner_type = scanner
+    if _engine:
+        _engine.set_scanner_type(scanner)
+
+    # Switch symbol (same path as manual switch)
+    await set_config_bulk({"symbol": symbol})
+    if _engine:
+        await _ws.switch_symbol(symbol)
+        global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts
+        _last_candles_fetch = 0.0
+        _htf_bias = "NEUTRAL"
+        _last_htf_fetch = 0.0
+        _last_switch_ts = time.time()
+        raw_candles = await _rest.get_klines(symbol, interval=cfg.timeframe, limit=200)
+        if raw_candles and len(raw_candles) >= 60:
+            fresh = [
+                {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
+                for k in raw_candles
+            ]
+            _engine.update_candles(fresh)
+            _last_candles_fetch = time.time()
+        await _executor.prepare_symbol(symbol, cfg.leverage)
+        await _do_broadcast({"type": "symbol_ready", "symbol": symbol})
+        await _do_broadcast({"type": "notification",
+                             "text": f"TV Signal: {direction} {symbol} ({scanner})"})
+
+    return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
 
 
 @app.get("/api/pos_log")
