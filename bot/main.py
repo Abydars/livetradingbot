@@ -43,6 +43,8 @@ from database import (
     set_config,
     set_config_bulk,
     update_session,
+    save_tv_alert,
+    get_tv_alerts,
 )
 from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
@@ -1321,6 +1323,22 @@ async def lifespan(app: FastAPI):
     _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
 
+    # Restore TV alerts into sidebar cache so page refresh shows previous alerts
+    if cfg.tv_scanner_enabled:
+        stored_alerts = await get_tv_alerts()
+        global _last_top_movers
+        _last_top_movers = [
+            {
+                "symbol":       a["symbol"],
+                "direction":    a["direction"],
+                "scanner_type": a["scanner"],
+                "_bias":        a["direction"],
+                "_scanner":     a["scanner"],
+                "score":        1.0,
+            }
+            for a in stored_alerts
+        ]
+
     # ── Startup position sync ─────────────────────────────────────────────
     # Paper mode: if trading was already stopped when the process died and
     # there is still an open session in the DB, close it now using the
@@ -1572,12 +1590,19 @@ async def tv_signal(request: Request):
         "symbol":       symbol,
         "direction":    direction,
         "scanner_type": scanner,
-        "score":        1.0,   # TV signal = high confidence
+        "score":        1.0,
+        "bias":         direction,   # sidebar reads 'bias' not '_bias'
         "_bias":        direction,
         "_scanner":     scanner,
+        "change":       0.0,         # not available from TradingView — show neutral
+        "vol_surge":    None,        # will be hidden in sidebar (no data)
+        "momentum":     None,        # will be hidden in sidebar (no data)
+        "atr_pct":      None,        # will be hidden in sidebar (no data)
+        "htf_bias":     "",
     }
     _last_top_movers = [new_entry] + existing   # TV signal goes to top
     await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+    await save_tv_alert(symbol, direction, scanner)
 
     return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
 

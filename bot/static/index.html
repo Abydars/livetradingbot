@@ -1791,8 +1791,9 @@ function updateSymSidebar(movers) {
   if (!list) return;
   list.innerHTML = movers.map((m, i) => {
     const active   = m.symbol === currentSymbol ? 'active' : '';
-    const chgCls   = m.change >= 0 ? 'up' : 'dn';
-    const chgSign  = m.change >= 0 ? '+' : '';
+    const change   = m.change ?? 0;
+    const chgCls   = change >= 0 ? 'up' : 'dn';
+    const chgSign  = change >= 0 ? '+' : '';
     const coin     = m.symbol.replace('USDT', '');
     const bias     = m.bias || '';
     const biasCls  = bias === 'LONG' ? 'long' : bias === 'SHORT' ? 'short' : '';
@@ -1808,8 +1809,9 @@ function updateSymSidebar(movers) {
       momentum:  'rgba(88,166,255,.2);color:#58a6ff',
       breakout:  'rgba(245,158,11,.2);color:#f59e0b',
       trendpull: 'rgba(139,92,246,.2);color:#a78bfa',
+      breakdown: 'rgba(248,81,73,.2);color:#f85149',
     };
-    const scanLabel = { momentum: 'MOM', breakout: 'BRK', trendpull: 'PULL' };
+    const scanLabel = { momentum: 'MOM', breakout: 'BRK', trendpull: 'PULL↗', breakdown: 'BRKDWN↘' };
     const scanBadge = scanType
       ? `<span class="sym-htf" style="background:${scanColors[scanType] || scanColors.momentum}">${scanLabel[scanType] || scanType}</span>`
       : '';
@@ -1820,9 +1822,9 @@ function updateSymSidebar(movers) {
       ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}${scanBadge}</div>`
       : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span></div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score != null ? m.score.toFixed(1) : 'TV'}</span></div>
       <div class="sym-name">${coin}</div>
-      <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
+      <div class="sym-chg ${chgCls}">${chgSign}${change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
       ${tagRow}
     </div>`;
