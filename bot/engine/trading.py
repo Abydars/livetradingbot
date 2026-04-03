@@ -755,6 +755,55 @@ class TradingEngine:
             logger.info("TradingEngine: skipping entry — ATR unavailable")
             return
 
+        # Price action filter: wick rejection + candle direction confirmation.
+        # Uses the last CLOSED candle (candles[-2]) not the live candle (candles[-1])
+        # so we're reading completed price structure, not an in-progress candle.
+        #
+        # Wick rejection: if the last candle's shadow in the signal direction
+        # is > 60% of the total range, price was rejected at that level — risky entry.
+        # Example: pump wick (TAGUSDT) = long upper wick → bearish rejection → no LONG.
+        #
+        # Candle direction: the last closed candle body must agree with signal direction.
+        # A bearish close (red candle) during a LONG signal = price still falling.
+        if len(self.candles) >= 2:
+            c      = self.candles[-2]   # last confirmed closed candle
+            high_  = c["high"]
+            low_   = c["low"]
+            open_  = c["open"]
+            close_ = c["close"]
+            range_ = high_ - low_
+
+            if range_ > 0:
+                upper_wick = high_ - max(open_, close_)
+                lower_wick = min(open_, close_) - low_
+                _WICK_THRESHOLD = 0.60   # wick > 60% of range = rejection
+
+                if direction == "LONG" and upper_wick / range_ > _WICK_THRESHOLD:
+                    _blocked(
+                        f"bearish wick rejection — upper wick {upper_wick/range_*100:.0f}% "
+                        f"of candle range (>{_WICK_THRESHOLD*100:.0f}% threshold)"
+                    )
+                    return
+
+                if direction == "SHORT" and lower_wick / range_ > _WICK_THRESHOLD:
+                    _blocked(
+                        f"bullish wick rejection — lower wick {lower_wick/range_*100:.0f}% "
+                        f"of candle range (>{_WICK_THRESHOLD*100:.0f}% threshold)"
+                    )
+                    return
+
+                # Candle direction confirmation: body must agree with signal direction.
+                # Skip if candle is a doji (body < 10% of range — indecision, allow through).
+                body = abs(close_ - open_)
+                is_doji = body / range_ < 0.10
+                if not is_doji:
+                    if direction == "LONG" and close_ < open_:
+                        _blocked("bearish candle — waiting for bullish close to confirm LONG")
+                        return
+                    if direction == "SHORT" and close_ > open_:
+                        _blocked("bullish candle — waiting for bearish close to confirm SHORT")
+                        return
+
         entry_adaptive = self._compute_adaptive(atr_val, price, strength)
         if entry_adaptive["tp_pct"] < 0.4:
             logger.info(
