@@ -2209,12 +2209,14 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 "movers": _last_top_movers,
             }))
         else:
-            # Cold start — fetch immediately for this client
+            # Cold start — only run internal scanner fetch if TV scanner is NOT active.
+            # When TV scanner is enabled, sidebar populates from TV alerts only.
             try:
                 cfg_cold = await load_config()
-                top = await _rest.get_top_movers(n=cfg_cold.scanner_top_n, timeframe=cfg_cold.timeframe)
-                movers = _format_movers(top)
-                await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
+                if not cfg_cold.tv_scanner_enabled:
+                    top    = await _rest.get_top_movers(n=cfg_cold.scanner_top_n, timeframe=cfg_cold.timeframe)
+                    movers = _format_movers(top)
+                    await ws.send_text(json.dumps({"type": "top_movers", "movers": movers}))
             except Exception:
                 pass
 
