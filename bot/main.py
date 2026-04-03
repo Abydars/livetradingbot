@@ -1582,33 +1582,58 @@ async def tv_signal(request: Request):
     if _engine:
         _engine.set_scanner_type(scanner)
 
-    # Score-based switch: only switch if no position open AND new score beats current symbol's score.
-    # This ensures bot always tracks the strongest TV signal until a position opens.
+    # Update sidebar first — always add/update this symbol in the list
+    existing   = [m for m in _last_top_movers if m.get("symbol") != symbol]
+    new_entry  = {
+        "symbol":       symbol,
+        "direction":    direction,
+        "scanner_type": scanner,
+        "score":        tv_score,
+        "bias":         direction,
+        "_bias":        direction,
+        "_scanner":     scanner,
+        "change":       0.0,
+        "vol_surge":    None,
+        "momentum":     None,
+        "atr_pct":      None,
+        "htf_bias":     "",
+    }
+    _last_top_movers = sorted([new_entry] + existing, key=lambda x: x.get("score", 0.0), reverse=True)
+    await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+    await save_tv_alert(symbol, direction, scanner)
+
+    # Score-based switch: switch only if no position open AND this symbol has the best score
     position_open = _engine is not None and _engine._session is not None
     current_score = next((m.get("score", 0.0) for m in _last_top_movers if m.get("symbol") == cfg.symbol), 0.0)
+    best          = _last_top_movers[0] if _last_top_movers else {}
+    best_sym      = best.get("symbol", symbol)
+    best_score    = best.get("score", 0.0)
+
     should_switch = (
-        not position_open and (
-            cfg.symbol != symbol or          # different symbol → always switch
-            tv_score > current_score         # same symbol, better score → refresh
-        )
+        not position_open
+        and best_sym != cfg.symbol   # best symbol is different from current
+        and best_score > current_score
     )
 
     if not should_switch:
         logger.info(
-            "TV webhook: %s score=%.2f skipped — current %s score=%.2f %s",
-            symbol, tv_score, cfg.symbol, current_score,
-            "position open" if position_open else "score not better",
+            "TV webhook: sidebar updated %s score=%.2f — no switch (position=%s best=%s)",
+            symbol, tv_score, position_open, best_sym,
         )
-        return {"ok": True, "symbol": symbol, "switched": False, "reason": "score not better or position open"}
+        return {"ok": True, "symbol": symbol, "switched": False}
 
-    # Switch symbol (same path as manual switch)
+    # Switch to best scoring symbol
+    symbol    = best_sym
+    direction = best.get("direction", direction)
+    scanner   = best.get("scanner_type", scanner)
+
     await set_config_bulk({"symbol": symbol})
     if _engine:
         await _ws.switch_symbol(symbol)
         _last_candles_fetch = 0.0
-        _htf_bias = "NEUTRAL"
-        _last_htf_fetch = 0.0
-        _last_switch_ts = time.time()
+        _htf_bias           = "NEUTRAL"
+        _last_htf_fetch     = 0.0
+        _last_switch_ts     = time.time()
         raw_candles = await _rest.get_klines(symbol, interval=cfg.timeframe, limit=200)
         if raw_candles and len(raw_candles) >= 60:
             fresh = [
@@ -1620,29 +1645,6 @@ async def tv_signal(request: Request):
             _last_candles_fetch = time.time()
         await _executor.prepare_symbol(symbol, cfg.leverage)
         await _do_broadcast({"type": "symbol_ready", "symbol": symbol})
-        await _do_broadcast({"type": "notification",
-                             "text": f"TV Signal: {direction} {symbol} ({scanner})"})
-
-    # Add to sidebar — build a minimal mover entry so UI shows this symbol
-    # in the watchlist as alerts arrive from TradingView.
-    existing = [m for m in _last_top_movers if m.get("symbol") != symbol]
-    new_entry = {
-        "symbol":       symbol,
-        "direction":    direction,
-        "scanner_type": scanner,
-        "score":        tv_score,
-        "bias":         direction,   # sidebar reads 'bias' not '_bias'
-        "_bias":        direction,
-        "_scanner":     scanner,
-        "change":       0.0,         # not available from TradingView — show neutral
-        "vol_surge":    None,        # will be hidden in sidebar (no data)
-        "momentum":     None,        # will be hidden in sidebar (no data)
-        "atr_pct":      None,        # will be hidden in sidebar (no data)
-        "htf_bias":     "",
-    }
-    _last_top_movers = sorted([new_entry] + existing, key=lambda x: x.get("score", 0.0), reverse=True)
-    await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
-    await save_tv_alert(symbol, direction, scanner)
 
     return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
 
