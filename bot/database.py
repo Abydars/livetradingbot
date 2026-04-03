@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS signal_log (
     action      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS tv_alerts (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol    TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    scanner   TEXT NOT NULL DEFAULT 'momentum',
+    ts        INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pos_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     event   TEXT    NOT NULL,
@@ -549,3 +557,31 @@ async def get_today_pnl() -> float:
         )
         row = await cursor.fetchone()
         return float(row["total"]) if row else 0.0
+
+
+async def save_tv_alert(symbol: str, direction: str, scanner: str) -> None:
+    """Persist a TradingView webhook alert so sidebar survives server restart."""
+    import time
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Keep only latest 50 alerts — delete oldest if over limit
+        await db.execute(
+            "DELETE FROM tv_alerts WHERE id NOT IN "
+            "(SELECT id FROM tv_alerts ORDER BY ts DESC LIMIT 49)"
+        )
+        await db.execute(
+            "INSERT INTO tv_alerts (symbol, direction, scanner, ts) VALUES (?, ?, ?, ?)",
+            (symbol, direction, scanner, int(time.time())),
+        )
+        await db.commit()
+
+
+async def get_tv_alerts(limit: int = 50) -> List[Dict[str, Any]]:
+    """Load persisted TradingView alerts for sidebar restore on restart."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT symbol, direction, scanner, ts FROM tv_alerts ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
