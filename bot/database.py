@@ -88,6 +88,8 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "min_signal_strength": "0.25",
     "trading_mode":        "paper",
     "discord_webhook":     "",
+    "tv_scanner_enabled":  "0",    # use TradingView webhook signals as scanner source
+    "tv_secret":           "",     # shared secret to verify TV webhook authenticity
     "auto_switch":         "1",
     "scan_interval_s":     "5",
     "htf_filter":          "1",   # block entries when HTF EMA bias contradicts signal direction
