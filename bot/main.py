@@ -1745,31 +1745,9 @@ async def tv_signal(request: Request):
     if cfg.symbol == best_sym:
         return {"ok": True, "symbol": symbol, "switched": False}
 
-    # Switch to best scoring symbol
-    symbol    = best_sym
-    direction = best.get("direction", direction)
-    scanner   = best.get("scanner_type", scanner)
-
-    await set_config_bulk({"symbol": symbol})
-    if _engine:
-        await _ws.switch_symbol(symbol)
-        _last_candles_fetch = 0.0
-        _htf_bias           = "NEUTRAL"
-        _last_htf_fetch     = 0.0
-        _last_switch_ts     = time.time()
-        raw_candles = await _rest.get_klines(symbol, interval=cfg.timeframe, limit=200)
-        if raw_candles and len(raw_candles) >= 60:
-            fresh = [
-                {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
-                 "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
-                for k in raw_candles
-            ]
-            _engine.update_candles(fresh)
-            _last_candles_fetch = time.time()
-        await _executor.prepare_symbol(symbol, cfg.leverage)
-        await _do_broadcast({"type": "symbol_ready", "symbol": symbol})
-
-    return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
+    # Switch to best scoring symbol — fire and forget so TradingView doesn't timeout
+    asyncio.ensure_future(_do_switch(best_sym, cfg))
+    return {"ok": True, "symbol": symbol, "switched": True}
 
 
 @app.delete("/api/tv-alerts")
