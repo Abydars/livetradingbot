@@ -1696,7 +1696,9 @@ async def tv_signal(request: Request):
     # Prune stale entries so dict doesn't grow unbounded
     _tv_alert_cooldown = {s: t for s, t in _tv_alert_cooldown.items() if now - t < 3600}
 
-    tv_score = max(0.0, min(1.0, abs(float(body.get("score", 0.5)))))
+    tv_score    = max(0.0, min(1.0, abs(float(body.get("score", 0.5)))))
+    tv_change   = float(body.get("change",   0.0))
+    tv_vol_usdt = float(body.get("vol_usdt", 0.0))
 
     logger.info(
         "TV webhook: %s %s scanner=%s score=%.2f",
@@ -1729,7 +1731,8 @@ async def tv_signal(request: Request):
         "bias":         direction,
         "_bias":        direction,
         "_scanner":     scanner,
-        "change":       0.0,
+        "change":       tv_change,
+        "vol_usdt":     tv_vol_usdt if tv_vol_usdt > 0 else None,
         "vol_surge":    None,
         "momentum":     None,
         "atr_pct":      None,
