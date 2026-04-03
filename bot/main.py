@@ -429,15 +429,21 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
             _engine.reset_for_switch()
 
         # Update config and reset state immediately
+        global _entry_start_candle, _neutral_since_candle, _tried_syms
         await set_config_bulk({"symbol": new_sym})
-        _last_candles_fetch = 0.0
-        _htf_bias           = "NEUTRAL"
-        _last_htf_fetch     = 0.0
-        _last_switch_ts     = time.time()
+        _last_candles_fetch   = 0.0
+        _htf_bias             = "NEUTRAL"
+        _last_htf_fetch       = 0.0
+        _last_switch_ts       = time.time()
+        _entry_start_candle   = 0
+        _neutral_since_candle = 0
+        _tried_syms.discard(new_sym)   # new symbol is active — remove from tried
 
         # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
-        # Candles and leverage setup happen in parallel after, so user sees immediate response
+        # Also broadcast HTF NEUTRAL immediately so old symbol's HTF badge clears right away.
+        # The real HTF for the new symbol will be fetched and broadcast on the next ticker tick.
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+        await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
 
         if _engine:
             # Run WS switch, candle fetch, and leverage prep in parallel
