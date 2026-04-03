@@ -1564,6 +1564,21 @@ async def tv_signal(request: Request):
         await _do_broadcast({"type": "notification",
                              "text": f"TV Signal: {direction} {symbol} ({scanner})"})
 
+    # Add to sidebar — build a minimal mover entry so UI shows this symbol
+    # in the watchlist as alerts arrive from TradingView.
+    global _last_top_movers
+    existing = [m for m in _last_top_movers if m.get("symbol") != symbol]
+    new_entry = {
+        "symbol":       symbol,
+        "direction":    direction,
+        "scanner_type": scanner,
+        "score":        1.0,   # TV signal = high confidence
+        "_bias":        direction,
+        "_scanner":     scanner,
+    }
+    _last_top_movers = [new_entry] + existing   # TV signal goes to top
+    await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+
     return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
 
 
