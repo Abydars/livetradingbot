@@ -235,7 +235,7 @@ async def _sync_position_rest(cfg) -> None:
 
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch
+    global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch, _tv_batch_timer
     cfg = await load_config()
 
     _cfg_tick_cache: BotConfig | None = None
@@ -375,7 +375,6 @@ async def _ticker_loop() -> None:
                             )
                             asyncio.ensure_future(_do_switch(best_sym, cfg))
 
-            global _tv_batch_timer
             # Batch timer expiry check — if batch window started but no more alerts came,
             # fire the switch here so a single alert doesn't get silently dropped.
             if (_tv_batch_timer > 0.0
