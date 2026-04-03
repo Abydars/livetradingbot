@@ -1536,6 +1536,9 @@ async def tv_signal(request: Request):
         return {"ok": False, "error": "unauthorized"}
 
     symbol    = str(body.get("symbol", "")).upper().strip()
+    # TradingView appends ".P" suffix for perpetual futures — strip it
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
     direction = str(body.get("direction", "")).upper().strip()
     scanner   = str(body.get("scanner", "momentum")).lower().strip()
 
