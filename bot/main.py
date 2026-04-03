@@ -82,6 +82,7 @@ _last_symbol_scan: float = 0.0
 _force_scan: bool = False   # set True to trigger scanner immediately (e.g. after trade close)
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
+_tv_alert_cooldown: dict = {}          # symbol → last-accepted timestamp (rate-limit TV webhooks)
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
@@ -1548,9 +1549,26 @@ async def tv_signal(request: Request):
     if direction not in ("LONG", "SHORT"):
         return {"ok": False, "error": f"invalid direction: {direction}"}
 
+    # Rate-limit: ignore same symbol arriving within 60 s to protect against alert storms.
+    global _tv_alert_cooldown
+    _TV_COOLDOWN_S = 60
+    now = time.time()
+    last_seen = _tv_alert_cooldown.get(symbol, 0.0)
+    if now - last_seen < _TV_COOLDOWN_S:
+        logger.info(
+            "TV webhook: %s throttled — %.0fs since last alert (cooldown %ds)",
+            symbol, now - last_seen, _TV_COOLDOWN_S,
+        )
+        return {"ok": True, "symbol": symbol, "switched": False, "reason": "cooldown"}
+    _tv_alert_cooldown[symbol] = now
+    # Prune stale entries so dict doesn't grow unbounded
+    _tv_alert_cooldown = {s: t for s, t in _tv_alert_cooldown.items() if now - t < 3600}
+
+    tv_score = max(0.0, min(1.0, float(body.get("score", 1.0))))
+
     logger.info(
-        "TV webhook: %s %s scanner=%s — switching symbol",
-        direction, symbol, scanner,
+        "TV webhook: %s %s scanner=%s score=%.2f",
+        direction, symbol, scanner, tv_score,
     )
 
     # Reset auto-switch cycle and switch to TV-suggested symbol
@@ -1608,7 +1626,6 @@ async def tv_signal(request: Request):
     # in the watchlist as alerts arrive from TradingView.
     global _last_top_movers
     existing = [m for m in _last_top_movers if m.get("symbol") != symbol]
-    tv_score  = max(0.0, min(1.0, float(body.get("score", 1.0))))
     new_entry = {
         "symbol":       symbol,
         "direction":    direction,
