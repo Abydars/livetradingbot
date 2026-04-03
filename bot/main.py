@@ -1333,9 +1333,15 @@ async def lifespan(app: FastAPI):
                 "symbol":       a["symbol"],
                 "direction":    a["direction"],
                 "scanner_type": a["scanner"],
+                "bias":         a["direction"],
                 "_bias":        a["direction"],
                 "_scanner":     a["scanner"],
                 "score":        1.0,
+                "change":       0.0,
+                "vol_surge":    None,
+                "momentum":     None,
+                "atr_pct":      None,
+                "htf_bias":     "",
             }
             for a in stored_alerts
         ]
