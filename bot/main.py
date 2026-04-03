@@ -261,14 +261,6 @@ async def _ticker_loop() -> None:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Refresh TvWatcher candles for top 3 TV symbols (parallel monitoring)
-            if _tv_watcher and cfg.tv_scanner_enabled and _last_top_movers:
-                watch_syms = [m["symbol"] for m in _last_top_movers[:3]
-                              if m.get("symbol") != cfg.symbol]
-                if watch_syms and _tv_watcher.needs_refresh(watch_syms):
-                    # Run in background — don't await so main tick isn't delayed
-                    asyncio.ensure_future(_tv_watcher.refresh(watch_syms, cfg))
-
             # Refresh candles periodically
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
                 try:
@@ -340,50 +332,6 @@ async def _ticker_loop() -> None:
                             _broadcast({"type": "htf_bias", "bias": _htf_bias, "timeframe": htf_tf})
                     except Exception as exc:
                         logger.debug("HTF fetch failed: %s", exc)
-
-            # TV watcher: update sidebar strength + check for best entry
-            if (cfg.tv_scanner_enabled and _tv_watcher and _last_top_movers):
-                watch_syms = [m["symbol"] for m in _last_top_movers[:3]
-                              if m.get("symbol") != cfg.symbol]
-                if watch_syms:
-                    # Signal engine runs only when candles refreshed (every 30s) — expensive
-                    if _tv_watcher.signals_are_stale():
-                        all_sigs = _tv_watcher.get_all_signals(watch_syms, _last_top_movers, cfg, _htf_bias)
-                        _tv_watcher.mark_signals_fresh()
-                        updated = False
-                        for sig in all_sigs:
-                            for m in _last_top_movers:
-                                if m.get("symbol") == sig["symbol"]:
-                                    m["bot_strength"] = sig["strength"]
-                                    m["bot_ready"]    = sig["ready"]
-                                    updated = True
-                        if updated:
-                            # Re-sort: bot_ready symbols first, then by TV score
-                            _last_top_movers.sort(
-                                key=lambda x: (x.get("bot_ready", False), x.get("score", 0.0)),
-                                reverse=True,
-                            )
-                            await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
-
-                    # Best entry check runs every tick — uses cached results from last signal run.
-                    # This ensures we don't miss a switch window between 30s candle refreshes.
-                    if _engine._session is None and _trading_active and not _switching_in_progress:
-                        best_ready = next(
-                            (m for m in _last_top_movers
-                             if m.get("bot_ready") and m.get("symbol") != cfg.symbol),
-                            None,
-                        )
-                        if best_ready:
-                            best_sym = best_ready["symbol"]
-                            logger.info(
-                                "TvWatcher: switching to %s %s bot_strength=%.2f — entry ready",
-                                best_sym, best_ready.get("direction", ""), best_ready.get("bot_strength", 0),
-                            )
-                            # Clear bot_ready so this symbol isn't re-triggered next tick
-                            for m in _last_top_movers:
-                                if m.get("symbol") == best_sym:
-                                    m["bot_ready"] = False
-                            asyncio.ensure_future(_do_switch(best_sym, cfg))
 
             # Batch timer expiry check — if batch window started but no more alerts came,
             # fire the switch here so a single alert doesn't get silently dropped.
@@ -516,6 +464,88 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
                 _tv_watcher.invalidate(new_sym)
     finally:
         _switching_in_progress = False
+
+
+async def _tv_monitor_loop() -> None:
+    """
+    Background task: monitors all TV-alerted symbols for bot signal readiness.
+    Runs independently from _ticker_loop so signal computation never delays
+    price tick processing or position management.
+
+    Every cycle:
+      1. Refresh candles for all sidebar symbols (respects 30s cache TTL)
+      2. Run signal engine on all non-current symbols
+      3. Update bot_strength + bot_ready on _last_top_movers
+      4. Re-sort sidebar: bot_ready=True symbols first, then by TV score
+      5. Broadcast updated sidebar to UI
+      6. If best_ready found and no position open → switch
+    """
+    while True:
+        try:
+            cfg = await load_config()
+
+            if not cfg.tv_scanner_enabled or not _tv_watcher or not _last_top_movers:
+                await asyncio.sleep(15.0)
+                continue
+
+            # All sidebar symbols except current active symbol
+            all_syms = [m["symbol"] for m in _last_top_movers
+                        if m.get("symbol") != cfg.symbol]
+
+            if not all_syms:
+                await asyncio.sleep(15.0)
+                continue
+
+            # Refresh candles for all watched symbols (respects internal 30s TTL cache)
+            await _tv_watcher.refresh(all_syms, cfg)
+
+            # Run signal engine on all symbols
+            all_sigs = _tv_watcher.get_all_signals(all_syms, _last_top_movers, cfg, _htf_bias)
+            _tv_watcher.mark_signals_fresh()
+
+            # Update bot_strength and bot_ready on sidebar entries
+            updated    = False
+            best_ready = None
+            for sig in all_sigs:
+                for m in _last_top_movers:
+                    if m.get("symbol") == sig["symbol"]:
+                        m["bot_strength"] = sig["strength"]
+                        m["bot_ready"]    = sig["ready"]
+                        updated = True
+                if sig["ready"] and best_ready is None:
+                    best_ready = sig
+
+            if updated:
+                # Re-sort: bot_ready symbols float to top, then by TV score
+                _last_top_movers.sort(
+                    key=lambda x: (x.get("bot_ready", False), x.get("score", 0.0)),
+                    reverse=True,
+                )
+                await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+
+            # Switch to best ready symbol if no position open
+            if (best_ready
+                    and _engine
+                    and _engine._session is None
+                    and _trading_active
+                    and not _switching_in_progress):
+                best_sym = best_ready["symbol"]
+                logger.info(
+                    "TvMonitor: switching to %s %s strength=%.2f — entry ready",
+                    best_sym, best_ready.get("direction", ""), best_ready.get("strength", 0),
+                )
+                # Clear bot_ready to prevent re-trigger on next cycle
+                for m in _last_top_movers:
+                    if m.get("symbol") == best_sym:
+                        m["bot_ready"] = False
+                asyncio.ensure_future(_do_switch(best_sym, cfg))
+
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("_tv_monitor_loop error: %s", exc)
+
+        await asyncio.sleep(15.0)   # check every 15s — half a 15m candle
 
 
 async def _scanner_loop() -> None:
@@ -1581,6 +1611,7 @@ async def lifespan(app: FastAPI):
 
     ticker_task = asyncio.create_task(_ticker_loop())
     asyncio.create_task(_scanner_loop())
+    asyncio.create_task(_tv_monitor_loop())
 
     # Graceful shutdown on SIGTERM
     loop = asyncio.get_running_loop()
