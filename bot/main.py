@@ -1477,11 +1477,12 @@ async def lifespan(app: FastAPI):
                 "_bias":        a["direction"],
                 "_scanner":     a["scanner"],
                 "score":        1.0,
-                "change":       0.0,
+                "change":       a.get("change_pct", 0.0),
+                "vol_usdt":     a.get("vol_usdt") or None,
                 "vol_surge":    None,
                 "momentum":     None,
                 "atr_pct":      None,
-                "htf_bias":     "",
+                "htf_bias":     a.get("htf", ""),
                 "ts":           a.get("ts", now_ts),
             }
             for a in stored_alerts
@@ -1760,7 +1761,7 @@ async def tv_signal(request: Request):
     }
     _last_top_movers = sorted([new_entry] + fresh, key=lambda x: x.get("score", 0.0), reverse=True)
     await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
-    await save_tv_alert(symbol, direction, scanner)
+    await save_tv_alert(symbol, direction, scanner, tv_htf, tv_change, tv_vol_usdt)
 
     # Score-based switch: switch only if no position open AND this symbol has the best score
     position_open = _engine is not None and _engine._session is not None

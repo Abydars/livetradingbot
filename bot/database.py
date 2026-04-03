@@ -164,6 +164,16 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
         except Exception:
             pass  # column already exists
+    # Migrate tv_alerts — add new columns if they don't exist yet (safe to run every startup)
+    for _col, _def in [
+        ("htf",        "TEXT NOT NULL DEFAULT ''"),
+        ("change_pct", "REAL NOT NULL DEFAULT 0.0"),
+        ("vol_usdt",   "REAL NOT NULL DEFAULT 0.0"),
+    ]:
+        try:
+            await db.execute(f"ALTER TABLE tv_alerts ADD COLUMN {_col} {_def}")
+        except Exception:
+            pass  # column already exists
     # Create pos_log table if missing (older DBs won't have it)
     await db.execute(
         """CREATE TABLE IF NOT EXISTS pos_log (
@@ -559,18 +569,22 @@ async def get_today_pnl() -> float:
         return float(row["total"]) if row else 0.0
 
 
-async def save_tv_alert(symbol: str, direction: str, scanner: str) -> None:
-    """Persist a TradingView webhook alert so sidebar survives server restart."""
+async def save_tv_alert(symbol: str, direction: str, scanner: str, htf: str = "", change_pct: float = 0.0, vol_usdt: float = 0.0) -> None:
+    """Persist a TradingView webhook alert — upsert so the same symbol is never duplicated.
+    Each symbol gets one row only; receiving a new alert for the same symbol updates it in place."""
     import time
     async with aiosqlite.connect(DB_PATH) as db:
-        # Keep only latest 50 alerts — delete oldest if over limit
+        # Delete any existing row for this symbol first (upsert behaviour)
+        await db.execute("DELETE FROM tv_alerts WHERE symbol = ?", (symbol,))
+        # Trim to 49 oldest so the new insert brings total to 50 max
         await db.execute(
             "DELETE FROM tv_alerts WHERE id NOT IN "
             "(SELECT id FROM tv_alerts ORDER BY ts DESC LIMIT 49)"
         )
         await db.execute(
-            "INSERT INTO tv_alerts (symbol, direction, scanner, ts) VALUES (?, ?, ?, ?)",
-            (symbol, direction, scanner, int(time.time())),
+            "INSERT INTO tv_alerts (symbol, direction, scanner, htf, change_pct, vol_usdt, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (symbol, direction, scanner, htf, change_pct, vol_usdt, int(time.time())),
         )
         await db.commit()
 
@@ -580,7 +594,7 @@ async def get_tv_alerts(limit: int = 50) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT symbol, direction, scanner, ts FROM tv_alerts ORDER BY ts DESC LIMIT ?",
+            "SELECT symbol, direction, scanner, htf, change_pct, vol_usdt, ts FROM tv_alerts ORDER BY ts DESC LIMIT ?",
             (limit,),
         ) as cur:
             rows = await cur.fetchall()
