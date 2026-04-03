@@ -83,6 +83,7 @@ _force_scan: bool = False   # set True to trigger scanner immediately (e.g. afte
 _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _tv_alert_cooldown: dict = {}          # symbol → last-accepted timestamp (rate-limit TV webhooks)
+_tv_watcher = None                     # parallel signal monitor for top TV-alerted symbols
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
@@ -249,6 +250,13 @@ async def _ticker_loop() -> None:
                 await asyncio.sleep(1.0)
                 continue
 
+            # Refresh TvWatcher candles for top 3 TV symbols (parallel monitoring)
+            if _tv_watcher and cfg.tv_scanner_enabled and _last_top_movers:
+                watch_syms = [m["symbol"] for m in _last_top_movers[:3]
+                              if m.get("symbol") != cfg.symbol]
+                if watch_syms:
+                    asyncio.ensure_future(_tv_watcher.refresh(watch_syms, cfg))
+
             # Refresh candles periodically
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
                 try:
@@ -321,6 +329,21 @@ async def _ticker_loop() -> None:
                     except Exception as exc:
                         logger.debug("HTF fetch failed: %s", exc)
 
+            # TV watcher: check if any watched symbol has a better entry than current
+            if (cfg.tv_scanner_enabled and _tv_watcher and _last_top_movers
+                    and _engine._session is None and _trading_active):
+                watch_syms = [m["symbol"] for m in _last_top_movers[:3]
+                              if m.get("symbol") != cfg.symbol]
+                if watch_syms:
+                    best = _tv_watcher.best_entry(watch_syms, _last_top_movers, cfg, _htf_bias)
+                    if best:
+                        best_sym, best_dir, best_str = best
+                        logger.info(
+                            "TvWatcher: switching to %s %s (strength=%.2f) — entry ready",
+                            best_sym, best_dir, best_str,
+                        )
+                        asyncio.ensure_future(_do_switch(best_sym, cfg))
+
                 await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
             # Detect trade close → signal scanner to run immediately
@@ -378,6 +401,31 @@ def _format_movers(top: list) -> list:
             "scanner_type": t.get("_scanner", "momentum"),
         })
     return out
+
+
+async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
+    """Switch active symbol — reused by auto-switch and TvWatcher."""
+    global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts
+    await set_config_bulk({"symbol": new_sym})
+    if _engine:
+        await _ws.switch_symbol(new_sym)
+        _last_candles_fetch = 0.0
+        _htf_bias           = "NEUTRAL"
+        _last_htf_fetch     = 0.0
+        _last_switch_ts     = time.time()
+        raw = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
+        if raw and len(raw) >= 60:
+            fresh = [
+                {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
+                for k in raw
+            ]
+            _engine.update_candles(fresh)
+            _last_candles_fetch = time.time()
+        await _executor.prepare_symbol(new_sym, cfg.leverage)
+        await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+        if _tv_watcher:
+            _tv_watcher.invalidate(new_sym)
 
 
 async def _scanner_loop() -> None:
@@ -1324,6 +1372,10 @@ async def lifespan(app: FastAPI):
     _engine = TradingEngine(_executor, _flow, _broadcast)
     await _engine.restore_state()
 
+    from engine.tv_watcher import TvWatcher
+    global _tv_watcher
+    _tv_watcher = TvWatcher(_rest)
+
     # Restore TV alerts into sidebar cache so page refresh shows previous alerts
     if cfg.tv_scanner_enabled:
         stored_alerts = await get_tv_alerts()
@@ -1673,6 +1725,8 @@ async def clear_tv_alerts():
     """Clear all TradingView alerts from sidebar and database."""
     global _last_top_movers
     _last_top_movers = []
+    if _tv_watcher:
+        _tv_watcher.clear()
     await _do_broadcast({"type": "top_movers", "movers": []})
     # Clear from DB too
     async with __import__('aiosqlite').connect(__import__('database').DB_PATH) as db:
