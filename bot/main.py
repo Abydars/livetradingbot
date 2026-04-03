@@ -456,15 +456,30 @@ def _format_movers(top: list) -> list:
 async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
     """Switch active symbol — reused by auto-switch and TvWatcher."""
     global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts
+
+    # Update config and reset state immediately
     await set_config_bulk({"symbol": new_sym})
+    _last_candles_fetch = 0.0
+    _htf_bias           = "NEUTRAL"
+    _last_htf_fetch     = 0.0
+    _last_switch_ts     = time.time()
+
+    # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
+    # Candles and leverage setup happen in parallel after, so user sees immediate response
+    await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+
     if _engine:
-        await _ws.switch_symbol(new_sym)
-        _last_candles_fetch = 0.0
-        _htf_bias           = "NEUTRAL"
-        _last_htf_fetch     = 0.0
-        _last_switch_ts     = time.time()
-        raw = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
-        if raw and len(raw) >= 60:
+        # Run WS switch, candle fetch, and leverage prep in parallel
+        raw, _ = await asyncio.gather(
+            _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200),
+            asyncio.gather(
+                _ws.switch_symbol(new_sym),
+                _executor.prepare_symbol(new_sym, cfg.leverage),
+            ),
+            return_exceptions=True,
+        )
+
+        if isinstance(raw, list) and len(raw) >= 60:
             fresh = [
                 {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
                  "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
@@ -472,8 +487,12 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
             ]
             _engine.update_candles(fresh)
             _last_candles_fetch = time.time()
-        await _executor.prepare_symbol(new_sym, cfg.leverage)
-        await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+            # Broadcast candles after they load
+            await _do_broadcast({
+                "type":    "candles",
+                "candles": fresh[-100:],
+            })
+
         if _tv_watcher:
             _tv_watcher.invalidate(new_sym)
 
