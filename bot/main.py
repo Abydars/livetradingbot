@@ -1589,11 +1589,12 @@ async def tv_signal(request: Request):
     # in the watchlist as alerts arrive from TradingView.
     global _last_top_movers
     existing = [m for m in _last_top_movers if m.get("symbol") != symbol]
+    tv_score  = max(0.0, min(1.0, float(body.get("score", 1.0))))
     new_entry = {
         "symbol":       symbol,
         "direction":    direction,
         "scanner_type": scanner,
-        "score":        1.0,
+        "score":        tv_score,
         "bias":         direction,   # sidebar reads 'bias' not '_bias'
         "_bias":        direction,
         "_scanner":     scanner,
@@ -1603,7 +1604,7 @@ async def tv_signal(request: Request):
         "atr_pct":      None,        # will be hidden in sidebar (no data)
         "htf_bias":     "",
     }
-    _last_top_movers = [new_entry] + existing   # TV signal goes to top
+    _last_top_movers = sorted([new_entry] + existing, key=lambda x: x.get("score", 0.0), reverse=True)
     await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
     await save_tv_alert(symbol, direction, scanner)
 
