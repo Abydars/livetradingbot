@@ -358,13 +358,18 @@ async def _ticker_loop() -> None:
                                     m["bot_ready"]    = sig["ready"]
                                     updated = True
                         if updated:
+                            # Re-sort: bot_ready symbols first, then by TV score
+                            _last_top_movers.sort(
+                                key=lambda x: (x.get("bot_ready", False), x.get("score", 0.0)),
+                                reverse=True,
+                            )
                             await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
                     # Best entry check runs every tick — uses cached results from last signal run.
                     # This ensures we don't miss a switch window between 30s candle refreshes.
-                    if _engine._session is None and _trading_active:
+                    if _engine._session is None and _trading_active and not _switching_in_progress:
                         best_ready = next(
-                            (m for m in _last_top_movers[:3]
+                            (m for m in _last_top_movers
                              if m.get("bot_ready") and m.get("symbol") != cfg.symbol),
                             None,
                         )
