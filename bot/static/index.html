@@ -1742,6 +1742,11 @@ function dispatch(msg) {
     case 'config':
       configData = msg.config || {};
       renderConfig(configData);
+      // Show/hide Scan Now button based on TV scanner mode
+      const scanNowBtn = document.getElementById('scan-now-btn');
+      if (scanNowBtn) {
+        scanNowBtn.style.display = configData.tv_scanner_enabled === '1' ? 'none' : '';
+      }
       if ('trading_mode' in configData) {
         isPaperMode = configData.trading_mode === 'paper';
         updateModeDisplay(configData.trading_mode);
