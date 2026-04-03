@@ -84,6 +84,8 @@ _last_price_rest_fetch: float = 0.0   # throttle REST mark-price fallback
 _last_top_movers: list = []            # cached for new WS clients
 _tv_alert_cooldown: dict = {}          # symbol → last-accepted timestamp (rate-limit TV webhooks)
 _tv_watcher = None                     # parallel signal monitor for top TV-alerted symbols
+_tv_batch_timer: float = 0.0           # timestamp when batch window started
+_TV_BATCH_WINDOW_S = 5.0               # collect alerts for 5s before switching
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
@@ -1710,17 +1712,37 @@ async def tv_signal(request: Request):
     best_sym      = best.get("symbol", symbol)
     best_score    = best.get("score", 0.0)
 
-    should_switch = (
-        not position_open
-        and best_sym != cfg.symbol   # best symbol is different from current
-        and best_score > current_score
-    )
+    # Batch window: collect all alerts for N seconds, then switch to best score only.
+    # This prevents multiple rapid switches when TradingView fires 20 alerts simultaneously
+    # on candle close (one per monitored symbol).
+    global _tv_batch_timer
+    if not position_open and best_sym != cfg.symbol:
+        if _tv_batch_timer == 0.0:
+            # Start batch window — first qualifying alert
+            _tv_batch_timer = time.time()
+            logger.info("TV webhook: batch window started — collecting alerts for %.0fs", _TV_BATCH_WINDOW_S)
+        elif time.time() - _tv_batch_timer >= _TV_BATCH_WINDOW_S:
+            # Batch window expired — switch to best scored symbol now
+            _tv_batch_timer = 0.0
+            symbol    = best_sym
+            direction = best.get("direction", direction)
+            scanner   = best.get("scanner_type", scanner)
+            logger.info(
+                "TV webhook: batch window done — switching to best %s score=%.2f",
+                symbol, best_score,
+            )
+        else:
+            # Still collecting — update sidebar but don't switch yet
+            remaining = _TV_BATCH_WINDOW_S - (time.time() - _tv_batch_timer)
+            logger.info(
+                "TV webhook: collecting — %s score=%.2f, batch closes in %.1fs",
+                symbol, tv_score, remaining,
+            )
+            return {"ok": True, "symbol": symbol, "switched": False, "reason": "batch_collecting"}
+    else:
+        _tv_batch_timer = 0.0  # reset if position open or already on best
 
-    if not should_switch:
-        logger.info(
-            "TV webhook: sidebar updated %s score=%.2f — no switch (position=%s best=%s)",
-            symbol, tv_score, position_open, best_sym,
-        )
+    if cfg.symbol == best_sym:
         return {"ok": True, "symbol": symbol, "switched": False}
 
     # Switch to best scoring symbol
