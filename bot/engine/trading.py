@@ -697,7 +697,7 @@ class TradingEngine:
         # HTF confirmation: if the higher timeframe has a clear directional bias,
         # block entries that go counter to it. "NEUTRAL" means no HTF data yet or
         # the EMAs are mixed — in that case we allow the entry through.
-        if cfg.htf_filter and htf_bias != "NEUTRAL" and htf_bias != direction:
+        if htf_bias != "NEUTRAL" and htf_bias != direction:
             logger.debug(
                 "TradingEngine: entry blocked — HTF bias %s disagrees with signal %s",
                 htf_bias, direction,
