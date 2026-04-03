@@ -347,6 +347,15 @@ class SignalEngine:
         if raw_dir == "SHORT" and rsi_val is not None and rsi_val < _RSI_OS:
             return "NEUTRAL", False, f"RSI {rsi_val:.1f} < {_RSI_OS} (extreme oversold)"
 
+        # StochRSI extreme blocks — catches pump wicks that RSI misses.
+        # RSI lags; StochRSI reacts faster to price spikes.
+        sr = ind.get("stoch_rsi") or {}
+        stoch_k = sr.get("k")
+        if raw_dir == "LONG" and stoch_k is not None and stoch_k > 85:
+            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} > 85 (extreme overbought — pump wick risk)"
+        if raw_dir == "SHORT" and stoch_k is not None and stoch_k < 15:
+            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} < 15 (extreme oversold — dump wick risk)"
+
         # Counter-trend filter — allow if RSI is at extreme (mean-reversion mode)
         if ema21 is not None and ema50 is not None:
             trend_up = ema21 > ema50
