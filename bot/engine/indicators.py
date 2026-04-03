@@ -272,6 +272,7 @@ def compute_all(candles: List[Dict]) -> Dict:
     srsi_v  = stoch_rsi(closes)
 
     return {
+        "price":    closes[-1] if closes else None,
         "ema9":     ema9_v,
         "ema21":    ema21_v,
         "ema50":    ema50_v,

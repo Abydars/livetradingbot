@@ -555,6 +555,16 @@
     .sig-badge.short   { color: var(--red);    border-color: var(--red);    background: rgba(248,81,73,.1); }
     .sig-badge.neutral { color: var(--muted);  border-color: var(--muted);  background: transparent; }
 
+    .htf-badge { font-size: 9px; font-weight: 600; padding: 1px 5px; border: 1px solid; border-radius: 3px; }
+    .htf-badge.long    { color: var(--green); border-color: var(--green); background: rgba(63,185,80,.08); }
+    .htf-badge.short   { color: var(--red);   border-color: var(--red);   background: rgba(248,81,73,.08); }
+    .htf-badge.neutral { color: var(--muted); border-color: var(--muted); background: transparent; }
+    #scanner-badge { font-size: 9px; font-weight: 600; padding: 1px 5px; border: 1px solid; border-radius: 3px; display: none; }
+    #scanner-badge.momentum { display: none; }
+    #scanner-badge.breakout  { display: inline; color: #f59e0b; border-color: #f59e0b; background: rgba(245,158,11,.08); }
+    #scanner-badge.trendpull { display: inline; color: #8b5cf6; border-color: #8b5cf6; background: rgba(139,92,246,.08); }
+    #scanner-badge.breakdown { display: inline; color: #ec4899; border-color: #ec4899; background: rgba(236,72,153,.08); }
+
     #sig-strength { font-size: 12px; }
     #sig-reason   { font-size: 10px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
 
@@ -787,7 +797,22 @@
     .sym-bias  { font-size: 8px; font-weight: 700; letter-spacing: .05em; padding: 1px 4px; border-radius: 3px; }
     .sym-bias.long { background: rgba(63,185,80,.18); color: var(--green); }
     .sym-bias.short { background: rgba(248,81,73,.18); color: var(--red); }
+    .sym-htf   { font-size: 8px; font-weight: 600; padding: 1px 3px; border-radius: 2px; opacity: .85; }
+    .sym-htf.long  { background: rgba(63,185,80,.25); color: var(--green); }
+    .sym-htf.short { background: rgba(248,81,73,.25); color: var(--red); }
     .sym-metrics { font-size: 9px; color: var(--muted); margin-top: 2px; display: flex; gap: 6px; flex-wrap: wrap; }
+    #entry-wait-bar { display:none; flex-direction:column; gap:5px; padding:7px 10px 8px; margin:4px 8px 4px; border-radius:7px; font-size:11px; background:rgba(227,179,65,.07); border:1px solid rgba(227,179,65,.25); }
+    #entry-wait-bar.visible { display:flex; }
+    #ew-row1 { display:flex; align-items:center; justify-content:space-between; }
+    #ew-row2 { display:flex; align-items:center; gap:4px; }
+    #ew-label { color:var(--muted); font-size:9px; letter-spacing:.06em; text-transform:uppercase; }
+    #ew-sym   { font-weight:700; color:#e3b341; font-size:12px; }
+    #ew-arrow { color:var(--muted); font-size:10px; margin:0 2px; }
+    #ew-next  { font-weight:600; color:var(--text); font-size:11px; }
+    #ew-tried { color:var(--muted); font-size:9px; margin-left:auto; }
+    #ew-timer { font-size:10px; font-variant-numeric:tabular-nums; color:#e3b341; font-weight:600; min-width:32px; text-align:right; }
+    #ew-track { flex:1; height:3px; background:rgba(255,255,255,.1); border-radius:2px; }
+    #ew-fill  { height:3px; background:#e3b341; border-radius:2px; width:0%; transition:width .5s linear; }
 
     /* ═══════════════════════════════ RESPONSIVE ══ */
 
@@ -824,7 +849,8 @@
         max-height: 340px;
       }
 
-      #tabs-wrap { height: 195px; }
+      #tabs-wrap { height: auto; flex-shrink: 0; }
+      .tbl-scroll { overflow-y: visible; flex: none; }
 
       #right-col {
         width: 100%;
@@ -895,7 +921,7 @@
         max-height: 280px;
       }
 
-      #tabs-wrap { height: 185px; }
+      #tabs-wrap { height: auto; }
 
       #ws-label { display: none; }
 
@@ -1032,9 +1058,12 @@
       #right-col.drawer-open { transform: translateX(0); }
 
       /* Cards stack vertically inside the right drawer */
-      #right-col .rcard { flex-shrink: 0; }
+      #right-col .rcard { flex-shrink: 0; width: 100%; box-sizing: border-box; }
       #card-hedge,
       #card-ob { grid-column: auto !important; }
+
+      /* Remove nested scroll — drawer itself scrolls */
+      #right-col #pos-log-list { max-height: none; overflow-y: visible; }
     }
   </style>
 </head>
@@ -1081,7 +1110,27 @@
   <div id="sym-sidebar">
     <div id="sym-sidebar-head">
       WATCHLIST
-      <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button id="scan-now-btn" onclick="triggerScan()" title="Run scanner now"
+          style="font-size:9px;padding:2px 7px;border:1px solid var(--muted);border-radius:3px;
+                 background:transparent;color:var(--muted);cursor:pointer;letter-spacing:.05em">
+          SCAN NOW
+        </button>
+        <button class="drawer-close-btn" onclick="closeDrawers()" title="Close">✕</button>
+      </div>
+    </div>
+    <div id="entry-wait-bar">
+      <div id="ew-row1">
+        <span id="ew-label">Scanning for entry</span>
+        <span id="ew-timer">0s</span>
+      </div>
+      <div id="ew-row2">
+        <span id="ew-sym">—</span>
+        <span id="ew-arrow">→</span>
+        <span id="ew-next">?</span>
+        <span id="ew-tried"></span>
+      </div>
+      <div id="ew-track"><div id="ew-fill"></div></div>
     </div>
     <div id="sym-list"></div>
   </div>
@@ -1176,6 +1225,8 @@
       <div id="sig-top">
         <span id="sig-badge" class="sig-badge neutral">NEUTRAL</span>
         <span id="sig-strength">0.0%</span>
+        <span id="htf-badge" class="htf-badge neutral" title="HTF EMA bias">HTF –</span>
+        <span id="scanner-badge" class="scanner-badge momentum" title="Active scanner type"></span>
       </div>
       <div id="sig-reason">Waiting…</div>
       <div id="sig-bars">
@@ -1225,8 +1276,11 @@
 
     <!-- Position log -->
     <section class="rcard" id="card-pos-log">
-      <div class="rcard-title">POSITION LOG</div>
-      <div id="pos-log-list"><div class="empty">No events yet</div></div>
+      <div class="rcard-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>POSITION LOG</span>
+        <button id="clear-pos-log-btn" onclick="clearPosLog()" style="font-size:10px;padding:2px 8px;background:transparent;border:1px solid #444;color:#888;border-radius:3px;cursor:pointer;">CLEAR</button>
+      </div>
+      <div id="pos-log-list" onscroll="onPosLogScroll(this)"><div class="empty">No events yet</div></div>
     </section>
 
   </div><!-- /right-col -->
@@ -1314,14 +1368,14 @@ function adjustLevel(type, dir) {
       });
     }
   } else {
-    const cur = _overrideSlPrice ?? curSlPrice ?? computeSLPrice(curSession);
+    const cur = _overrideSlPrice ?? curSlPrice ?? null;
     _overrideSlPrice = cur + dir * step;
     if (csSeries && _slLine !== undefined) {
       _slLine = _removeLine(_slLine);
       _slLine = csSeries.createPriceLine({
         price: _overrideSlPrice, color: '#f85149', lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: true, title: 'HARD STOP',
+        axisLabelVisible: true, title: 'LAST RESORT SL',
       });
     }
   }
@@ -1331,7 +1385,7 @@ function adjustLevel(type, dir) {
 }
 
 // chart handles
-let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S;
+let chart, csSeries, bbUp, bbDn, ema9S, ema21S, ema50S, volSeries;
 
 // live candle (updated on every trade tick)
 let _liveCandle = null;
@@ -1342,6 +1396,7 @@ let _tpLine    = null;
 let _slLine    = null;
 let _trailLine = null;
 let _hedgeLines = [];   // one price line per open hedge
+let _dcaLines   = [];   // DCA trigger level lines on chart
 
 // entry/exit markers [ {time, position, color, shape, text} ]
 let _markers = [];
@@ -1402,6 +1457,19 @@ function initChart() {
   ema21S = chart.addLineSeries({ color:'rgba(63,185,80,.75)',   lineWidth:1, priceLineVisible:false, lastValueVisible:false });
   ema50S = chart.addLineSeries({ color:'rgba(88,166,255,.75)',  lineWidth:1, priceLineVisible:false, lastValueVisible:false });
 
+  // Volume histogram — bottom 18% of chart, separate price scale
+  volSeries = chart.addHistogramSeries({
+    priceScaleId:       'volume',
+    priceLineVisible:   false,
+    lastValueVisible:   false,
+    color:              'rgba(88,166,255,0.35)',
+  });
+  volSeries.priceScale().applyOptions({
+    scaleMargins: { top: 0.82, bottom: 0.00 },
+    borderVisible: false,
+    drawTicks:     false,
+  });
+
   // Resize observer
   new ResizeObserver(() => {
     chart.applyOptions({ width: wrap.clientWidth, height: wrap.clientHeight });
@@ -1443,6 +1511,17 @@ function wsSend(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+function triggerScan() {
+  const btn = document.getElementById('scan-now-btn');
+  if (btn) {
+    btn.textContent = 'SCANNING…';
+    btn.disabled = true;
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+  }
+  wsSend({ type: 'force_scan' });
+}
+
 function setWsDot(state) {
   document.getElementById('ws-dot').className   = state;
   document.getElementById('ws-label').textContent = state === 'connected' ? 'connected' : 'disconnected';
@@ -1476,9 +1555,49 @@ function dispatch(msg) {
       showToast(tradingActive ? 'Trading started' : 'Trading stopped', tradingActive ? 'ok' : '');
       break;
 
-    case 'top_movers':
+    case 'force_scan_ack':
+      // Scanner triggered — button resets when top_movers results arrive
+      break;
+
+    case 'top_movers': {
+      // Reset scan button if it was manually triggered
+      const scanBtn = document.getElementById('scan-now-btn');
+      if (scanBtn && scanBtn.disabled) {
+        scanBtn.textContent = 'SCAN NOW';
+        scanBtn.disabled = false;
+        scanBtn.style.color = '';
+        scanBtn.style.borderColor = '';
+      }
       if (msg.movers?.length) updateSymSidebar(msg.movers);
       break;
+    }
+
+    case 'entry_wait': {
+      const bar   = document.getElementById('entry-wait-bar');
+      const sym   = document.getElementById('ew-sym');
+      const fill  = document.getElementById('ew-fill');
+      const next  = document.getElementById('ew-next');
+      const timer = document.getElementById('ew-timer');
+      const tried = document.getElementById('ew-tried');
+      if (!bar) break;
+      if (!msg.waiting) {
+        bar.classList.remove('visible');
+        break;
+      }
+      bar.classList.add('visible');
+      sym.textContent   = (msg.symbol    || '').replace('USDT', '');
+      next.textContent  = (msg.candidate || '').replace('USDT', '') || '—';
+      tried.textContent = msg.total > 0 ? `${msg.tried}/${msg.total}` : '';
+      const rem = Math.max(0, (msg.timeout || 0) - (msg.elapsed || 0));
+      timer.textContent = rem > 0 ? Math.ceil(rem) + 's' : '—';
+      const pct = msg.timeout > 0 ? Math.min(msg.elapsed / msg.timeout * 100, 100) : 0;
+      // Show candle count next to symbol
+      if (msg.elapsed > 0) sym.textContent += ` [${msg.elapsed}/${msg.timeout}c]`;
+      fill.style.width      = pct + '%';
+      fill.style.background = pct > 75 ? '#f85149' : '#e3b341';
+      timer.style.color     = pct > 75 ? '#f85149' : '#e3b341';
+      break;
+    }
 
     case 'price':
       updatePrice(msg.price);
@@ -1499,8 +1618,18 @@ function dispatch(msg) {
       setSymbolSelect(msg.symbol);
       _markers = [];
       clearTradeLevels();
-      document.getElementById('sym-loader-text').textContent =
-        `Loading ${msg.symbol} data…`;
+      // Clear stale chart data so old symbol's candles/overlays don't bleed
+      // into the new symbol's price range while waiting for the candles message.
+      _liveCandle = null;
+      if (csSeries) { csSeries.setData([]); }
+      if (volSeries) { volSeries.setData([]); }
+      if (ema9S)    { ema9S.setData([]);    }
+      if (ema21S)   { ema21S.setData([]);   }
+      if (ema50S)   { ema50S.setData([]);   }
+      if (bbUp)     { bbUp.setData([]);     }
+      if (bbDn)     { bbDn.setData([]);     }
+      showSymLoader(msg.symbol);
+      window._pendingChartFit = true;
       break;
     }
 
@@ -1508,6 +1637,11 @@ function dispatch(msg) {
       if (msg.candles?.length) {
         processCandleUpdate(msg.candles);
         hideSymLoader();   // data arrived — switch complete
+        if (chart && window._pendingChartFit) {
+          window._pendingChartFit = false;
+          chart.timeScale().fitContent();
+          chart.timeScale().scrollToRealTime();
+        }
       }
       break;
 
@@ -1517,8 +1651,23 @@ function dispatch(msg) {
       }
       break;
 
+    case 'htf_bias': {
+      const b   = (msg.bias || 'NEUTRAL').toUpperCase();
+      const tf  = msg.timeframe || '';
+      const el  = document.getElementById('htf-badge');
+      if (el) {
+        el.textContent  = `HTF ${b === 'NEUTRAL' ? '–' : b}${tf ? ' ' + tf : ''}`;
+        el.className    = 'htf-badge ' + b.toLowerCase();
+        el.title        = `HTF EMA bias on ${tf}: ${b}`;
+      }
+      break;
+    }
+
     case 'signal':
       if (msg.data) updateSignalPanel(msg.data);
+      break;
+    case 'entry_blocked':
+      if (msg.reason) updateEntryBlockedReason(msg.reason);
       break;
 
     case 'level_overrides_cleared':
@@ -1537,6 +1686,22 @@ function dispatch(msg) {
       curTrailActive = !!msg.trail_active;
       curTpPrice     = msg.tp_price  ?? null;
       curSlPrice     = msg.sl_price  ?? null;
+      // Draw DCA level lines
+      _dcaLines.forEach(l => _removeLine(l));
+      _dcaLines = [];
+      if (msg.dca_prices?.length && csSeries) {
+        msg.dca_prices.forEach((p, i) => {
+          const line = csSeries.createPriceLine({
+            price:            p,
+            color:            'rgba(240,180,41,0.50)',
+            lineWidth:        1,
+            lineStyle:        LightweightCharts.LineStyle.Dashed,
+            axisLabelVisible: true,
+            title:            i === 0 ? 'DCA 1' : i === 1 ? 'DCA 2' : 'DCA 3',
+          });
+          _dcaLines.push(line);
+        });
+      }
       // Sync manual overrides from engine (keeps other tabs in sync too)
       if (msg.override_tp_price !== undefined) _overrideTpPrice = msg.override_tp_price;
       if (msg.override_sl_price !== undefined) _overrideSlPrice = msg.override_sl_price;
@@ -1577,19 +1742,34 @@ function dispatch(msg) {
     case 'config':
       configData = msg.config || {};
       renderConfig(configData);
+      // Show/hide Scan Now button based on TV scanner mode
+      const scanNowBtn = document.getElementById('scan-now-btn');
+      if (scanNowBtn) {
+        scanNowBtn.style.display = configData.tv_scanner_enabled === '1' ? 'none' : '';
+      }
       if ('trading_mode' in configData) {
         isPaperMode = configData.trading_mode === 'paper';
         updateModeDisplay(configData.trading_mode);
       }
       break;
 
-    case 'config_saved':
+    case 'config_saved': {
+      // Restore save button regardless of outcome
+      const btn = document.querySelector('#cfg-modal-foot .cfg-btn:not(.danger)');
+      if (btn) {
+        btn.textContent = 'SAVE';
+        btn.disabled = false;
+        btn.style.opacity = '';
+      }
       if (msg.ok) {
         showToast('Config saved', 'info');
+        closeCfgModal();   // close modal on success
       } else {
         showToast(msg.error || 'Config save failed', 'err');
+        // Modal stays open so user can fix the error
       }
       break;
+    }
   }
 }
 
@@ -1619,14 +1799,32 @@ function updateSymSidebar(movers) {
     const biasBadge = bias
       ? `<span class="sym-bias ${biasCls}">${bias}</span>`
       : '';
+    const htfB  = (m.htf_bias || '').toUpperCase();
+    const htfBadge = (htfB === 'LONG' || htfB === 'SHORT')
+      ? `<span class="sym-htf ${htfB.toLowerCase()}">HTF ${htfB}</span>`
+      : '';
+    const scanType = m.scanner_type || '';
+    const scanColors = {
+      momentum:  'rgba(88,166,255,.2);color:#58a6ff',
+      breakout:  'rgba(245,158,11,.2);color:#f59e0b',
+      trendpull: 'rgba(139,92,246,.2);color:#a78bfa',
+    };
+    const scanLabel = { momentum: 'MOM', breakout: 'BRK', trendpull: 'PULL' };
+    const scanBadge = scanType
+      ? `<span class="sym-htf" style="background:${scanColors[scanType] || scanColors.momentum}">${scanLabel[scanType] || scanType}</span>`
+      : '';
     const surge    = m.vol_surge != null ? `×${m.vol_surge.toFixed(1)}vol` : '';
     const mom      = m.momentum  != null ? `${m.momentum.toFixed(2)}%mom` : '';
     const atr      = m.atr_pct   != null ? `${m.atr_pct.toFixed(2)}%atr` : '';
+    const tagRow = (biasBadge || htfBadge || scanBadge)
+      ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}${scanBadge}</div>`
+      : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span>${biasBadge}</div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score.toFixed(1)}</span></div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${m.change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>
+      ${tagRow}
     </div>`;
   }).join('');
 }
@@ -1684,8 +1882,10 @@ function updatePrice(price) {
   el.style.color = dir > 0 ? '#3fb950' : dir < 0 ? '#f85149' : '#c9d1d9';
   el.textContent = fmtPrice(price);
   lastPrice = price;
-  // refresh unrealised PnL on each tick
-  if (curSession?.status === 'open') refreshPnL();
+  if (curSession?.status === 'open') {
+    refreshPnL();
+    updatePositionPanel();
+  }
 }
 
 function calcMinMove(price) {
@@ -1715,6 +1915,17 @@ function processCandleUpdate(candles) {
   ema9S.applyOptions({ priceFormat: priceFmt });
   ema21S.applyOptions({ priceFormat: priceFmt });
   ema50S.applyOptions({ priceFormat: priceFmt });
+
+  // Volume bars — green if close >= open, red if close < open
+  if (volSeries) {
+    volSeries.setData(candles.map(c => ({
+      time:  c.time,
+      value: c.volume || 0,
+      color: (c.close >= c.open)
+        ? 'rgba(63,185,80,0.45)'
+        : 'rgba(248,81,73,0.45)',
+    })));
+  }
 
   // Seed live candle from the last (current open) candle returned by server
   const last = candles[candles.length - 1];
@@ -1796,14 +2007,6 @@ function computeTPPrice(session) {
     : session.avg_price - move;
 }
 
-function computeSLPrice(session) {
-  // Mirror engine: hard_stop_pct is UN-LEVERAGED, minimum 2.0%
-  const slPct = 2.0;
-  const move  = session.avg_price * slPct / 100;
-  return session.direction === 'LONG'
-    ? session.avg_price - move
-    : session.avg_price + move;
-}
 
 function _removeLine(ref) {
   try { if (ref) csSeries.removePriceLine(ref); } catch {}
@@ -1817,6 +2020,8 @@ function clearTradeLevels() {
   _trailLine = _removeLine(_trailLine);
   _hedgeLines.forEach(l => _removeLine(l));
   _hedgeLines = [];
+  _dcaLines.forEach(l => _removeLine(l));
+  _dcaLines = [];
 }
 
 function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
@@ -1892,12 +2097,12 @@ function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) 
   // Hard-stop line — override takes priority; falls back to server then computed
   _slLine = _removeLine(_slLine);
   _slLine = csSeries.createPriceLine({
-    price:            _overrideSlPrice ?? curSlPrice ?? computeSLPrice(session),
+    price:            _overrideSlPrice ?? curSlPrice ?? null,
     color:            '#f85149',
     lineWidth:        1,
     lineStyle:        LightweightCharts.LineStyle.Dashed,
     axisLabelVisible: true,
-    title:            'HARD STOP',
+    title:            'LAST RESORT SL',
   });
 
   // Trailing stop line (orange dotted, only when active)
@@ -1975,6 +2180,13 @@ function setInd(id, text, cls) {
 /* ═══════════════════════════════════════════════════════
    SIGNAL PANEL — Step 7
 ═══════════════════════════════════════════════════════ */
+function updateEntryBlockedReason(reason) {
+  const el = document.getElementById('sig-reason');
+  if (!el) return;
+  el.textContent = '⏸ ' + reason;
+  el.style.color = 'rgba(240,180,41,0.85)';
+}
+
 function updateSignalPanel(sig) {
   const dir = (sig.direction || 'NEUTRAL').toUpperCase();
 
@@ -1983,12 +2195,48 @@ function updateSignalPanel(sig) {
   badge.textContent = dir;
   badge.className   = 'sig-badge ' + dir.toLowerCase();
 
-  // Strength %
-  document.getElementById('sig-strength').textContent =
-    ((sig.strength || 0) * 100).toFixed(1) + '%';
+  // Strength % when directional, raw composite when NEUTRAL
+  const strEl = document.getElementById('sig-strength');
+  if (dir === 'NEUTRAL') {
+    const comp = sig.composite ?? 0;
+    const sign = comp >= 0 ? '+' : '';
+    strEl.textContent = sign + (comp * 100).toFixed(1) + '%';
+    strEl.style.opacity = '0.5';
+    strEl.title = `composite ${sign}${comp.toFixed(4)} — threshold ±0.25`;
+  } else {
+    strEl.textContent = ((sig.strength || 0) * 100).toFixed(1) + '%';
+    strEl.style.opacity = '1';
+    strEl.title = '';
+  }
 
-  // Reason text
-  document.getElementById('sig-reason').textContent = sig.reason || '';
+  // Reason text — show warmup indicator if flow window is filling up
+  const reasonEl = document.getElementById('sig-reason');
+  if (sig.flow_warmup) {
+    const ws = (sig.warmup_strength != null && sig.warmup_strength > 0)
+      ? ` (${(sig.warmup_strength * 100).toFixed(1)}%)`
+      : '';
+    reasonEl.textContent = `⏳ flow warming up — technical only${ws}`;
+    reasonEl.style.color = 'var(--amber, #f59e0b)';
+  } else {
+    // Only replace reason text if signal engine has a reason — otherwise keep
+    // the last entry_blocked reason visible so user knows what's being waited for.
+    if (sig.reason) {
+      reasonEl.textContent = sig.reason;
+      reasonEl.style.color = '';
+    }
+  }
+
+  // Scanner type badge
+  const scanBadge = document.getElementById('scanner-badge');
+  if (scanBadge) {
+    const stype = sig.scanner_type || 'momentum';
+    scanBadge.className = 'scanner-badge ' + stype;
+    scanBadge.textContent = stype === 'breakout' ? 'BREAKOUT'
+      : stype === 'trendpull' ? 'TREND↗'
+      : stype === 'breakdown' ? 'BRKDWN↘'
+      : '';
+    scanBadge.title = 'Signal weights: ' + stype;
+  }
 
   // Component bars: each value is -1 … +1
   const comps = sig.components || {};
@@ -2034,7 +2282,7 @@ function updatePositionPanel() {
   const elapsed = s.open_time ? (Date.now() / 1000 - s.open_time) : 0;
 
   const tpPrice  = _overrideTpPrice ?? curTpPrice  ?? computeTPPrice(s);
-  const slPrice  = _overrideSlPrice ?? curSlPrice  ?? computeSLPrice(s);
+  const slPrice  = _overrideSlPrice ?? curSlPrice  ?? null;
   const trailRow = curTrailActive && curTrailPrice
     ? pr('Trail Stop', `<span class="prv" style="color:#ff9800">${fmtPrice(curTrailPrice)}</span>`)
     : '';
@@ -2055,15 +2303,15 @@ function updatePositionPanel() {
     </span>
   </div>`;
 
-  const slRow = `<div class="pr">
-    <span class="prk">Hard Stop</span>
+  const slRow = slPrice != null ? `<div class="pr">
+    <span class="prk">Last Resort SL</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
       <span style="color:var(--red)">${fmtPrice(slPrice)}</span>
       ${fmtLvlPnl(slPnl)}
       <button class="btn-adj" onclick="adjustLevel('sl',+1)">▲</button>
     </span>
-  </div>`;
+  </div>` : '';
 
   posEl.innerHTML = `
     ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
@@ -2154,10 +2402,13 @@ function pr(label, value) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   POSITION LOG
+   POSITION LOG — persistent, scroll-loaded
 ═══════════════════════════════════════════════════════ */
-const _posLogEntries = [];
-const _POS_LOG_MAX = 50;
+const _posLogEntries = [];   // in-memory, newest last
+let _posLogOldestId  = null; // for pagination
+let _posLogLoading   = false;
+let _posLogExhausted = false;
+const _POS_LOG_PAGE  = 20;   // entries per page
 
 const _PL_LABELS = {
   open:        'OPEN',
@@ -2166,6 +2417,9 @@ const _PL_LABELS = {
   hedge_open:  'HEDGE',
   hedge_close: 'H-CLOSE',
   failed:      'FAILED',
+  smart_sl:    'SMART SL',
+  signal_degraded: 'SIG DEG',
+  rescue_dca:  'RESCUE DCA',
 };
 const _PL_CLASSES = {
   open:        'pl-open',
@@ -2174,32 +2428,30 @@ const _PL_CLASSES = {
   hedge_open:  'pl-hedge-open',
   hedge_close: 'pl-hedge-close',
   failed:      'pl-failed',
+  smart_sl:    'pl-close',
+  signal_degraded: 'pl-close',
+  rescue_dca:  'pl-dca',
 };
 
 function _fmtPosLogTime(ts) {
   const d = new Date(ts * 1000);
-  return d.toTimeString().slice(0, 8);
+  return d.toLocaleTimeString();
 }
 
 function _buildPosLogDetail(e) {
   if (e.event === 'failed')
     return `<span class="pl-detail">${e.reason || 'unknown error'}</span>`;
-
   const dir  = e.direction || '';
   const px   = e.price  ? fmtPrice(e.price) : '';
   const qty  = e.qty    ? ` qty=${fmtQty(e.qty)}` : '';
   const sym  = e.symbol || '';
   const mode = e.mode   ? ` [${e.mode.toUpperCase()}]` : '';
   let detail = `${sym} ${dir} @ ${px}${qty}${mode}`;
-
-  if (e.event === 'dca')
-    detail += ` · DCA#${e.dca_n} avg=${fmtPrice(e.new_avg)}`;
-  if (e.event === 'hedge_open')
-    detail += ` · hedge#${e.hedge_n}`;
-
+  if (e.event === 'dca')         detail += ` · DCA#${e.dca_n} avg=${fmtPrice(e.new_avg)}`;
+  if (e.event === 'hedge_open')  detail += ` · hedge#${e.hedge_n}`;
   let pnlHtml = '';
   if (e.pnl !== undefined) {
-    const cls = e.pnl >= 0 ? 'pl-pnl-pos' : 'pl-pnl-neg';
+    const cls  = e.pnl >= 0 ? 'pl-pnl-pos' : 'pl-pnl-neg';
     const sign = e.pnl >= 0 ? '+' : '';
     pnlHtml = ` <span class="${cls}">${sign}${e.pnl.toFixed(4)} USDT`;
     if (e.pnl_pct !== undefined) pnlHtml += ` (${e.pnl_pct >= 0 ? '+' : ''}${e.pnl_pct.toFixed(2)}%)`;
@@ -2209,6 +2461,16 @@ function _buildPosLogDetail(e) {
   return `<span class="pl-detail">${detail}${pnlHtml}</span>`;
 }
 
+function _posLogRowHtml(e) {
+  const badgeCls = _PL_CLASSES[e.event] || 'pl-open';
+  const label    = _PL_LABELS[e.event]  || e.event.toUpperCase();
+  return `<div class="pl-row" data-id="${e._id || ''}">
+    <span class="pl-badge ${badgeCls}">${label}</span>
+    ${_buildPosLogDetail(e)}
+    <span class="pl-time">${_fmtPosLogTime(e.ts)}</span>
+  </div>`;
+}
+
 function _renderPosLog() {
   const el = document.getElementById('pos-log-list');
   if (!el) return;
@@ -2216,22 +2478,60 @@ function _renderPosLog() {
     el.innerHTML = '<div class="empty">No events yet</div>';
     return;
   }
-  el.innerHTML = _posLogEntries.slice().reverse().map(e => {
-    const badgeCls = _PL_CLASSES[e.event] || 'pl-open';
-    const label    = _PL_LABELS[e.event]  || e.event.toUpperCase();
-    return `<div class="pl-row">
-      <span class="pl-badge ${badgeCls}">${label}</span>
-      ${_buildPosLogDetail(e)}
-      <span class="pl-time">${_fmtPosLogTime(e.ts)}</span>
-    </div>`;
-  }).join('');
+  // newest at top
+  el.innerHTML = [..._posLogEntries].reverse().map(_posLogRowHtml).join('');
 }
 
 function addPosLogEntry(e) {
+  // Assign temporary _id if none (live WS events)
+  if (!e._id) e._id = Date.now();
   _posLogEntries.push(e);
-  if (_posLogEntries.length > _POS_LOG_MAX) _posLogEntries.shift();
   _renderPosLog();
 }
+
+async function _loadPosLog(prepend = false) {
+  if (_posLogLoading || _posLogExhausted) return;
+  _posLogLoading = true;
+  try {
+    let url = `/api/pos_log?limit=${_POS_LOG_PAGE}`;
+    if (prepend && _posLogOldestId) url += `&before_id=${_posLogOldestId}`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    const rows = data.pos_log || [];
+    if (rows.length < _POS_LOG_PAGE) _posLogExhausted = true;
+    if (rows.length) {
+      // rows come newest-first from API; push oldest-first into _posLogEntries
+      const ordered = [...rows].reverse();
+      if (prepend) {
+        _posLogEntries.unshift(...ordered);
+      } else {
+        _posLogEntries.push(...ordered);
+      }
+      _posLogOldestId = rows[rows.length - 1]._id;
+    }
+    _renderPosLog();
+  } catch(e) { console.error('pos_log load error', e); }
+  finally { _posLogLoading = false; }
+}
+
+function onPosLogScroll(el) {
+  // Load more when user scrolls near bottom (oldest entries)
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+    _loadPosLog(true);
+  }
+}
+
+async function clearPosLog() {
+  if (!confirm('Clear all position log entries?')) return;
+  await fetch('/api/pos_log', { method: 'DELETE' });
+  _posLogEntries.length = 0;
+  _posLogOldestId  = null;
+  _posLogExhausted = false;
+  _renderPosLog();
+}
+
+// Load initial entries on page load
+_loadPosLog();
 
 /* ═══════════════════════════════════════════════════════
    ORDER BOOK — Step 9
@@ -2411,22 +2711,26 @@ const TF_OPTIONS = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1
 
 const CFG_SCHEMA = [
   { section: 'Trading', fields: [
-    { key: 'timeframe',         label: 'Timeframe',           type: 'select', options: TF_OPTIONS },
     { key: 'leverage',          label: 'Leverage',            type: 'number' },
     { key: 'margin_usdt',       label: 'Margin (USDT)',       type: 'number' },
-    { key: 'max_dca',           label: 'Max DCA',             type: 'number' },
-    { key: 'dca_multiplier',    label: 'DCA Multiplier',      type: 'number' },
-    { key: 'max_re_hedge',      label: 'Max Re-hedges',       type: 'number' },
+    { key: 'max_dca',            label: 'Max DCA',              type: 'number' },
+    { key: 'smart_dca_gate',    label: 'Smart DCA Gate',       type: 'toggle' },
+    { key: 'smart_dca_signals', label: 'DCA Reversal Signals', type: 'number' },
+    { key: 'dca_multiplier',    label: 'DCA Multiplier',       type: 'number' },
+    { key: 'max_re_hedge',      label: 'Max Re-hedges',        type: 'number' },
     { key: 'partial_tp',        label: 'Partial TP',          type: 'toggle' },
     { key: 'partial_tp_ratio',  label: 'Partial TP Ratio',    type: 'number' },
   ]},
   { section: 'Signal', fields: [
     { key: 'min_signal_strength', label: 'Min Signal Strength', type: 'number' },
+    { key: 'htf_filter',          label: 'HTF Filter',          type: 'toggle' },
+    { key: 'htf_timeframe', label: 'HTF Timeframe (empty=auto)', type: 'text' },
     { key: 'strength_sizing',     label: 'Strength Sizing',     type: 'toggle' },
     { key: 'strength_size_min',   label: 'Min Size Scale',      type: 'number' },
-    { key: 'stoch_signal',        label: 'StochRSI Signal',     type: 'toggle' },
   ]},
   { section: 'Risk', fields: [
+    { key: 'breakeven_stop',        label: 'Breakeven Stop',         type: 'toggle' },
+    { key: 'last_resort_sl_buffer', label: 'Last Resort SL Buffer',  type: 'number' },
     { key: 'cooldown_after_stop_s', label: 'Stop Cooldown (s)',      type: 'number' },
     { key: 'max_daily_loss_usdt',   label: 'Max Daily Loss (USDT)',  type: 'number' },
     { key: 'taker_fee_pct',         label: 'Taker Fee (%)',          type: 'number' },
@@ -2436,7 +2740,17 @@ const CFG_SCHEMA = [
     { key: 'trading_mode',     label: 'Trading Mode',             type: 'select', options: ['paper','demo','live'] },
     { key: 'auto_switch',      label: 'Auto Symbol Switch',       type: 'toggle' },
     { key: 'scan_interval_s',  label: 'Scan Interval (s)',        type: 'number' },
+    { key: 'flow_warmup_mult', label: 'Flow Warmup Multiplier',   type: 'number' },
+    { key: 'auto_leverage',      label: 'Auto Leverage (ATR-based)', type: 'toggle' },
+    { key: 'signal_persist_ticks', label: 'Signal Persist Ticks (0=off)', type: 'number' },
     { key: 'switch_threshold', label: 'Switch Threshold (ratio)', type: 'number' },
+    { key: 'entry_wait_candles', label: 'Entry Wait (candles)',   type: 'number' },
+    { key: 'scanner_top_n',    label: 'Scanner Top N',            type: 'number' },
+    { key: 'tv_scanner_enabled', label: 'TradingView Scanner',       type: 'toggle' },
+    { key: 'tv_secret',          label: 'TV Webhook Secret',         type: 'text'   },
+    { key: 'scanner_momentum',  label: 'Scanner: Momentum',        type: 'toggle' },
+    { key: 'scanner_breakout',  label: 'Scanner: Breakout',        type: 'toggle' },
+    { key: 'scanner_trendpull', label: 'Scanner: Trend Pullback',  type: 'toggle' },
     { key: 'discord_webhook',  label: 'Discord Webhook',          type: 'text', wide: true },
   ]},
 ];
@@ -2493,6 +2807,16 @@ function onSelectCfg(el) {
 }
 
 function saveConfig() {
+  const btn = document.querySelector('#cfg-modal-foot .cfg-btn:not(.danger)');
+  const origText = btn ? btn.textContent : 'SAVE';
+
+  // Show saving state
+  if (btn) {
+    btn.textContent = 'SAVING…';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+  }
+
   const updates = {};
   document.querySelectorAll('#cfg-form [data-key]').forEach(el => {
     const key = el.dataset.key;
@@ -2501,6 +2825,15 @@ function saveConfig() {
     else updates[key] = el.value;
   });
   wsSend({ type: 'set_config', config: updates });
+
+  // Safety timeout: restore button if no response in 5s
+  setTimeout(() => {
+    if (btn && btn.disabled) {
+      btn.textContent = origText;
+      btn.disabled = false;
+      btn.style.opacity = '';
+    }
+  }, 5000);
 }
 
 function resetBot() {
@@ -2551,26 +2884,15 @@ function openDrawer(side) {
   if (side === 'left')  document.getElementById('sym-sidebar').classList.add('drawer-open');
   if (side === 'right') document.getElementById('right-col').classList.add('drawer-open');
   document.getElementById('drawer-overlay').classList.add('active');
+  document.body.style.overflow = 'hidden';
 }
 function closeDrawers() {
   document.getElementById('sym-sidebar').classList.remove('drawer-open');
   document.getElementById('right-col').classList.remove('drawer-open');
   document.getElementById('drawer-overlay').classList.remove('active');
+  document.body.style.overflow = '';
 }
 
-// Swipe gestures: right-swipe opens watchlist, left-swipe opens panel, either swipe closes open drawer
-let _swipeX = 0;
-document.addEventListener('touchstart', e => { _swipeX = e.touches[0].clientX; }, { passive: true });
-document.addEventListener('touchend', e => {
-  if (window.innerWidth > 767) return;
-  const dx = e.changedTouches[0].clientX - _swipeX;
-  const leftOpen  = document.getElementById('sym-sidebar').classList.contains('drawer-open');
-  const rightOpen = document.getElementById('right-col').classList.contains('drawer-open');
-  if (Math.abs(dx) < 40) return;  // ignore small swipes
-  if (leftOpen || rightOpen) { closeDrawers(); return; }
-  if (dx >  40) openDrawer('left');
-  if (dx < -40) openDrawer('right');
-}, { passive: true });
 
 function changeTf(tf) {
   if (tradingActive) {
@@ -2600,9 +2922,9 @@ function hideSymLoader() {
 }
 
 function changeSymbol(sym) {
-  if (tradingActive) {
-    showToast('Stop trading before changing symbol', 'warn');
-    setSymbolSelect(currentSymbol);  // revert the select
+  if (window._sessionOpen) {
+    showToast('Cannot change symbol while position is open', 'warn');
+    setSymbolSelect(currentSymbol);
     return;
   }
   currentSymbol = sym;

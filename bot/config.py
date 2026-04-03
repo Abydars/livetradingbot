@@ -26,6 +26,10 @@ class BotConfig:
     margin_usdt: float
     max_dca: int
     max_re_hedge: int
+    smart_dca_gate: bool
+    smart_dca_signals: int
+    breakeven_stop: bool
+    last_resort_sl_buffer: float
     min_signal_strength: float
     cooldown_after_stop_s: int
     max_daily_loss_usdt: float
@@ -53,7 +57,20 @@ class BotConfig:
     # Auto-switch
     auto_switch: bool
     scan_interval_s: int
+    tv_scanner_enabled: bool
+    tv_secret:          str
+    htf_filter: bool
+    htf_timeframe: str   # empty = auto, otherwise e.g. "4h", "1d"
+    flow_warmup_mult: float
+    auto_leverage: bool
+    signal_persist_ticks: int
     switch_threshold: float  # min score ratio for #1 vs current to trigger switch
+    entry_wait_candles: int # candles to wait with NEUTRAL signal before switching to next candidate
+    scanner_top_n: int
+    scanner_momentum:  bool
+    scanner_breakout:  bool
+    scanner_trendpull: bool
+    scanner_breakdown: bool
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -62,6 +79,14 @@ class BotConfig:
     @property
     def paper_mode(self) -> bool:
         return self.trading_mode == "paper"
+
+    @property
+    def tf_minutes(self) -> int:
+        """Candle duration in minutes — used to scale tick-based timers."""
+        return {
+            "1m": 1, "3m": 3, "5m": 5, "15m": 15,
+            "30m": 30, "1h": 60, "2h": 120, "4h": 240,
+        }.get(self.timeframe, 1)
 
 
 async def load_config() -> BotConfig:
@@ -104,7 +129,11 @@ async def load_config() -> BotConfig:
         leverage=_i("leverage", 10),
         margin_usdt=_f("margin_usdt", 10.0),
         max_dca=_i("max_dca", 3),
-        max_re_hedge=_i("max_re_hedge", 3),
+        max_re_hedge=_i("max_re_hedge", 0),
+        smart_dca_gate=_b("smart_dca_gate", True),
+        smart_dca_signals=_i("smart_dca_signals", 2),
+        breakeven_stop=_b("breakeven_stop", True),
+        last_resort_sl_buffer=_f("last_resort_sl_buffer", 0.80),
         min_signal_strength=_f("min_signal_strength", 0.25),
         cooldown_after_stop_s=_i("cooldown_after_stop_s", 300),
         max_daily_loss_usdt=_f("max_daily_loss_usdt", 0.0),
@@ -121,8 +150,21 @@ async def load_config() -> BotConfig:
         key_type=key_type,
         discord_webhook=_s("discord_webhook", ""),
         auto_switch=_b("auto_switch", True),
-        scan_interval_s=_i("scan_interval_s", 30),
+        scan_interval_s=_i("scan_interval_s", 10),
+        tv_scanner_enabled=_b("tv_scanner_enabled", False),
+        tv_secret=_s("tv_secret", ""),
+        htf_filter=_b("htf_filter", True),
+        htf_timeframe=_s("htf_timeframe", ""),
+        flow_warmup_mult=_f("flow_warmup_mult", 1.0),
+        auto_leverage=_b("auto_leverage", True),
+        signal_persist_ticks=_i("signal_persist_ticks", 2),
         switch_threshold=_f("switch_threshold", 1.1),
+        entry_wait_candles=_i("entry_wait_candles", 3),
+        scanner_top_n=_i("scanner_top_n", 10),
+        scanner_momentum=_b("scanner_momentum",  True),
+        scanner_breakout=_b("scanner_breakout",   True),
+        scanner_trendpull=_b("scanner_trendpull", True),
+        scanner_breakdown=_b("scanner_breakdown", True),
         api_key=api_key,
         api_secret=api_secret,
     )

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     direction        TEXT NOT NULL,
     entry_price      REAL NOT NULL,
     avg_price        REAL NOT NULL,
+    exit_price       REAL,
     qty              REAL NOT NULL,
     margin           REAL NOT NULL,
     leverage         INTEGER NOT NULL,
@@ -65,6 +66,13 @@ CREATE TABLE IF NOT EXISTS signal_log (
     rsi_score   REAL,
     action      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS pos_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event   TEXT    NOT NULL,
+    payload TEXT    NOT NULL,
+    ts      INTEGER NOT NULL
+);
 """
 
 _DEFAULT_CONFIG: Dict[str, str] = {
@@ -72,15 +80,32 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "leverage":            "10",
     "margin_usdt":         "10",
     "max_dca":             "3",
-    "max_re_hedge":        "3",
+    "max_re_hedge":        "0",
+    "smart_dca_gate":          "1",
+    "smart_dca_signals":       "2",
+    "breakeven_stop":          "1",
+    "last_resort_sl_buffer":   "0.80",
     "min_signal_strength": "0.25",
     "trading_mode":        "paper",
     "discord_webhook":     "",
+    "tv_scanner_enabled":  "0",    # use TradingView webhook signals as scanner source
+    "tv_secret":           "",     # shared secret to verify TV webhook authenticity
     "auto_switch":         "1",
-    "scan_interval_s":     "10",
+    "scan_interval_s":     "5",
+    "htf_filter":          "1",   # block entries when HTF EMA bias contradicts signal direction
+    "htf_timeframe":       "",    # override HTF timeframe (empty = auto based on trading TF)
+    "flow_warmup_mult":    "1.0",   # flow warmup window multiplier (1.0 = default ~50% of candle period, 2.0 = double)
+    "auto_leverage":       "1",    # auto-adjust leverage based on ATR so DCA fits within SL distance
+    "signal_persist_ticks": "2",   # ticks signal must hold before entry (0 = disabled)
     "timeframe":           "1m",
     "trading_active":      "0",
     "switch_threshold":    "1.1",
+    "entry_wait_candles":  "3",     # candles to wait (NEUTRAL) before trying next symbol
+    "scanner_top_n":       "10",   # how many symbols to show in the scanner sidebar
+    "scanner_momentum":    "1",   # enable momentum scanner (vol surge + acceleration)
+    "scanner_breakout":    "1",   # enable breakout scanner (BB squeeze + N-candle high/low)
+    "scanner_trendpull":   "1",   # enable trend pullback scanner (EMA bounce setups)
+    "scanner_breakdown":   "1",   # enable breakdown scanner (SHORT: sell rally in downtrend)
     "cooldown_after_stop_s": "300",
     "max_daily_loss_usdt":   "0",
     "dca_multiplier":        "1.0",
@@ -124,11 +149,22 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("trail_price",     "REAL"),
         # sessions columns added in v4 — signal price
         ("signal_price",    "REAL"),
+        # sessions columns added in v5 — exit fill price
+        ("exit_price",      "REAL"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
         except Exception:
             pass  # column already exists
+    # Create pos_log table if missing (older DBs won't have it)
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS pos_log (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            event   TEXT    NOT NULL,
+            payload TEXT    NOT NULL,
+            ts      INTEGER NOT NULL
+        )"""
+    )
     await db.commit()
 
 
@@ -223,11 +259,18 @@ async def update_session(session_id: int, **kwargs: Any) -> None:
         await db.commit()
 
 
-async def close_session(session_id: int, pnl: float, reason: str) -> None:
+async def close_session(
+    session_id: int,
+    pnl: float,
+    reason: str,
+    exit_price: Optional[float] = None,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE sessions SET status='closed', close_time=?, pnl=?, exit_reason=? WHERE id=?",
-            (time.time(), pnl, reason, session_id),
+            "UPDATE sessions "
+            "SET status='closed', close_time=?, pnl=?, exit_reason=?, exit_price=? "
+            "WHERE id=?",
+            (time.time(), pnl, reason, exit_price, session_id),
         )
         await db.commit()
 
@@ -355,6 +398,55 @@ async def get_signal_log(limit: int = 100) -> List[Dict[str, Any]]:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Position log — persisted across restarts
+# ---------------------------------------------------------------------------
+
+async def insert_pos_log(event: str, payload: dict) -> None:
+    import json
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR IGNORE INTO pos_log (event, payload, ts)
+               VALUES (?, ?, ?)""",
+            (event, json.dumps(payload), payload.get("ts", int(time.time()))),
+        )
+        await db.execute(
+            "DELETE FROM pos_log WHERE id NOT IN "
+            "(SELECT id FROM pos_log ORDER BY id DESC LIMIT 2000)"
+        )
+        await db.commit()
+
+
+async def get_pos_log(limit: int = 30, before_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    import json
+    async with aiosqlite.connect(DB_PATH) as db:
+        if before_id:
+            cur = await db.execute(
+                "SELECT id, event, payload, ts FROM pos_log "
+                "WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (before_id, limit),
+            )
+        else:
+            cur = await db.execute(
+                "SELECT id, event, payload, ts FROM pos_log "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cur.fetchall()
+    result = []
+    for row in rows:
+        entry = json.loads(row[2])
+        entry["_id"] = row[0]
+        result.append(entry)
+    return result
+
+
+async def clear_pos_log() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pos_log")
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
