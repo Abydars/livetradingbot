@@ -375,6 +375,7 @@ async def _ticker_loop() -> None:
                             )
                             asyncio.ensure_future(_do_switch(best_sym, cfg))
 
+            global _tv_batch_timer
             # Batch timer expiry check — if batch window started but no more alerts came,
             # fire the switch here so a single alert doesn't get silently dropped.
             if (_tv_batch_timer > 0.0
