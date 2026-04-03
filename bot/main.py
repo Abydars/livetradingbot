@@ -334,17 +334,19 @@ async def _ticker_loop() -> None:
                 watch_syms = [m["symbol"] for m in _last_top_movers[:3]
                               if m.get("symbol") != cfg.symbol]
                 if watch_syms:
-                    # Update sidebar with real bot signal strength for each watched symbol
-                    all_sigs = _tv_watcher.get_all_signals(watch_syms, _last_top_movers, cfg, _htf_bias)
-                    updated  = False
-                    for sig in all_sigs:
-                        for m in _last_top_movers:
-                            if m.get("symbol") == sig["symbol"]:
-                                m["bot_strength"] = sig["strength"]
-                                m["bot_ready"]    = sig["ready"]
-                                updated = True
-                    if updated:
-                        await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+                    # Update sidebar with real bot signal strength — only when candles refreshed
+                    if _tv_watcher.signals_are_stale():
+                        all_sigs = _tv_watcher.get_all_signals(watch_syms, _last_top_movers, cfg, _htf_bias)
+                        _tv_watcher.mark_signals_fresh()
+                        updated  = False
+                        for sig in all_sigs:
+                            for m in _last_top_movers:
+                                if m.get("symbol") == sig["symbol"]:
+                                    m["bot_strength"] = sig["strength"]
+                                    m["bot_ready"]    = sig["ready"]
+                                    updated = True
+                        if updated:
+                            await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
                     # Switch to best ready symbol if no position open
                     if _engine._session is None and _trading_active:

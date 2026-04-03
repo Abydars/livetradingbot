@@ -23,8 +23,9 @@ _WATCH_COUNT   = 3       # monitor top N TV symbols
 class TvWatcher:
     def __init__(self, rest_client):
         self._rest        = rest_client
-        self._cache: Dict[str, dict] = {}  # {symbol: {candles, indicators, last_fetch}}
+        self._cache: Dict[str, dict] = {}  # {symbol: {candles, indicators, prev_indicators, last_fetch}}
         self._signal_eng  = SignalEngine()
+        self._last_sig_ts: float = 0.0     # last time get_all_signals() ran
 
     async def refresh(self, symbols: List[str], cfg: BotConfig) -> None:
         """Fetch/update candles for watched symbols. Call periodically."""
@@ -42,10 +43,12 @@ class TvWatcher:
                         for k in raw
                     ]
                     self._cache[sym] = {
-                        "candles":    candles,
-                        "indicators": compute_all(candles),
-                        "last_fetch": now,
+                        "candles":         candles,
+                        "indicators":      compute_all(candles),
+                        "prev_indicators": compute_all(candles[:-1]) if len(candles) >= 2 else {},
+                        "last_fetch":      now,
                     }
+                    self._last_sig_ts = 0.0  # force signal recompute after candle refresh
                     logger.debug("TvWatcher: refreshed %s (%d candles)", sym, len(candles))
             except Exception as exc:
                 logger.warning("TvWatcher: candle fetch failed for %s: %s", sym, exc)
@@ -149,8 +152,9 @@ class TvWatcher:
             # Signal persistence: must have been same direction on previous candle close
             # (candle-based substitute for tick-based persist_needed)
             if len(candles) >= 3:
+                prev_ind_cached = entry.get("prev_indicators", {})
                 prev_flow = {**flow}
-                prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, compute_all(candles[:-1]))
+                prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, prev_ind_cached)
                 if prev_sig["direction"] != direction:
                     continue
 
@@ -231,8 +235,9 @@ class TvWatcher:
                     if direction == "LONG"  and c2["close"] < c2["open"]: ready = False
                     if direction == "SHORT" and c2["close"] > c2["open"]: ready = False
                 if ready and len(candles) >= 3:
+                    prev_ind_cached = entry.get("prev_indicators", {})
                     prev_flow = {**flow}
-                    prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, compute_all(candles[:-1]))
+                    prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, prev_ind_cached)
                     if prev_sig["direction"] != direction: ready = False
 
             results.append({
@@ -245,6 +250,13 @@ class TvWatcher:
 
         return results
 
+    def signals_are_stale(self) -> bool:
+        """True when candles were refreshed since last get_all_signals() call."""
+        return self._last_sig_ts == 0.0
+
+    def mark_signals_fresh(self) -> None:
+        self._last_sig_ts = time.time()
+
     def invalidate(self, symbol: str) -> None:
         """Force candle refresh for a symbol on next cycle."""
         if symbol in self._cache:
@@ -252,3 +264,4 @@ class TvWatcher:
 
     def clear(self) -> None:
         self._cache.clear()
+        self._last_sig_ts = 0.0
