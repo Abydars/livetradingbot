@@ -329,20 +329,33 @@ async def _ticker_loop() -> None:
                     except Exception as exc:
                         logger.debug("HTF fetch failed: %s", exc)
 
-            # TV watcher: check if any watched symbol has a better entry than current
-            if (cfg.tv_scanner_enabled and _tv_watcher and _last_top_movers
-                    and _engine._session is None and _trading_active):
+            # TV watcher: update sidebar strength + check for best entry
+            if (cfg.tv_scanner_enabled and _tv_watcher and _last_top_movers):
                 watch_syms = [m["symbol"] for m in _last_top_movers[:3]
                               if m.get("symbol") != cfg.symbol]
                 if watch_syms:
-                    best = _tv_watcher.best_entry(watch_syms, _last_top_movers, cfg, _htf_bias)
-                    if best:
-                        best_sym, best_dir, best_str = best
-                        logger.info(
-                            "TvWatcher: switching to %s %s (strength=%.2f) — entry ready",
-                            best_sym, best_dir, best_str,
-                        )
-                        asyncio.ensure_future(_do_switch(best_sym, cfg))
+                    # Update sidebar with real bot signal strength for each watched symbol
+                    all_sigs = _tv_watcher.get_all_signals(watch_syms, _last_top_movers, cfg, _htf_bias)
+                    updated  = False
+                    for sig in all_sigs:
+                        for m in _last_top_movers:
+                            if m.get("symbol") == sig["symbol"]:
+                                m["bot_strength"] = sig["strength"]
+                                m["bot_ready"]    = sig["ready"]
+                                updated = True
+                    if updated:
+                        await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+
+                    # Switch to best ready symbol if no position open
+                    if _engine._session is None and _trading_active:
+                        best = _tv_watcher.best_entry(watch_syms, _last_top_movers, cfg, _htf_bias)
+                        if best:
+                            best_sym, best_dir, best_str = best
+                            logger.info(
+                                "TvWatcher: switching to %s %s strength=%.2f — entry ready",
+                                best_sym, best_dir, best_str,
+                            )
+                            asyncio.ensure_future(_do_switch(best_sym, cfg))
 
                 await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
