@@ -359,7 +359,7 @@ async def _ticker_loop() -> None:
                             )
                             asyncio.ensure_future(_do_switch(best_sym, cfg))
 
-                await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
+            await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
             # Detect trade close → signal scanner to run immediately
             cur_session_open = _engine._session is not None
