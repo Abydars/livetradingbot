@@ -1328,6 +1328,8 @@ async def lifespan(app: FastAPI):
     if cfg.tv_scanner_enabled:
         stored_alerts = await get_tv_alerts()
         global _last_top_movers
+        now_ts      = time.time()
+        tf_window_s = cfg.tf_minutes * 60
         _last_top_movers = [
             {
                 "symbol":       a["symbol"],
@@ -1342,8 +1344,10 @@ async def lifespan(app: FastAPI):
                 "momentum":     None,
                 "atr_pct":      None,
                 "htf_bias":     "",
+                "ts":           a.get("ts", now_ts),
             }
             for a in stored_alerts
+            if now_ts - a.get("ts", 0) <= tf_window_s  # drop stale on startup too
         ]
 
     # ── Startup position sync ─────────────────────────────────────────────
@@ -1589,8 +1593,16 @@ async def tv_signal(request: Request):
         _engine.set_scanner_type(scanner)
 
     # Update sidebar first — always add/update this symbol in the list
-    existing   = [m for m in _last_top_movers if m.get("symbol") != symbol]
-    new_entry  = {
+    # Drop stale alerts outside the current TF window before scoring.
+    # A 15m TF means signals older than 15 minutes are no longer relevant —
+    # the candle that generated them has long closed and conditions have changed.
+    tf_window_s = cfg.tf_minutes * 60
+    now_ts      = time.time()
+    fresh       = [m for m in _last_top_movers
+                   if now_ts - m.get("ts", 0) <= tf_window_s
+                   and m.get("symbol") != symbol]
+
+    new_entry = {
         "symbol":       symbol,
         "direction":    direction,
         "scanner_type": scanner,
@@ -1603,8 +1615,9 @@ async def tv_signal(request: Request):
         "momentum":     None,
         "atr_pct":      None,
         "htf_bias":     "",
+        "ts":           now_ts,
     }
-    _last_top_movers = sorted([new_entry] + existing, key=lambda x: x.get("score", 0.0), reverse=True)
+    _last_top_movers = sorted([new_entry] + fresh, key=lambda x: x.get("score", 0.0), reverse=True)
     await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
     await save_tv_alert(symbol, direction, scanner)
 
@@ -1653,6 +1666,19 @@ async def tv_signal(request: Request):
         await _do_broadcast({"type": "symbol_ready", "symbol": symbol})
 
     return {"ok": True, "symbol": symbol, "direction": direction, "scanner": scanner}
+
+
+@app.delete("/api/tv-alerts")
+async def clear_tv_alerts():
+    """Clear all TradingView alerts from sidebar and database."""
+    global _last_top_movers
+    _last_top_movers = []
+    await _do_broadcast({"type": "top_movers", "movers": []})
+    # Clear from DB too
+    async with __import__('aiosqlite').connect(__import__('database').DB_PATH) as db:
+        await db.execute("DELETE FROM tv_alerts")
+        await db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/pos_log")
