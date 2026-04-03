@@ -1490,7 +1490,7 @@ function connectWS() {
 
   ws.onopen = () => {
     setWsDot('connected');
-    wsDelay = 2000;
+    wsDelay = 1000;  // reset backoff on successful connect
     wsSend({ type: 'get_config' });
     wsSend({ type: 'get_sessions', limit: 200 });
     wsSend({ type: 'get_signal_log', limit: 200 });
@@ -1505,7 +1505,25 @@ function connectWS() {
 
   ws.onerror = () => ws.close();
 
+  // Heartbeat: if no message received in 15s, connection is stale — reconnect
+  let _lastMsgTs = Date.now();
+  let _heartbeatTimer = setInterval(() => {
+    if (Date.now() - _lastMsgTs > 15000) {
+      console.warn('WS stale — no message in 15s, reconnecting');
+      clearInterval(_heartbeatTimer);
+      ws.close();
+    } else if (ws.readyState === WebSocket.OPEN) {
+      // Send ping to keep connection alive
+      wsSend({ type: 'ping' });
+    }
+  }, 10000);
+
+  ws.onclose = () => {
+    clearInterval(_heartbeatTimer);
+  };
+
   ws.onmessage = (e) => {
+    _lastMsgTs = Date.now();
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
     dispatch(msg);

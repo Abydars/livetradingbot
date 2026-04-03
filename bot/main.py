@@ -2245,6 +2245,9 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
                 "candles": _engine.candles[-100:],
             }))
 
+    elif mtype == "ping":
+        await ws.send_text(json.dumps({"type": "pong"}))
+
     elif mtype == "force_scan":
         global _force_scan
         _force_scan = True
