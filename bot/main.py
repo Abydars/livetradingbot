@@ -473,9 +473,10 @@ async def _scanner_loop() -> None:
             should_scan   = _force_scan or (now - _last_symbol_scan >= cfg.scan_interval_s)
 
             if _force_scan:
-                # Manual Scan Now button or trade close — always run regardless of auto_switch
                 _force_scan = False
-                await _scan_symbols(cfg)
+                # Skip internal scanner if TV scanner is active — TV alerts are the source
+                if not cfg.tv_scanner_enabled:
+                    await _scan_symbols(cfg)
             elif should_scan and cfg.auto_switch and not position_open and not cfg.tv_scanner_enabled:
                 # Skip internal scanner when TradingView scanner is active
                 await _scan_symbols(cfg)
