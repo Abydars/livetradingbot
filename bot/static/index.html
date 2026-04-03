@@ -1822,7 +1822,7 @@ function updateSymSidebar(movers) {
       ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}${scanBadge}</div>`
       : '';
     return `<div class="sym-item ${active}" onclick="changeSymbol('${m.symbol}')">
-      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score != null ? m.score.toFixed(1) : 'TV'}</span></div>
+      <div class="sym-rank"><span>#${i + 1} &middot; ${m.score != null ? (m.score < 1.0 ? m.score.toFixed(2) : m.score.toFixed(1)) : 'TV'}</span></div>
       <div class="sym-name">${coin}</div>
       <div class="sym-chg ${chgCls}">${chgSign}${change.toFixed(2)}%</div>
       <div class="sym-metrics">${[surge, mom, atr].filter(Boolean).join(' · ')}</div>

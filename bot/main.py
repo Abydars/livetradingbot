@@ -1333,9 +1333,15 @@ async def lifespan(app: FastAPI):
                 "symbol":       a["symbol"],
                 "direction":    a["direction"],
                 "scanner_type": a["scanner"],
+                "bias":         a["direction"],
                 "_bias":        a["direction"],
                 "_scanner":     a["scanner"],
                 "score":        1.0,
+                "change":       0.0,
+                "vol_surge":    None,
+                "momentum":     None,
+                "atr_pct":      None,
+                "htf_bias":     "",
             }
             for a in stored_alerts
         ]
@@ -1567,7 +1573,7 @@ async def tv_signal(request: Request):
     # Prune stale entries so dict doesn't grow unbounded
     _tv_alert_cooldown = {s: t for s, t in _tv_alert_cooldown.items() if now - t < 3600}
 
-    tv_score = max(0.0, min(1.0, float(body.get("score", 1.0))))
+    tv_score = max(0.0, min(1.0, abs(float(body.get("score", 0.5)))))
 
     logger.info(
         "TV webhook: %s %s scanner=%s score=%.2f",
