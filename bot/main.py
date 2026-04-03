@@ -1590,9 +1590,15 @@ async def tv_signal(request: Request):
         "symbol":       symbol,
         "direction":    direction,
         "scanner_type": scanner,
-        "score":        1.0,   # TV signal = high confidence
+        "score":        1.0,
+        "bias":         direction,   # sidebar reads 'bias' not '_bias'
         "_bias":        direction,
         "_scanner":     scanner,
+        "change":       0.0,         # not available from TradingView — show neutral
+        "vol_surge":    None,        # will be hidden in sidebar (no data)
+        "momentum":     None,        # will be hidden in sidebar (no data)
+        "atr_pct":      None,        # will be hidden in sidebar (no data)
+        "htf_bias":     "",
     }
     _last_top_movers = [new_entry] + existing   # TV signal goes to top
     await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
