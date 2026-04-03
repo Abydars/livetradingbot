@@ -1715,6 +1715,9 @@ async def tv_signal(request: Request):
     tv_score    = max(0.0, min(1.0, abs(float(body.get("score", 0.5)))))
     tv_change   = float(body.get("change",   0.0))
     tv_vol_usdt = float(body.get("vol_usdt", 0.0))
+    tv_htf = str(body.get("htf", "")).upper().strip()
+    if tv_htf not in ("LONG", "SHORT"):
+        tv_htf = ""
 
     logger.info(
         "TV webhook: %s %s scanner=%s score=%.2f",
@@ -1752,7 +1755,7 @@ async def tv_signal(request: Request):
         "vol_surge":    None,
         "momentum":     None,
         "atr_pct":      None,
-        "htf_bias":     "",
+        "htf_bias":     tv_htf,
         "ts":           now_ts,
     }
     _last_top_movers = sorted([new_entry] + fresh, key=lambda x: x.get("score", 0.0), reverse=True)
