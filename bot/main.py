@@ -1562,6 +1562,25 @@ async def tv_signal(request: Request):
     if _engine:
         _engine.set_scanner_type(scanner)
 
+    # Score-based switch: only switch if no position open AND new score beats current symbol's score.
+    # This ensures bot always tracks the strongest TV signal until a position opens.
+    position_open = _engine is not None and _engine._session is not None
+    current_score = next((m.get("score", 0.0) for m in _last_top_movers if m.get("symbol") == cfg.symbol), 0.0)
+    should_switch = (
+        not position_open and (
+            cfg.symbol != symbol or          # different symbol → always switch
+            tv_score > current_score         # same symbol, better score → refresh
+        )
+    )
+
+    if not should_switch:
+        logger.info(
+            "TV webhook: %s score=%.2f skipped — current %s score=%.2f %s",
+            symbol, tv_score, cfg.symbol, current_score,
+            "position open" if position_open else "score not better",
+        )
+        return {"ok": True, "symbol": symbol, "switched": False, "reason": "score not better or position open"}
+
     # Switch symbol (same path as manual switch)
     await set_config_bulk({"symbol": symbol})
     if _engine:
