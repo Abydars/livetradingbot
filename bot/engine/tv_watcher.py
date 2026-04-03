@@ -42,10 +42,11 @@ class TvWatcher:
                          "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
                         for k in raw
                     ]
+                    indicators = compute_all(candles)
                     self._cache[sym] = {
                         "candles":         candles,
-                        "indicators":      compute_all(candles),
-                        "prev_indicators": compute_all(candles[:-1]) if len(candles) >= 2 else {},
+                        "indicators":      indicators,
+                        "prev_indicators": compute_all(candles[:-1]) if len(candles) > 1 else indicators,
                         "last_fetch":      now,
                     }
                     self._last_sig_ts = 0.0  # force signal recompute after candle refresh
@@ -234,11 +235,15 @@ class TvWatcher:
                     c2 = candles[-2]
                     if direction == "LONG"  and c2["close"] < c2["open"]: ready = False
                     if direction == "SHORT" and c2["close"] > c2["open"]: ready = False
+                # Persistence: check previous candle direction using cached prev indicators
+                # Avoid calling compute_all() again — use last candle's indicators from cache
                 if ready and len(candles) >= 3:
-                    prev_ind_cached = entry.get("prev_indicators", {})
-                    prev_flow = {**flow}
-                    prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, prev_ind_cached)
-                    if prev_sig["direction"] != direction: ready = False
+                    prev_ind = self._cache.get(sym, {}).get("prev_indicators")
+                    if prev_ind is None:
+                        prev_ind = compute_all(candles[:-1])
+                    prev_sig = self._signal_eng.compute(candles[:-1], flow, prev_ind)
+                    if prev_sig["direction"] != direction:
+                        ready = False
 
             results.append({
                 "symbol":    sym,
@@ -249,6 +254,14 @@ class TvWatcher:
             })
 
         return results
+
+    def needs_refresh(self, symbols: List[str]) -> bool:
+        """True if any symbol's candles are stale and need refreshing."""
+        now = time.time()
+        return any(
+            now - self._cache.get(s, {}).get("last_fetch", 0) >= _CANDLE_TTL_S
+            for s in symbols
+        )
 
     def signals_are_stale(self) -> bool:
         """True when candles were refreshed since last get_all_signals() call."""
