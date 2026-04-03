@@ -86,6 +86,7 @@ _tv_alert_cooldown: dict = {}          # symbol → last-accepted timestamp (rat
 _tv_watcher = None                     # parallel signal monitor for top TV-alerted symbols
 _tv_batch_timer: float = 0.0           # timestamp when batch window started
 _TV_BATCH_WINDOW_S = 15.0              # collect alerts for 15s before switching
+_switching_in_progress: bool = False   # guard against concurrent symbol switches
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
@@ -388,7 +389,7 @@ async def _ticker_loop() -> None:
                     and _last_top_movers):
                 best = _last_top_movers[0]
                 best_sym = best.get("symbol", "")
-                if best_sym and best_sym != cfg.symbol:
+                if best_sym and best_sym != cfg.symbol and not _switching_in_progress and _engine._session is None:
                     _tv_batch_timer = 0.0
                     logger.info(
                         "TV batch expired in ticker — switching to best %s score=%.2f",
@@ -459,46 +460,57 @@ def _format_movers(top: list) -> list:
 
 async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
     """Switch active symbol — reused by auto-switch and TvWatcher."""
-    global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts
+    global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts, _switching_in_progress
 
-    # Update config and reset state immediately
-    await set_config_bulk({"symbol": new_sym})
-    _last_candles_fetch = 0.0
-    _htf_bias           = "NEUTRAL"
-    _last_htf_fetch     = 0.0
-    _last_switch_ts     = time.time()
+    if _switching_in_progress:
+        logger.debug("_do_switch: already switching, skipping %s", new_sym)
+        return
+    if _engine and _engine._session is not None:
+        logger.debug("_do_switch: position open, skipping switch to %s", new_sym)
+        return
+    _switching_in_progress = True
 
-    # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
-    # Candles and leverage setup happen in parallel after, so user sees immediate response
-    await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+    try:
+        # Update config and reset state immediately
+        await set_config_bulk({"symbol": new_sym})
+        _last_candles_fetch = 0.0
+        _htf_bias           = "NEUTRAL"
+        _last_htf_fetch     = 0.0
+        _last_switch_ts     = time.time()
 
-    if _engine:
-        # Run WS switch, candle fetch, and leverage prep in parallel
-        raw, _ = await asyncio.gather(
-            _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200),
-            asyncio.gather(
-                _ws.switch_symbol(new_sym),
-                _executor.prepare_symbol(new_sym, cfg.leverage),
-            ),
-            return_exceptions=True,
-        )
+        # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
+        # Candles and leverage setup happen in parallel after, so user sees immediate response
+        await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
-        if isinstance(raw, list) and len(raw) >= 60:
-            fresh = [
-                {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
-                 "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
-                for k in raw
-            ]
-            _engine.update_candles(fresh)
-            _last_candles_fetch = time.time()
-            # Broadcast candles after they load
-            await _do_broadcast({
-                "type":    "candles",
-                "candles": fresh[-100:],
-            })
+        if _engine:
+            # Run WS switch, candle fetch, and leverage prep in parallel
+            raw, _ = await asyncio.gather(
+                _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200),
+                asyncio.gather(
+                    _ws.switch_symbol(new_sym),
+                    _executor.prepare_symbol(new_sym, cfg.leverage),
+                ),
+                return_exceptions=True,
+            )
 
-        if _tv_watcher:
-            _tv_watcher.invalidate(new_sym)
+            if isinstance(raw, list) and len(raw) >= 60:
+                fresh = [
+                    {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                     "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
+                    for k in raw
+                ]
+                _engine.update_candles(fresh)
+                _last_candles_fetch = time.time()
+                # Broadcast candles after they load
+                await _do_broadcast({
+                    "type":    "candles",
+                    "candles": fresh[-100:],
+                })
+
+            if _tv_watcher:
+                _tv_watcher.invalidate(new_sym)
+    finally:
+        _switching_in_progress = False
 
 
 async def _scanner_loop() -> None:
@@ -1792,9 +1804,11 @@ async def tv_signal(request: Request):
     if cfg.symbol == best_sym:
         return {"ok": True, "symbol": symbol, "switched": False}
 
-    # Switch to best scoring symbol — fire and forget so TradingView doesn't timeout
-    asyncio.ensure_future(_do_switch(best_sym, cfg))
-    return {"ok": True, "symbol": symbol, "switched": True}
+    # Switch to best scoring symbol — only if no position open
+    position_open = _engine is not None and _engine._session is not None
+    if not position_open and not _switching_in_progress:
+        asyncio.ensure_future(_do_switch(best_sym, cfg))
+    return {"ok": True, "symbol": symbol, "switched": not position_open}
 
 
 @app.delete("/api/tv-alerts")
