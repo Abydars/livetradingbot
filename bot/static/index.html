@@ -1111,6 +1111,11 @@
     <div id="sym-sidebar-head">
       WATCHLIST
       <div style="display:flex;gap:6px;align-items:center">
+        <button id="clear-alerts-btn" onclick="clearTvAlerts()" title="Clear all TV alerts"
+          style="font-size:11px;padding:2px 6px;border:1px solid var(--muted);border-radius:3px;
+                 background:transparent;color:var(--muted);cursor:pointer;line-height:1.4">
+          ✕
+        </button>
         <button id="scan-now-btn" onclick="triggerScan()" title="Run scanner now"
           style="font-size:9px;padding:2px 7px;border:1px solid var(--muted);border-radius:3px;
                  background:transparent;color:var(--muted);cursor:pointer;letter-spacing:.05em">
@@ -1509,6 +1514,15 @@ function connectWS() {
 
 function wsSend(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function clearTvAlerts() {
+  fetch('/api/tv-alerts', { method: 'DELETE' })
+    .then(r => r.json())
+    .then(() => {
+      updateSymSidebar([]);
+    })
+    .catch(err => console.error('Clear alerts failed:', err));
 }
 
 function triggerScan() {
