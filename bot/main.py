@@ -1549,8 +1549,11 @@ async def tv_signal(request: Request):
     if direction not in ("LONG", "SHORT"):
         return {"ok": False, "error": f"invalid direction: {direction}"}
 
+    global _tv_alert_cooldown, _entry_start_candle, _neutral_since_candle, _tried_syms, \
+           _current_scanner_type, _last_top_movers, _last_candles_fetch, _htf_bias, \
+           _last_htf_fetch, _last_switch_ts
+
     # Rate-limit: ignore same symbol arriving within 60 s to protect against alert storms.
-    global _tv_alert_cooldown
     _TV_COOLDOWN_S = 60
     now = time.time()
     last_seen = _tv_alert_cooldown.get(symbol, 0.0)
@@ -1572,7 +1575,6 @@ async def tv_signal(request: Request):
     )
 
     # Reset auto-switch cycle and switch to TV-suggested symbol
-    global _entry_start_candle, _neutral_since_candle, _tried_syms, _current_scanner_type
     _entry_start_candle   = 0
     _neutral_since_candle = 0
     _tried_syms.clear()
@@ -1603,7 +1605,6 @@ async def tv_signal(request: Request):
     await set_config_bulk({"symbol": symbol})
     if _engine:
         await _ws.switch_symbol(symbol)
-        global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts
         _last_candles_fetch = 0.0
         _htf_bias = "NEUTRAL"
         _last_htf_fetch = 0.0
@@ -1624,7 +1625,6 @@ async def tv_signal(request: Request):
 
     # Add to sidebar — build a minimal mover entry so UI shows this symbol
     # in the watchlist as alerts arrive from TradingView.
-    global _last_top_movers
     existing = [m for m in _last_top_movers if m.get("symbol") != symbol]
     new_entry = {
         "symbol":       symbol,
