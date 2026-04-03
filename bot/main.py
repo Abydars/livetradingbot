@@ -345,35 +345,54 @@ async def _ticker_loop() -> None:
                 watch_syms = [m["symbol"] for m in _last_top_movers[:3]
                               if m.get("symbol") != cfg.symbol]
                 if watch_syms:
-                    # Run signal engine on watched symbols only when candles refreshed (not every tick)
+                    # Signal engine runs only when candles refreshed (every 30s) — expensive
                     if _tv_watcher.signals_are_stale():
                         all_sigs = _tv_watcher.get_all_signals(watch_syms, _last_top_movers, cfg, _htf_bias)
                         _tv_watcher.mark_signals_fresh()
-
-                        # Update sidebar strengths
-                        updated    = False
-                        best_ready = None
+                        updated = False
                         for sig in all_sigs:
                             for m in _last_top_movers:
                                 if m.get("symbol") == sig["symbol"]:
                                     m["bot_strength"] = sig["strength"]
                                     m["bot_ready"]    = sig["ready"]
                                     updated = True
-                            # Track best ready symbol — reuse results, no second engine run
-                            if sig["ready"] and best_ready is None:
-                                best_ready = sig
-
                         if updated:
                             await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
-                        # Switch to best ready symbol if no position open
-                        if best_ready and _engine._session is None and _trading_active:
+                    # Best entry check runs every tick — uses cached results from last signal run.
+                    # This ensures we don't miss a switch window between 30s candle refreshes.
+                    if _engine._session is None and _trading_active:
+                        best_ready = next(
+                            (m for m in _last_top_movers[:3]
+                             if m.get("bot_ready") and m.get("symbol") != cfg.symbol),
+                            None,
+                        )
+                        if best_ready:
                             best_sym = best_ready["symbol"]
                             logger.info(
-                                "TvWatcher: switching to %s %s strength=%.2f — entry ready",
-                                best_sym, best_ready["direction"], best_ready["strength"],
+                                "TvWatcher: switching to %s %s bot_strength=%.2f — entry ready",
+                                best_sym, best_ready.get("direction", ""), best_ready.get("bot_strength", 0),
                             )
                             asyncio.ensure_future(_do_switch(best_sym, cfg))
+
+            # Batch timer expiry check — if batch window started but no more alerts came,
+            # fire the switch here so a single alert doesn't get silently dropped.
+            if (_tv_batch_timer > 0.0
+                    and time.time() - _tv_batch_timer >= _TV_BATCH_WINDOW_S
+                    and _engine._session is None
+                    and _trading_active
+                    and _last_top_movers):
+                best = _last_top_movers[0]
+                best_sym = best.get("symbol", "")
+                if best_sym and best_sym != cfg.symbol:
+                    _tv_batch_timer = 0.0
+                    logger.info(
+                        "TV batch expired in ticker — switching to best %s score=%.2f",
+                        best_sym, best.get("score", 0),
+                    )
+                    asyncio.ensure_future(_do_switch(best_sym, cfg))
+                else:
+                    _tv_batch_timer = 0.0
 
             await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
@@ -1650,14 +1669,11 @@ async def tv_signal(request: Request):
     # Rate-limit: ignore same symbol arriving within 60 s to protect against alert storms.
     _TV_COOLDOWN_S = 60
     now = time.time()
-    last_seen = _tv_alert_cooldown.get(symbol, 0.0)
-    if now - last_seen < _TV_COOLDOWN_S:
-        logger.info(
-            "TV webhook: %s throttled — %.0fs since last alert (cooldown %ds)",
-            symbol, now - last_seen, _TV_COOLDOWN_S,
-        )
-        return {"ok": True, "symbol": symbol, "switched": False, "reason": "cooldown"}
-    _tv_alert_cooldown[symbol] = now
+    last_seen    = _tv_alert_cooldown.get(symbol, 0.0)
+    is_throttled = now - last_seen < _TV_COOLDOWN_S
+    if not is_throttled:
+        _tv_alert_cooldown[symbol] = now
+    # Note: throttled alerts still update sidebar score — only switch is skipped
     # Prune stale entries so dict doesn't grow unbounded
     _tv_alert_cooldown = {s: t for s, t in _tv_alert_cooldown.items() if now - t < 3600}
 
@@ -1715,6 +1731,11 @@ async def tv_signal(request: Request):
     # Batch window: collect all alerts for N seconds, then switch to best score only.
     # This prevents multiple rapid switches when TradingView fires 20 alerts simultaneously
     # on candle close (one per monitored symbol).
+    # If this alert was throttled (same symbol within cooldown), update sidebar only — no switch
+    if is_throttled:
+        logger.info("TV webhook: %s throttled — sidebar updated, switch skipped", symbol)
+        return {"ok": True, "symbol": symbol, "switched": False, "reason": "cooldown"}
+
     global _tv_batch_timer
     if not position_open and best_sym != cfg.symbol:
         if _tv_batch_timer == 0.0:
