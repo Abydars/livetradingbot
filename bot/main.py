@@ -22,7 +22,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import load_config
+from config import load_config, BotConfig
 from database import (
     close_hedge,
     close_session,
