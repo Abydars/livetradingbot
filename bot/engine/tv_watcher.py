@@ -163,6 +163,90 @@ class TvWatcher:
 
         return None
 
+    def get_all_signals(
+        self,
+        symbols: List[str],
+        movers:  List[dict],
+        cfg:     BotConfig,
+        htf_bias: str = "NEUTRAL",
+    ) -> List[dict]:
+        """
+        Return bot signal engine result for every watched symbol.
+        Used to update sidebar with real-time bot strength — not just TV composite score.
+        Each entry: {symbol, direction, strength, composite, ready}
+          ready=True means ALL entry gates passed (bot would take this trade).
+        """
+        results = []
+        for sym in symbols[:_WATCH_COUNT]:
+            entry = self._cache.get(sym)
+            if not entry or not entry.get("candles"):
+                continue
+
+            candles    = entry["candles"]
+            ind        = entry["indicators"]
+            mover_data = next((m for m in movers if m.get("symbol") == sym), {})
+            scanner    = mover_data.get("scanner_type", "momentum")
+
+            if len(candles) >= 2:
+                c         = candles[-1]
+                vol_avg   = sum(x["volume"] for x in candles[-20:]) / 20 if len(candles) >= 20 else c["volume"]
+                vol_ratio = c["volume"] / vol_avg if vol_avg > 0 else 1.0
+                price_dir = 1.0 if c["close"] > c["open"] else -1.0
+                flow_proxy = max(-1.0, min(1.0, (vol_ratio - 1.0) * price_dir))
+            else:
+                flow_proxy = 0.0
+
+            flow = {
+                "score":       flow_proxy,
+                "imbalance":   flow_proxy * 0.5,
+                "ba_ratio":    0.55 if flow_proxy > 0 else 0.45,
+                "trade_count": 30,
+            }
+
+            self._signal_eng.set_scanner_type(scanner)
+            signal    = self._signal_eng.compute(candles, flow, ind)
+            direction = signal["direction"]
+            strength  = signal["strength"]
+            composite = signal.get("composite", 0.0)
+
+            # Check all entry gates — same as best_entry()
+            ready = True
+            if direction == "NEUTRAL":                                              ready = False
+            elif strength < cfg.min_signal_strength:                                ready = False
+            elif not signal.get("filters_passed", False):                           ready = False
+            elif cfg.htf_filter and htf_bias not in ("NEUTRAL","") and htf_bias != direction: ready = False
+            elif direction == "LONG"  and flow_proxy <= 0:                          ready = False
+            elif direction == "SHORT" and flow_proxy >= 0:                          ready = False
+            else:
+                if len(candles) >= 2:
+                    c2    = candles[-2]
+                    rng   = c2["high"] - c2["low"]
+                    body  = abs(c2["close"] - c2["open"])
+                    is_doji = rng > 0 and body / rng < 0.10
+                    if not is_doji and rng > 0:
+                        upper = c2["high"] - max(c2["open"], c2["close"])
+                        lower = min(c2["open"], c2["close"]) - c2["low"]
+                        if direction == "LONG"  and upper / rng > 0.60: ready = False
+                        if direction == "SHORT" and lower / rng > 0.60: ready = False
+                if ready and len(candles) >= 2:
+                    c2 = candles[-2]
+                    if direction == "LONG"  and c2["close"] < c2["open"]: ready = False
+                    if direction == "SHORT" and c2["close"] > c2["open"]: ready = False
+                if ready and len(candles) >= 3:
+                    prev_flow = {**flow}
+                    prev_sig  = self._signal_eng.compute(candles[:-1], prev_flow, compute_all(candles[:-1]))
+                    if prev_sig["direction"] != direction: ready = False
+
+            results.append({
+                "symbol":    sym,
+                "direction": direction,
+                "strength":  round(strength, 3),
+                "composite": round(composite, 3),
+                "ready":     ready,
+            })
+
+        return results
+
     def invalidate(self, symbol: str) -> None:
         """Force candle refresh for a symbol on next cycle."""
         if symbol in self._cache:
