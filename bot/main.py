@@ -424,6 +424,10 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
     _switching_in_progress = True
 
     try:
+        # Reset all per-symbol engine state before loading new symbol data
+        if _engine:
+            _engine.reset_for_switch()
+
         # Update config and reset state immediately
         await set_config_bulk({"symbol": new_sym})
         _last_candles_fetch = 0.0

@@ -39,6 +39,10 @@ class OrderFlowAnalyzer:
         # Track consecutive adverse-pressure seconds for DCA confirmation
         self._adverse_start: Dict[str, float] = {}   # direction → start_ts
 
+    def reset(self) -> None:
+        """Clear all accumulated trade data — called on symbol switch."""
+        self._trades.clear()
+
     # ------------------------------------------------------------------
     # Feed methods (called by WS callbacks)
     # ------------------------------------------------------------------

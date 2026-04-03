@@ -131,6 +131,42 @@ class TradingEngine:
         self._prev_indicators: Dict = {}   # indicators from the tick before last — used for slope checks
         self.candles: List[Dict] = []
 
+    def reset_for_switch(self) -> None:
+        """
+        Reset all per-symbol state when switching to a new symbol.
+        Prevents stale signal counts, flow data, cooldowns and momentum
+        multipliers from a previous symbol contaminating the new one.
+        Called by _do_switch() before loading new symbol candles.
+        """
+        # Signal persistence — must start fresh on new symbol
+        self._entry_signal_ticks   = 0
+        self._entry_signal_dir     = "NEUTRAL"
+
+        # Momentum and trail state — symbol-specific, meaningless on new symbol
+        self._trail_pct_mult       = 1.0
+        self._signal_degraded_ticks = 0
+        self._smart_sl_ticks       = 0
+
+        # DCA and stop cooldowns — these are per-trade, not per-symbol
+        # Reset so new symbol isn't penalised for previous symbol's losses
+        self._last_dca_time        = None
+        self._last_stop_time       = None
+
+        # Rescue mode — must not carry over
+        self._rescue_mode          = False
+        self._rescue_trail_price   = None
+
+        # Flow — old symbol's order flow is meaningless for new symbol
+        # Flow warmup in _ticker_loop handles the transition window
+        self._flow.reset()
+
+        # Trail state — no open position so these are irrelevant
+        # but reset for cleanliness
+        self._trail_activated      = False
+        self._trail_price          = None
+
+        logger.info("TradingEngine: state reset for symbol switch")
+
     # ------------------------------------------------------------------
     # Session broadcast helper
     # ------------------------------------------------------------------
