@@ -570,16 +570,20 @@ async def get_today_pnl() -> float:
 
 
 async def save_tv_alert(symbol: str, direction: str, scanner: str, htf: str = "", change_pct: float = 0.0, vol_usdt: float = 0.0) -> None:
-    """Persist a TradingView webhook alert so sidebar survives server restart."""
+    """Persist a TradingView webhook alert — upsert so the same symbol is never duplicated.
+    Each symbol gets one row only; receiving a new alert for the same symbol updates it in place."""
     import time
     async with aiosqlite.connect(DB_PATH) as db:
-        # Keep only latest 50 alerts — delete oldest if over limit
+        # Delete any existing row for this symbol first (upsert behaviour)
+        await db.execute("DELETE FROM tv_alerts WHERE symbol = ?", (symbol,))
+        # Trim to 49 oldest so the new insert brings total to 50 max
         await db.execute(
             "DELETE FROM tv_alerts WHERE id NOT IN "
             "(SELECT id FROM tv_alerts ORDER BY ts DESC LIMIT 49)"
         )
         await db.execute(
-            "INSERT INTO tv_alerts (symbol, direction, scanner, htf, change_pct, vol_usdt, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tv_alerts (symbol, direction, scanner, htf, change_pct, vol_usdt, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (symbol, direction, scanner, htf, change_pct, vol_usdt, int(time.time())),
         )
         await db.commit()
