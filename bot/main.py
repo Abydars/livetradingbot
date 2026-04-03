@@ -373,6 +373,10 @@ async def _ticker_loop() -> None:
                                 "TvWatcher: switching to %s %s bot_strength=%.2f — entry ready",
                                 best_sym, best_ready.get("direction", ""), best_ready.get("bot_strength", 0),
                             )
+                            # Clear bot_ready so this symbol isn't re-triggered next tick
+                            for m in _last_top_movers:
+                                if m.get("symbol") == best_sym:
+                                    m["bot_ready"] = False
                             asyncio.ensure_future(_do_switch(best_sym, cfg))
 
             # Batch timer expiry check — if batch window started but no more alerts came,
