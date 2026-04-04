@@ -205,10 +205,14 @@ class TradingEngine:
             ref = self._entry_adaptive or self._adaptive
             if ref:
                 tp = ref["tp_pct"]
+                # After DCA, _check_tp() arms the trail from avg_price not entry_price.
+                # Display must match so the UI shows the price that will actually trigger.
+                dca_count = self._session.get("dca_count", 0)
+                ref_price = avg if dca_count > 0 else entry
                 if d == "LONG":
-                    tp_price = entry * (1 + tp / 100)
+                    tp_price = ref_price * (1 + tp / 100)
                 else:
-                    tp_price = entry * (1 - tp / 100)
+                    tp_price = ref_price * (1 - tp / 100)
 
             # SL: does NOT need ref — only uses session values + buffer cache.
             # This works correctly even after restart when ref is empty.
