@@ -292,7 +292,7 @@ class TradingEngine:
     # Main tick — called every N seconds by the scheduler
     # ------------------------------------------------------------------
 
-    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
+    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, entry_block_reason: str = "", flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
         ind          = self.last_indicators
         flow_summary = self._flow.summarize()
 
@@ -333,7 +333,7 @@ class TradingEngine:
             if allow_entry:
                 await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
             else:
-                self._broadcast({"type": "entry_blocked", "reason": "Trading paused — press Start to enable entries", "gates": {}})
+                self._broadcast({"type": "entry_blocked", "reason": entry_block_reason or "Trading paused — press Start to enable entries", "gates": {}})
         else:
             await self._manage_position(cfg, price, signal, ind, atr_val)
 

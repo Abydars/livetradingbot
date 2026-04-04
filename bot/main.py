@@ -361,7 +361,15 @@ async def _ticker_loop() -> None:
                 else:
                     _tv_batch_timer = 0.0
 
-            await _engine.tick(cfg, price, allow_entry=_trading_active and not _switching_in_progress, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
+            _allow_entry = _trading_active and not _switching_in_progress
+            if not _allow_entry:
+                if not _trading_active:
+                    _entry_block = "Trading paused — press Start to enable entries"
+                else:
+                    _entry_block = "Switching symbol — please wait…"
+            else:
+                _entry_block = ""
+            await _engine.tick(cfg, price, allow_entry=_allow_entry, entry_block_reason=_entry_block, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
             # Detect trade close → signal scanner to run immediately
             cur_session_open = _engine._session is not None
