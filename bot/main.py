@@ -48,6 +48,7 @@ from database import (
 )
 from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
+from engine.session_backfill import backfill_session_history
 from engine.trading import TradingEngine
 from exchange.binance_rest import BinanceRestClient
 from exchange.binance_ws import BinanceWebSocket
@@ -548,6 +549,9 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
 
             if _tv_watcher:
                 _tv_watcher.invalidate(new_sym)
+
+            # Backfill session history for new symbol (non-blocking)
+            asyncio.ensure_future(backfill_session_history(_rest, cfg))
     finally:
         _switching_in_progress = False
         global _cfg_tick_cache
@@ -1551,6 +1555,9 @@ async def lifespan(app: FastAPI):
                 _engine._scalp_sl_price   = None
         except Exception as exc:
             logger.error("Startup position sync failed: %s", exc)
+
+    # Backfill session history in background (non-blocking)
+    asyncio.ensure_future(backfill_session_history(_rest, cfg))
 
     _ws = BinanceWebSocket(
         cfg.symbol, cfg.trading_mode,
