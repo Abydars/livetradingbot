@@ -630,17 +630,11 @@ class BinanceRestClient:
             rng     = high - low
             vol_pct = rng / price if price > 0 else 0
 
-            # Position in 24h range (0=at low, 1=at high)
-            # Aligned with trend direction = fresh move (not exhausted)
-            range_pos   = (price - low) / rng if rng > 0 else 0.5
-            trend_fresh = range_pos if pcp > 0 else (1 - range_pos)
-
-            p1_score = (
-                abs(pcp)
-                * vol_pct
-                * math.log10(max(qv, 1))
-                * (0.4 + trend_fresh * 0.6)
-            )
+            # Phase 1 goal: cast a wide net — NOT predict direction.
+            # Just filter for liquid + active symbols. Phase 2 klines decide quality.
+            # Simple activity score: liquidity × 24h volatility (no directional bias).
+            # Coins that just started moving (low pcp, high recent vol) now reach Phase 2.
+            p1_score = math.log10(max(qv, 1)) * vol_pct * (1 + abs(pcp) / 10.0)
 
             candidates.append({
                 **t,
@@ -653,10 +647,9 @@ class BinanceRestClient:
                 "_scanner":   "momentum",
             })
 
-        # Keep top 15 for phase 2 — Phase 1 already filters well enough.
-        # Smaller pool = faster batch fetch (~300ms saved per scan cycle).
+        # Top 25 reach Phase 2 kline scoring — wider net catches coins just starting to move.
         candidates.sort(key=lambda x: x["_p1_score"], reverse=True)
-        phase2_pool = candidates[:15]
+        phase2_pool = candidates[:25]
 
         # ── Phase 2: kline deep score ──────────────────────────────────
         pool_syms  = [c["symbol"] for c in phase2_pool]
@@ -688,28 +681,41 @@ class BinanceRestClient:
                 continue   # minimum volatility for scalping TP to be reachable
             atr_penalty = 0.60 if atr_pct > 5.0 else 1.0   # chaotic = penalty
 
-            # ── Volume surge: last-3-candle avg vs 10-candle baseline ──
-            if len(vols) >= 13:
-                recent_vol   = sum(vols[-3:]) / 3
-                baseline_vol = sum(vols[-13:-3]) / 10
+            # ── Volume surge: last-2-candle avg vs 8-candle baseline ──
+            # Short baseline (2 vs 8) reacts fast to fresh activity spikes.
+            if len(vols) >= 10:
+                recent_vol   = sum(vols[-2:]) / 2          # last 2 candles (very fresh)
+                baseline_vol = sum(vols[-10:-2]) / 8        # 8-candle baseline before that
                 vol_surge    = recent_vol / baseline_vol if baseline_vol > 0 else 1.0
             else:
                 vol_surge = 1.0
 
-            # ── Momentum with acceleration check ──
-            # Base: abs price change over last 5 candles
+            # Early exit: volume contracting — symbol is cooling off, not worth scoring
+            if vol_surge < 0.8:
+                continue
+
+            # ── Momentum with acceleration + recency check ──
             momentum_pct = abs(closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0.0
 
-            # Acceleration: compare last 3 candles vs previous 3 candles
-            # accel > 1 = momentum speeding up (good), < 1 = slowing down (bad)
             if len(closes) >= 7:
                 recent_move = abs(closes[-1] - closes[-4]) / max(closes[-4], 1e-10)
                 older_move  = abs(closes[-4] - closes[-7]) / max(closes[-7], 1e-10)
                 accel = recent_move / older_move if older_move > 0.0001 else 1.0
-                accel = min(max(accel, 0.3), 3.0)   # clamp 0.3x – 3x
+                accel = min(max(accel, 0.3), 3.0)
             else:
                 accel = 1.0
-            momentum_score = momentum_pct * min(accel, 2.0)
+
+            # Recency: weight most recent 2 candles vs prior 3 candles.
+            # >1 = move happening NOW; <1 = move already fading.
+            if len(closes) >= 4:
+                recent2_move = abs(closes[-1] - closes[-3]) / max(closes[-3], 1e-10) * 100
+                older3_move  = abs(closes[-3] - closes[-6]) / max(closes[-6], 1e-10) * 100 if len(closes) >= 6 else recent2_move
+                recency = (recent2_move / older3_move) if older3_move > 0.01 else 1.0
+                recency = min(max(recency, 0.2), 2.5)
+            else:
+                recency = 1.0
+
+            momentum_score = momentum_pct * min(accel, 2.0) * min(recency, 1.5)
 
             # ── RSI — tiered penalty ──
             rsi_val = _scan_rsi(closes, 14)
@@ -720,39 +726,19 @@ class BinanceRestClient:
             else:
                 rsi_penalty = 1.0
 
-            # ── EMA trend: continuous strength instead of binary bonus ──
+            # ── EMA trend: continuous strength ──
             ema9  = _scan_ema(closes, 9)
             ema21 = _scan_ema(closes, 21)
             ema50 = _scan_ema(closes, 50)
-            # Use EMA21 vs EMA50 — matches signal engine TREND component (23% weight)
-            # EMA9 vs EMA21 was causing scanner/signal engine disagreement
             bullish_setup = ema21 > ema50 and closes[-1] > ema21
             bearish_setup = ema21 < ema50 and closes[-1] < ema21
 
             if atr_pct > 0:
                 ema_diff_pct   = abs(ema21 - ema50) / ema21
-                trend_strength = min(ema_diff_pct / (atr_pct / 100), 1.0)   # normalised 0→1
+                trend_strength = min(ema_diff_pct / (atr_pct / 100), 1.0)
             else:
                 trend_strength = 0.0
-            trend_score = trend_strength * 0.20   # max contribution 0.20
-
-            # ── Signal tendency: lightweight pre-check aligned with signal engine ──
-            # Uses EMA trend + MACD histogram as a proxy for what the signal engine
-            # will compute. Symbols with clearer directional tendency rank higher,
-            # reducing switches to symbols that immediately give NEUTRAL signal.
-            if len(closes) >= 27:
-                # MACD-like: 9-period EMA vs 26-period EMA delta, ATR-normalised
-                ema26    = _scan_ema(closes, 26)
-                macd_val = (ema9 - ema26) / ema26 if ema26 > 0 else 0.0
-                macd_norm = abs(macd_val) / (atr_pct / 100) if atr_pct > 0 else 0.0
-                macd_norm = min(macd_norm, 1.0)
-
-                # Trend component (EMA21 vs EMA50 proxy using available data)
-                trend_norm = min(abs(ema21 - ema50) / ema21 / (atr_pct / 100), 1.0) if atr_pct > 0 else 0.0
-
-                signal_tendency = (macd_norm * 0.5 + trend_norm * 0.5)
-            else:
-                signal_tendency = 0.0
+            trend_score = trend_strength * 0.20
 
             # ── Direction bias ──
             if bullish_setup:
@@ -762,25 +748,28 @@ class BinanceRestClient:
             else:
                 bias = c["_bias"]
 
-            # ── Normalise all components to 0→1 before applying weights ──
-            # vol_surge is unbounded (pump can be 10+), cap at 3× as "maximum useful surge"
-            # momentum_score = momentum_pct × accel, also unbounded, cap at 3.0
-            # signal_tendency already 0→1 (clamped)
-            # trend_score already 0→0.20, normalise back to 0→1
+            # ── Normalise components to 0→1 ──
             vol_norm   = min(vol_surge / 3.0, 1.0)
             mom_norm   = min(momentum_score / 3.0, 1.0)
-            sig_norm   = signal_tendency               # already 0→1
-            trend_norm = min(trend_score / 0.20, 1.0) # 0.20 is max from trend_strength*0.20
+            trend_norm = min(trend_score / 0.20, 1.0)
 
-            # Weights now sum to 1.0 and all inputs are in 0→1 range
-            # Weights: vol_surge 0.30, momentum_accel 0.25, signal_tendency 0.20, trend 0.25
+            # Weights: vol_surge 0.40, momentum_recency 0.35, trend 0.25 (sum = 1.0)
+            # signal_tendency removed — redundant with trend_norm
             base_score = (
-                vol_norm   * 0.30
-                + mom_norm * 0.25
-                + sig_norm * 0.20
+                vol_norm   * 0.40
+                + mom_norm * 0.35
                 + trend_norm * 0.25
             )
-            final_score = base_score * rsi_penalty * atr_penalty
+
+            # Directional consistency: how many of last 4 candles agree on direction
+            # 4 same direction → multiplier 1.0; 2+2 choppy → multiplier 0.7
+            if len(closes) >= 5:
+                last4_up    = sum(1 for i in range(-4, 0) if closes[i] > closes[i - 1])
+                consistency = abs(last4_up - 2) / 2   # 0=mixed, 1=all same direction
+            else:
+                consistency = 0.0
+
+            final_score = base_score * rsi_penalty * atr_penalty * (0.7 + consistency * 0.3)
 
             c["_score"]     = final_score
             c["_bias"]      = bias

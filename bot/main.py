@@ -101,7 +101,7 @@ _stale_scan_cycles: int = 0
 # Force a rotation after this many scan cycles on the same symbol with no entry.
 # With scan_interval_s=10 → 30 cycles = 300s = 5 minutes per symbol.
 # Gives enough time for a proper candle setup while still rotating regularly.
-_STALE_SCAN_CYCLES  = 30
+_STALE_SCAN_CYCLES  = 12   # 12 × 10s = 120s = 2 minutes per symbol
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _symbol_blacklist: set = {            # never trade these symbols
     "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT",
@@ -738,9 +738,9 @@ async def _scan_symbols(cfg) -> None:
 
         # ── Auto-switch logic ─────────────────────────────────────────────
         now_ts = time.time()
-        # Minimum 60s between switches — prevents thrashing when multiple symbols
-        # score similarly and the current one just switched in.
-        if now_ts - _last_switch_ts < 60:
+        # Minimum 30s between switches — enough to prevent thrashing while still
+        # reacting quickly to better opportunities.
+        if now_ts - _last_switch_ts < 30:
             return
         for t in top20:
             t["_switch_score"] = _composite_switch_score(t, now_ts)
@@ -781,7 +781,7 @@ async def _scan_symbols(cfg) -> None:
             atr_pct   = d.get("_atr_pct",   0.0) or 0.0
             score     = d.get("_score",      0.0) or 0.0
 
-            if vol_surge < 1.1:    # recent candles barely more active than baseline
+            if vol_surge < 1.25:   # require genuine recent volume pickup
                 return False
             if atr_pct < 0.20:     # too quiet — not enough room for TP
                 return False
