@@ -934,6 +934,16 @@ async def _scan_symbols(cfg) -> None:
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
         global _switching_in_progress
         _switching_in_progress = True
+        # Clear HTF state immediately — before any awaits — so ticks that fire
+        # during the async switch operations don't fetch/broadcast old HTF for new symbol.
+        global _htf_bias, _last_htf_fetch
+        _htf_bias = "NEUTRAL"
+        _last_htf_fetch = 0.0
+        _htf_scanner_cache.pop(new_sym, None)
+        for m in _last_top_movers:
+            if m.get("symbol") == new_sym:
+                m["htf_bias"] = ""
+                break
         try:
             await set_config_bulk({"symbol": new_sym})
             # Fetch 200 candles for the new symbol BEFORE switching so the engine
@@ -1012,13 +1022,11 @@ async def _scan_symbols(cfg) -> None:
             if _engine:
                 _engine.set_scanner_type(_current_scanner_type)
             logger.info("Auto-switch scanner type: %s → %s", new_sym, _current_scanner_type)
-            global _last_switch_ts, _htf_bias, _last_htf_fetch
+            global _last_switch_ts
             _last_switch_ts = time.time()
-            _htf_bias = "NEUTRAL"
-            _last_htf_fetch = 0.0
-            _htf_scanner_cache.pop(new_sym, None)   # force fresh HTF fetch for new symbol on next scan
             await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
             await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
+            await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
             if fresh_candles:
                 _engine.update_candles(fresh_candles)
