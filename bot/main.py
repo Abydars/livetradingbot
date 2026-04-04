@@ -895,15 +895,16 @@ async def _scan_symbols(cfg) -> None:
             return
 
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
-        global _switching_in_progress, _htf_bias, _last_htf_fetch
-        _switching_in_progress = True
-        _htf_bias = "NEUTRAL"
-        _last_htf_fetch = 0.0
+        global _htf_bias, _last_htf_fetch
         _htf_scanner_cache.pop(new_sym, None)
         for m in _last_top_movers:
             if m.get("symbol") == new_sym:
                 m["htf_bias"] = ""
                 break
+        # Do NOT set _switching_in_progress here — _do_switch manages it
+        # via its own try/finally. Setting it before ensure_future causes
+        # _do_switch's early guard to fire and return without the finally,
+        # leaving _switching_in_progress=True permanently.
         asyncio.ensure_future(_do_switch(new_sym, cfg))
 
     except asyncio.CancelledError:
