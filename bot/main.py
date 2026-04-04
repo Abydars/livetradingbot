@@ -405,9 +405,9 @@ def _format_movers(top: list) -> list:
             "volume":    round(float(t.get("quoteVolume", 0))),
             "price":     float(t.get("lastPrice", 0)),
             "bias":      t.get("_bias", ""),
-            "vol_surge": t.get("_vol_surge", 1.0),
-            "momentum":  t.get("_momentum", 0.0),
-            "atr_pct":   t.get("_atr_pct", 0.0),
+            "vol_surge": t.get("_vol_surge"),
+            "momentum":  t.get("_momentum"),
+            "atr_pct":   t.get("_atr_pct"),
             "htf_bias":    t.get("_htf_bias", ""),
             "scanner_type": t.get("_scanner", "momentum"),
         })
