@@ -593,8 +593,7 @@ class TradingEngine:
         # Broadcast signal to UI
         self._broadcast({"type": "signal", "data": {
             **signal,
-            "flow_warmup":     flow_warmup,
-            "warmup_strength": None,   # filled in by re-broadcast in _try_entry if warmup fires
+            "flow_warmup": flow_warmup,
         }})
 
         atr_val = ind.get("atr") or 0.0
@@ -627,59 +626,13 @@ class TradingEngine:
             self._broadcast({"type": "entry_blocked", "reason": reason})
 
         # During flow warmup window after auto-switch, the flow component (28% weight)
-        # is zero because the WebSocket just subscribed and has no trade history yet.
-        # BUG FIX: previous code checked `direction != "NEUTRAL"` first, but flow=0
-        # is exactly what causes direction to become NEUTRAL (composite below threshold).
-        # Fix: always recompute from non-flow components during warmup, determine
-        # direction from adj_composite directly — do not rely on signal["direction"].
+        # Flow warmup window — order flow is empty immediately after a symbol switch.
+        # Block all entries until the flow window is fully warmed up.
+        # Signal is still computed and broadcast normally so the UI shows the
+        # technical picture, but no position will be opened.
         if flow_warmup:
-            comps         = signal["components"]
-            non_flow_w    = 0.72   # 1.0 - flow weight (0.28)
-            adj_composite = (
-                comps.get("trend",    0.0) * 0.23 +
-                comps.get("momentum", 0.0) * 0.19 +
-                comps.get("mean_rev", 0.0) * 0.13 +
-                comps.get("rsi",      0.0) * 0.10 +
-                comps.get("stoch",    0.0) * 0.07
-            ) / non_flow_w
-
-            if abs(adj_composite) >= 0.25:
-                # Non-flow technicals are directional — derive direction and strength
-                direction    = "LONG" if adj_composite > 0 else "SHORT"
-                adj_strength = min((abs(adj_composite) - 0.25) / 0.75, 1.0)
-                logger.debug(
-                    "TradingEngine: flow warmup — adj composite=%.3f dir=%s strength=%.2f",
-                    adj_composite, direction, adj_strength,
-                )
-                strength = adj_strength
-
-                # Re-apply entry filters using the warmup-derived direction.
-                # The original signal had filters_passed=False because its direction
-                # was NEUTRAL (flow=0 pulled composite below threshold) — not because
-                # RSI/EMA filters failed. We must re-check with the corrected direction.
-                _, warmup_filters_ok, warmup_reason = self._signal_engine._apply_filters(
-                    direction, adj_composite, ind
-                )
-                if not warmup_filters_ok:
-                    logger.debug(
-                        "TradingEngine: flow warmup entry blocked by filter — %s",
-                        warmup_reason,
-                    )
-                    return
-
-                # Re-broadcast corrected signal so UI shows warmup direction/strength
-                # instead of the original NEUTRAL/0% that was sent before _try_entry.
-                self._broadcast({"type": "signal", "data": {
-                    **signal,
-                    "direction":       direction,
-                    "strength":        round(adj_strength, 4),
-                    "flow_warmup":     True,
-                    "warmup_strength": round(adj_strength, 4),
-                    "reason":          f"warmup: {warmup_reason}",
-                }})
-            else:
-                # Non-flow components not directional enough — skip entry
-                return
+            logger.debug("TradingEngine: flow warmup in progress — entry blocked")
+            return
 
         if direction == "NEUTRAL":
             # Smart counter handling: preserve the persistence counter if the composite
@@ -705,8 +658,6 @@ class TradingEngine:
             _blocked(f"strength {strength*100:.0f}% < min {cfg.min_signal_strength*100:.0f}%")
             return
 
-        # filters_passed check: during warmup, already re-applied above with correct direction.
-        # For normal (non-warmup) path, use original signal's filters_passed.
         if not flow_warmup and not signal["filters_passed"]:
             # Filter hard-blocked — fundamental market condition wrong (RSI extreme,
             # counter-trend). Reset counter because entry won't happen until condition changes.
@@ -754,7 +705,6 @@ class TradingEngine:
         # All other components (EMA, MACD, RSI) are historical — flow is right now.
         # LONG needs taker buyers dominant (flow > 0).
         # SHORT needs taker sellers dominant (flow < 0).
-        # Skipped during flow warmup window (after auto-switch, flow window is empty).
         if not flow_warmup:
             flow_score = signal["components"].get("flow", 0.0)
             if direction == "LONG" and flow_score <= 0:
