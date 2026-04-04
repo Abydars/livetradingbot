@@ -553,7 +553,7 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
                 _tv_watcher.invalidate(new_sym)
 
             # Backfill session history for new symbol (non-blocking)
-            asyncio.ensure_future(backfill_session_history(_rest, cfg))
+            asyncio.ensure_future(backfill_session_history(_rest, cfg, broadcast=_broadcast))
     finally:
         _switching_in_progress = False
         global _cfg_tick_cache
@@ -1559,7 +1559,7 @@ async def lifespan(app: FastAPI):
             logger.error("Startup position sync failed: %s", exc)
 
     # Backfill session history in background (non-blocking)
-    asyncio.ensure_future(backfill_session_history(_rest, cfg))
+    asyncio.ensure_future(backfill_session_history(_rest, cfg, broadcast=_broadcast))
 
     _ws = BinanceWebSocket(
         cfg.symbol, cfg.trading_mode,

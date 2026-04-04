@@ -31,6 +31,7 @@ async def backfill_session_history(
     cfg,
     days: int = 60,
     tz_offset: int = None,
+    broadcast=None,
 ) -> None:
     """
     Analyze last `days` days of 1M historical data and populate
@@ -38,9 +39,15 @@ async def backfill_session_history(
 
     Safe to call multiple times — uses upsert (INSERT OR REPLACE).
     Skips days that already have records.
-    Logs progress every 10 days.
+
+    broadcast: optional callable(dict) — sends notifications to UI clients.
     """
     tz = tz_offset if tz_offset is not None else cfg.session_timezone_offset
+
+    def _notify(text: str) -> None:
+        logger.info("session_backfill: %s", text)
+        if broadcast:
+            broadcast({"type": "notification", "text": f"[Backfill] {text}"})
 
     # ── Check existing coverage ───────────────────────────────────────────
     existing = await get_session_history(cfg.symbol, "london", bars=days * 2)
@@ -52,11 +59,6 @@ async def backfill_session_history(
             cfg.symbol, len(existing_dates),
         )
         return
-
-    logger.info(
-        "session_backfill: starting backfill for %s (%d days)…",
-        cfg.symbol, days,
-    )
 
     # ── Build list of dates to process ───────────────────────────────────
     today_utc = datetime.datetime.utcnow().date()
@@ -70,7 +72,8 @@ async def backfill_session_history(
         logger.info("session_backfill: nothing new to backfill")
         return
 
-    logger.info("session_backfill: %d days to process", len(dates_to_process))
+    total = len(dates_to_process)
+    _notify(f"Building session history for {cfg.symbol} — {total} days to fetch…")
 
     # ── Process each day ─────────────────────────────────────────────────
     processed = 0
@@ -120,11 +123,10 @@ async def backfill_session_history(
                 await save_session_history(ny_record)
 
             processed += 1
-            if (idx + 1) % 10 == 0:
-                logger.info(
-                    "session_backfill: processed %d/%d days",
-                    idx + 1, len(dates_to_process),
-                )
+
+            # Progress update every 10 days
+            if processed % 10 == 0:
+                _notify(f"{cfg.symbol} history: {processed}/{total} days ({processed*100//total}%)")
 
             # Small delay between days to avoid hammering the REST API
             await asyncio.sleep(0.3)
@@ -135,9 +137,9 @@ async def backfill_session_history(
             logger.warning("session_backfill: error on %s: %s", day, exc)
             continue
 
-    logger.info(
-        "session_backfill: complete for %s — %d days written",
-        cfg.symbol, processed,
+    _notify(
+        f"{cfg.symbol} session history ready — {processed} days loaded "
+        f"({existing_dates.__len__() + processed} total records)"
     )
 
 
