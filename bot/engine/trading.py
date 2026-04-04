@@ -332,6 +332,8 @@ class TradingEngine:
         if self._session is None:
             if allow_entry:
                 await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
+            else:
+                self._broadcast({"type": "entry_blocked", "reason": "Trading paused — press Start to enable entries", "gates": {}})
         else:
             await self._manage_position(cfg, price, signal, ind, atr_val)
 
