@@ -2266,10 +2266,7 @@ function updateSignalPanel(sig) {
   // Reason text — show warmup indicator if flow window is filling up
   const reasonEl = document.getElementById('sig-reason');
   if (sig.flow_warmup) {
-    const ws = (sig.warmup_strength != null && sig.warmup_strength > 0)
-      ? ` (${(sig.warmup_strength * 100).toFixed(1)}%)`
-      : '';
-    reasonEl.textContent = `⏳ flow warming up — technical only${ws}`;
+    reasonEl.textContent = `⏳ flow warming up — entry paused`;
     reasonEl.style.color = 'var(--amber, #f59e0b)';
   } else {
     // Only replace reason text if signal engine has a reason — otherwise keep

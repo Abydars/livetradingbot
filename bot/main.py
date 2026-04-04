@@ -310,7 +310,9 @@ async def _ticker_loop() -> None:
                         _on_exchange_error(err)
             else:
                 flow_warmup_s = _flow_window_for_timeframe(cfg.timeframe) * cfg.flow_warmup_mult
-                in_flow_warmup = (time.time() - _last_switch_ts) < flow_warmup_s
+                time_warmup_done  = (time.time() - _last_switch_ts) >= flow_warmup_s
+                trade_warmup_done = (_flow is not None and _flow.summarize()["trade_count"] >= 20)
+                in_flow_warmup    = not (time_warmup_done or trade_warmup_done)
 
                 # HTF EMA bias — refresh once per TTL; cheap (1 REST call, 70 candles)
                 htf_tf, htf_ttl = (cfg.htf_timeframe, 15 * 60) if cfg.htf_timeframe else _htf_for_timeframe(cfg.timeframe)
@@ -464,6 +466,14 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
                 ]
                 _engine.update_candles(fresh)
                 _last_candles_fetch = time.time()
+                flow_window_s = _flow_window_for_timeframe(cfg.timeframe)
+                agg_trades = await _rest.get_agg_trades(new_sym, window_seconds=flow_window_s)
+                if agg_trades and _flow:
+                    _flow.seed_from_trades(agg_trades)
+                    logger.info(
+                        "_do_switch: seeded flow with %d aggTrades for %s",
+                        len(agg_trades), new_sym,
+                    )
                 # Broadcast candles after they load
                 await _do_broadcast({
                     "type":    "candles",
@@ -1011,6 +1021,14 @@ async def _scan_symbols(cfg) -> None:
                 _engine.update_candles(fresh_candles)
                 _entry_start_candle = fresh_candles[-1]["time"] if fresh_candles else 0
                 _last_candles_fetch = time.time()
+                flow_window_s = _flow_window_for_timeframe(cfg.timeframe)
+                agg_trades = await _rest.get_agg_trades(new_sym, window_seconds=flow_window_s)
+                if agg_trades and _flow:
+                    _flow.seed_from_trades(agg_trades)
+                    logger.info(
+                        "auto-switch: seeded flow with %d aggTrades for %s",
+                        len(agg_trades), new_sym,
+                    )
                 await _do_broadcast({
                     "type":    "candles",
                     "candles": fresh_candles[-100:],
