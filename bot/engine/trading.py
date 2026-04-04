@@ -354,6 +354,9 @@ class TradingEngine:
         Compute all active key levels sorted by distance to price.
         Returns: [{type, price, dist}, ...]
         """
+        if price <= 0:
+            return []
+
         levels = []
 
         # PDH / PDL
@@ -707,15 +710,26 @@ class TradingEngine:
         candles_1d: List[Dict],
     ) -> None:
         """
-        Session-Aware Pattern entry.
+        Session-Aware Pattern entry — short-circuit evaluation.
+        When a gate fails, broadcast immediately and return so that
+        subsequent gates show as '–' (unchecked) in the UI.
+
         Gate 1: Session active (London or NY, past first 5 min, trades remaining)
-        Gate 2: Historical probability >= threshold
+        Gate 2: Historical probability >= threshold (or bootstrap mode)
         Gate 3: Key level nearby (within session_proximity_pts)
         Gate 4: Candle pattern confirmed (pin bar, engulfing, inside bar)
         Gate 5: R:R >= session_min_rr
         """
         candles_1m = self.candles
         gates: Dict[str, tuple] = {}
+
+        def _block(gate: str) -> None:
+            """Broadcast current gates state and stop (later gates stay unset → '–' in UI)."""
+            self._broadcast({
+                "type":   "entry_blocked",
+                "reason": f"Entry blocked: {gate} — {gates[gate][1]}",
+                "gates":  gates,
+            })
 
         # ── Gate 1: Session Active ────────────────────────────────────────
         minutes_open = self._minutes_since_session_open(session, cfg.session_timezone_offset)
@@ -735,6 +749,10 @@ class TradingEngine:
                 remaining = cfg.session_max_trades - trades_done
                 gates["SESSION"] = (True,
                     f"{session.upper()} | {minutes_open}min open | {remaining} trades left")
+
+        if not gates["SESSION"][0]:
+            _block("SESSION")
+            return   # ← PROBABILITY, KEY LEVEL, PATTERN, R:R show as "–"
 
         # ── Gate 2: Historical Probability ───────────────────────────────
         history = await get_session_history(cfg.symbol, session, cfg.session_history_bars)
@@ -771,6 +789,13 @@ class TradingEngine:
             elif prob["direction"] in ("short", "reversal"):
                 expected_dir = "short"
 
+        if not gates["PROBABILITY"][0] or expected_dir == "none":
+            if gates["PROBABILITY"][0] and expected_dir == "none":
+                # Probability passed but direction is indeterminate (no Asian range yet)
+                gates["PROBABILITY"] = (False, "no Asian range yet — cannot determine direction")
+            _block("PROBABILITY")
+            return   # ← KEY LEVEL, PATTERN, R:R show as "–"
+
         # ── Gate 3: Key Level Proximity ───────────────────────────────────
         nearby_level = None
         for lv in self._key_levels:
@@ -791,11 +816,12 @@ class TradingEngine:
                 f"{nearby_level['type']} @ {nearby_level['price']:.2f} "
                 f"({nearby_level['dist']:.1f}pts away)")
 
+        if not gates["KEY LEVEL"][0]:
+            _block("KEY LEVEL")
+            return   # ← PATTERN, R:R show as "–"
+
         # ── Gate 4: Candle Pattern ────────────────────────────────────────
-        pattern = {"pattern": "none", "detected": False, "sl_extreme": 0.0,
-                   "reason": "waiting for pattern"}
-        if expected_dir != "none" and gates.get("KEY LEVEL", (False,))[0]:
-            pattern = self._check_candle_pattern(candles_1m, expected_dir)
+        pattern = self._check_candle_pattern(candles_1m, expected_dir)
 
         if pattern["detected"]:
             gates["PATTERN"] = (True,
@@ -803,38 +829,32 @@ class TradingEngine:
         else:
             gates["PATTERN"] = (False, pattern["reason"])
 
-        # ── Gate 5: R:R Check ─────────────────────────────────────────────
-        levels: Dict = {}
-        if pattern["detected"] and expected_dir != "none":
-            levels = self._compute_session_levels(
-                expected_dir, price, pattern["sl_extreme"],
-                self._key_levels, cfg,
-            )
-            rr = levels.get("rr_ratio", 0.0)
-            if rr < cfg.session_min_rr:
-                gates["R:R"] = (False, f"{rr:.2f} < {cfg.session_min_rr:.1f} minimum")
-            else:
-                gates["R:R"] = (True,
-                    f"{rr:.2f}:1  SL={levels['sl_pts']:.1f}pts  TP→{levels['tp_price']:.2f}")
-        else:
-            gates["R:R"] = (False, "waiting for pattern to compute R:R")
+        if not gates["PATTERN"][0]:
+            _block("PATTERN")
+            return   # ← R:R shows as "–"
 
-        # ── Broadcast ─────────────────────────────────────────────────────
-        all_passed  = all(v[0] for v in gates.values())
-        failed_gate = next((k for k, v in gates.items() if not v[0]), None)
-        broadcast_reason = (
-            f"All gates passed — entering {expected_dir.upper()}"
-            if all_passed
-            else f"Entry blocked: {failed_gate} — {gates[failed_gate][1]}"
+        # ── Gate 5: R:R Check ─────────────────────────────────────────────
+        levels = self._compute_session_levels(
+            expected_dir, price, pattern["sl_extreme"],
+            self._key_levels, cfg,
         )
+        rr = levels.get("rr_ratio", 0.0)
+        if rr < cfg.session_min_rr:
+            gates["R:R"] = (False, f"{rr:.2f} < {cfg.session_min_rr:.1f} minimum")
+        else:
+            gates["R:R"] = (True,
+                f"{rr:.2f}:1  SL={levels['sl_pts']:.1f}pts  TP→{levels['tp_price']:.2f}")
+
+        if not gates["R:R"][0]:
+            _block("R:R")
+            return
+
+        # ── All gates passed — broadcast then enter ───────────────────────
         self._broadcast({
             "type":   "entry_blocked",
-            "reason": broadcast_reason,
+            "reason": f"All gates passed — entering {expected_dir.upper()}",
             "gates":  gates,
         })
-
-        if not all_passed:
-            return
 
         # ── Cooldown check ────────────────────────────────────────────────
         if time.time() - self._last_exit_time < cfg.entry_cooldown_s:

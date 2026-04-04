@@ -413,6 +413,8 @@ async def _ticker_loop() -> None:
                     _entry_block = "Switching symbol — please wait…"
             else:
                 _entry_block = ""
+            if price <= 0:
+                continue   # skip tick until WS delivers a real price
             await _engine.tick(cfg, price, candles_5m=_candles_5m, candles_15m=_candles_15m,
                                candles_1d=_candles_1d, allow_entry=_allow_entry, htf_bias=_htf_bias)
 
