@@ -839,14 +839,11 @@ class TradingEngine:
             )
             return
 
-        # Strength-based sizing: block weak signals, scale margin linearly above minimum.
+        # Strength-based sizing: scale margin linearly with strength, floored at strength_size_min.
+        # strength_size_min is a sizing floor only — entry is already gated above by min_signal_strength.
         if cfg.strength_sizing:
-            if strength < cfg.strength_size_min:
-                _blocked(
-                    f"signal strength {strength:.2f} below minimum {cfg.strength_size_min:.2f}"
-                )
-                return
-            effective_margin = cfg.margin_usdt * strength
+            scale = max(strength, cfg.strength_size_min)
+            effective_margin = cfg.margin_usdt * scale
         else:
             effective_margin = cfg.margin_usdt
 
