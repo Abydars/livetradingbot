@@ -213,13 +213,20 @@ class TvWatcher:
             composite = signal.get("composite", 0.0)
 
             # Check all entry gates — same as best_entry()
-            ready = True
-            if direction == "NEUTRAL":                                              ready = False
-            elif strength < cfg.min_signal_strength:                                ready = False
-            elif not signal.get("filters_passed", False):                           ready = False
-            elif cfg.htf_filter and htf_bias not in ("NEUTRAL","") and htf_bias != direction: ready = False
-            elif direction == "LONG"  and flow_proxy <= 0:                          ready = False
-            elif direction == "SHORT" and flow_proxy >= 0:                          ready = False
+            ready        = True
+            block_reason = ""
+            if direction == "NEUTRAL":
+                ready = False; block_reason = "signal NEUTRAL"
+            elif strength < cfg.min_signal_strength:
+                ready = False; block_reason = f"strength {strength*100:.0f}% < {cfg.min_signal_strength*100:.0f}% min"
+            elif not signal.get("filters_passed", False):
+                ready = False; block_reason = signal.get("reason", "filter blocked")
+            elif cfg.htf_filter and htf_bias not in ("NEUTRAL","") and htf_bias != direction:
+                ready = False; block_reason = f"HTF {htf_bias} disagrees"
+            elif direction == "LONG"  and flow_proxy <= 0:
+                ready = False; block_reason = "flow disagrees"
+            elif direction == "SHORT" and flow_proxy >= 0:
+                ready = False; block_reason = "flow disagrees"
             else:
                 if len(candles) >= 2:
                     c2    = candles[-2]
@@ -229,12 +236,16 @@ class TvWatcher:
                     if not is_doji and rng > 0:
                         upper = c2["high"] - max(c2["open"], c2["close"])
                         lower = min(c2["open"], c2["close"]) - c2["low"]
-                        if direction == "LONG"  and upper / rng > 0.60: ready = False
-                        if direction == "SHORT" and lower / rng > 0.60: ready = False
+                        if direction == "LONG"  and upper / rng > 0.60:
+                            ready = False; block_reason = "long upper wick"
+                        if direction == "SHORT" and lower / rng > 0.60:
+                            ready = False; block_reason = "short lower wick"
                 if ready and len(candles) >= 2:
                     c2 = candles[-2]
-                    if direction == "LONG"  and c2["close"] < c2["open"]: ready = False
-                    if direction == "SHORT" and c2["close"] > c2["open"]: ready = False
+                    if direction == "LONG"  and c2["close"] < c2["open"]:
+                        ready = False; block_reason = "last candle bearish"
+                    if direction == "SHORT" and c2["close"] > c2["open"]:
+                        ready = False; block_reason = "last candle bullish"
                 # Persistence: check previous candle direction using cached prev indicators
                 # Avoid calling compute_all() again — use last candle's indicators from cache
                 if ready and len(candles) >= 3:
@@ -243,14 +254,15 @@ class TvWatcher:
                         prev_ind = compute_all(candles[:-1])
                     prev_sig = self._signal_eng.compute(candles[:-1], flow, prev_ind)
                     if prev_sig["direction"] != direction:
-                        ready = False
+                        ready = False; block_reason = "prev candle disagrees"
 
             results.append({
-                "symbol":    sym,
-                "direction": direction,
-                "strength":  round(strength, 3),
-                "composite": round(composite, 3),
-                "ready":     ready,
+                "symbol":       sym,
+                "direction":    direction,
+                "strength":     round(strength, 3),
+                "composite":    round(composite, 3),
+                "ready":        ready,
+                "block_reason": block_reason,
             })
 
         return results

@@ -1879,10 +1879,12 @@ function updateSymSidebar(movers) {
       ? `<div style="display:flex;gap:4px;align-items:center;margin-top:3px">${biasBadge}${htfBadge}${scanBadge}</div>`
       : '';
     // Bot signal strength badge — green if all entry gates passed, muted if not
+    const blockReason = m.block_reason || '';
     const botStr = m.bot_strength != null
       ? `<span style="font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;
            background:${m.bot_ready ? 'rgba(63,185,80,.18)' : 'rgba(255,255,255,.06)'};
-           color:${m.bot_ready ? 'var(--green)' : 'var(--muted)'}">
+           color:${m.bot_ready ? 'var(--green)' : 'var(--muted)'}"
+           title="${m.bot_ready ? 'All entry gates passed' : blockReason}">
            ${m.bot_ready ? '✓ ' : ''}${(m.bot_strength * 100).toFixed(0)}%</span>`
       : '';
     const tvScore = m.score != null
