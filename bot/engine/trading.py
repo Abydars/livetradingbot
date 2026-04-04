@@ -477,13 +477,43 @@ class TradingEngine:
             # Restore trailing-stop state so it survives restarts
             self._trail_activated = bool(self._session.get("trail_active", 0))
             self._trail_price     = self._session.get("trail_price") or None
+
+            import json as _json
+            sess = self._session
+
+            # Rescue mode
+            self._rescue_mode        = bool(sess.get("rescue_mode", 0))
+            self._rescue_trail_price = sess.get("rescue_trail_price") or None
+
+            # Breakeven stop
+            self._breakeven_stop_price = sess.get("breakeven_stop_price") or None
+
+            # Entry adaptive thresholds
+            raw_adaptive = sess.get("entry_adaptive")
+            if raw_adaptive:
+                try:
+                    self._entry_adaptive = _json.loads(raw_adaptive)
+                except Exception:
+                    self._entry_adaptive = {}
+
+            # Trail pct multiplier
+            self._trail_pct_mult = float(sess.get("trail_pct_mult") or 1.0)
+
+            # Margin envelope
+            self._margin_envelope = float(sess.get("margin_envelope") or 0.0)
+
             logger.info(
-                "TradingEngine: restored session id=%d dir=%s hedges=%d trail=%s@%.6f",
+                "TradingEngine: restored session id=%d dir=%s hedges=%d trail=%s@%.6f "
+                "rescue=%s breakeven=%s trail_mult=%.2f adaptive_keys=%d",
                 self._session["id"],
                 self._session["direction"],
                 len(self._hedges),
                 self._trail_activated,
                 self._trail_price or 0.0,
+                self._rescue_mode,
+                self._breakeven_stop_price,
+                self._trail_pct_mult,
+                len(self._entry_adaptive),
             )
 
     # ------------------------------------------------------------------
@@ -896,6 +926,12 @@ class TradingEngine:
             cfg.margin_usdt * (cfg.dca_multiplier ** i)
             for i in range(cfg.max_dca + 1)
         )
+        import json as _json
+        await update_session(
+            self._session["id"],
+            entry_adaptive=_json.dumps(self._entry_adaptive),
+            margin_envelope=self._margin_envelope,
+        )
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
 
@@ -1128,6 +1164,7 @@ class TradingEngine:
                 )
                 self._rescue_mode        = False
                 self._rescue_trail_price = None
+                await update_session(self._session["id"], rescue_mode=0, rescue_trail_price=None)
                 await self._close_position(cfg, price, pnl_pct, "rescue_trail")
                 return
 
@@ -1181,6 +1218,7 @@ class TradingEngine:
             else:
                 be_price = avg_price * (1 - fee_pct)
             self._breakeven_stop_price = be_price
+            await update_session(self._session["id"], breakeven_stop_price=be_price)
             logger.info(
                 "TradingEngine: breakeven stop SET @ %.6f  (avg=%.6f  trail_active=True)",
                 be_price, avg_price,
@@ -1219,6 +1257,7 @@ class TradingEngine:
                     # Weak confirmation: arm trail but tighten it proactively.
                     # Position still has upside but conviction is low.
                     self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
+                    await update_session(self._session["id"], trail_pct_mult=self._trail_pct_mult)
                     logger.info(
                         "TradingEngine: DCA recovery — signal WEAK %s (%.2f) — "
                         "trail tightened to %.1f×, letting position run",
@@ -1248,6 +1287,7 @@ class TradingEngine:
                 # Arm the trail and set breakeven stop: protect capital but
                 # don't force an early exit if momentum resumes.
                 self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
+                await update_session(self._session["id"], trail_pct_mult=self._trail_pct_mult)
                 logger.info(
                     "TradingEngine: DCA recovery — signal NEUTRAL — "
                     "arming tight trail + breakeven stop",
@@ -1561,6 +1601,7 @@ class TradingEngine:
         # so the engine resumes ATR-based levels for the new avg price.
         self._clear_level_overrides("dca")
         self._breakeven_stop_price = None  # will re-arm on next recovery above avg
+        await update_session(self._session["id"], breakeven_stop_price=None)
 
         # Recalculate risk thresholds from current ATR at DCA time.
         # Market volatility may have changed since entry; refreshing here keeps
@@ -1572,6 +1613,11 @@ class TradingEngine:
             self._entry_adaptive = self._compute_adaptive(atr_val, price)
             if old_tp_pct is not None:
                 self._entry_adaptive["tp_pct"] = old_tp_pct
+            import json as _json
+            await update_session(
+                self._session["id"],
+                entry_adaptive=_json.dumps(self._entry_adaptive),
+            )
             logger.info(
                 "TradingEngine: entry_adaptive recalculated at DCA #%d "
                 "(tp=%.3f%% sl=%.3f%%)",
@@ -1719,6 +1765,7 @@ class TradingEngine:
 
         self._clear_level_overrides("rescue_dca")
         self._breakeven_stop_price  = None
+        await update_session(self._session["id"], breakeven_stop_price=None)
         self._last_dca_time         = time.time()
         self._smart_sl_ticks        = 0
         self._signal_degraded_ticks = 0
@@ -1729,6 +1776,11 @@ class TradingEngine:
             self._entry_adaptive = self._compute_adaptive(atr_val, price)
             if old_tp_pct is not None:
                 self._entry_adaptive["tp_pct"] = old_tp_pct
+            import json as _json
+            await update_session(
+                self._session["id"],
+                entry_adaptive=_json.dumps(self._entry_adaptive),
+            )
 
         # Arm rescue trail. Initialize best price with a buffer so the trail
         # doesn't fire on the very first tick due to spread/slippage.
@@ -1740,6 +1792,11 @@ class TradingEngine:
         else:
             self._rescue_trail_price = fill_price * (1 + dca_step_pct / 100 * 1.0)
         self._rescue_mode = True
+        await update_session(
+            self._session["id"],
+            rescue_mode=1,
+            rescue_trail_price=self._rescue_trail_price,
+        )
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"

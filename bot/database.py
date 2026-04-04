@@ -159,6 +159,13 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("signal_price",    "REAL"),
         # sessions columns added in v5 — exit fill price
         ("exit_price",      "REAL"),
+        # sessions columns added in v6 — rescue and breakeven state persistence
+        ("rescue_mode",          "INTEGER DEFAULT 0"),
+        ("rescue_trail_price",   "REAL"),
+        ("breakeven_stop_price", "REAL"),
+        ("entry_adaptive",       "TEXT"),
+        ("trail_pct_mult",       "REAL DEFAULT 1.0"),
+        ("margin_envelope",      "REAL DEFAULT 0.0"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
