@@ -4,6 +4,7 @@ exchange/binance_ws.py — Binance USDT-M Futures WebSocket streams.
 Subscribes to:
   - {symbol}@aggTrade       — real-time trades (price, qty, buyer_maker)
   - {symbol}@depth20@100ms  — top-20 order book depth
+  - {symbol}@kline_{interval} — real-time candle updates (every tick)
 
 Stream URL is selected by trading_mode:
   - paper / live : wss://fstream.binance.com/ws/   (production)
@@ -35,8 +36,8 @@ _BACKOFF_CAP = 30          # max reconnect delay (seconds)
 
 class BinanceWebSocket:
     """
-    Manages two combined Binance Futures WebSocket streams for a symbol.
-    Calls `on_trade` and `on_depth` callbacks with parsed data.
+    Manages combined Binance Futures WebSocket streams for a symbol.
+    Calls `on_trade`, `on_depth`, and `on_kline` callbacks with parsed data.
     """
 
     def __init__(
@@ -45,13 +46,16 @@ class BinanceWebSocket:
         trading_mode: str,
         on_trade: Callable[[Dict], None],
         on_depth: Callable[[Dict], None],
+        on_kline: Callable[[Dict], None],
         on_error: Optional[Callable[[str], None]] = None,
     ) -> None:
-        self.symbol = symbol.lower()
-        self.on_trade = on_trade
-        self.on_depth = on_depth
+        self.symbol    = symbol.lower()
+        self.on_trade  = on_trade
+        self.on_depth  = on_depth
+        self.on_kline  = on_kline
         self._on_error = on_error
         self._base_url = _WS_STREAM_URLS.get(trading_mode, _WS_STREAM_URLS["live"])
+        self._interval = "1m"   # updated via set_interval() before start()
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -60,6 +64,10 @@ class BinanceWebSocket:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_interval(self, interval: str) -> None:
+        """Set the kline interval. Call before start() or switch_symbol()."""
+        self._interval = interval
 
     async def start(self) -> None:
         self._running = True
@@ -78,15 +86,16 @@ class BinanceWebSocket:
                 pass
         logger.info("BinanceWebSocket: stopped for %s", self.symbol)
 
-    async def switch_symbol(self, new_symbol: str) -> None:
-        """Stop current streams and restart for a new symbol."""
+    async def switch_symbol(self, new_symbol: str, interval: str = "1m") -> None:
+        """Stop current streams and restart for a new symbol + interval."""
         logger.info(
-            "BinanceWebSocket: switching %s → %s", self.symbol, new_symbol
+            "BinanceWebSocket: switching %s → %s (%s)", self.symbol, new_symbol, interval
         )
-        self.symbol = new_symbol.lower()
+        self.symbol    = new_symbol.lower()
+        self._interval = interval
         if self._ws is not None:
             await self._ws.close()
-        # _run_with_backoff will reconnect automatically
+        # _run_with_backoff reconnects automatically with new symbol + interval
 
     # ------------------------------------------------------------------
     # Internal
@@ -114,6 +123,7 @@ class BinanceWebSocket:
         streams = (
             f"{self.symbol}@aggTrade"
             f"/{self.symbol}@depth20@100ms"
+            f"/{self.symbol}@kline_{self._interval}"
         )
         url = f"{self._base_url}{streams}"
         logger.info("BinanceWebSocket: connecting to %s", url)
@@ -177,4 +187,15 @@ class BinanceWebSocket:
                     "time": int(msg.get("T", time.time() * 1000)),
                 }
             )
+        elif event == "kline":
+            k = msg.get("k", {})
+            self.on_kline({
+                "open":   float(k.get("o", 0)),
+                "high":   float(k.get("h", 0)),
+                "low":    float(k.get("l", 0)),
+                "close":  float(k.get("c", 0)),
+                "volume": float(k.get("v", 0)),
+                "time":   int(k.get("t", 0)) // 1000,   # ms → seconds
+                "closed": bool(k.get("x", False)),       # True = candle finalized
+            })
         # Ignore other event types (e.g. bookTicker)

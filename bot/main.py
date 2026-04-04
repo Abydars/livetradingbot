@@ -112,7 +112,8 @@ _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
 _last_position_check: float = 0.0     # throttle REST position sync
 _last_external_fill_price: float = 0.0   # fill price captured from ORDER_TRADE_UPDATE for external closes
 _POSITION_CHECK_S = 60.0              # check Binance position every N seconds
-_CANDLE_REFRESH_S = 30.0   # fetch new candles every N seconds
+_CANDLE_REFRESH_S = 300.0  # REST candle integrity sync every 5 min
+                            # Real-time updates come from WS kline stream
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 _CLIENT_WARN_INTERVAL = 60.0  # re-broadcast "client unavailable" at most once per minute
 
@@ -252,7 +253,9 @@ async def _ticker_loop() -> None:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Refresh candles periodically
+            # REST candle integrity sync — only fires every 5 minutes.
+            # Normal real-time updates come from the WS kline stream (_on_kline).
+            # This catches any candles missed during a brief WS reconnect gap.
             if now - _last_candles_fetch >= _CANDLE_REFRESH_S:
                 try:
                     raw = await _rest.get_klines(cfg.symbol, interval=cfg.timeframe, limit=200)
@@ -269,19 +272,20 @@ async def _ticker_loop() -> None:
                     ]
                     _engine.update_candles(candles)
                     _last_candles_fetch = now
+                    logger.info("Candles: REST integrity sync (%d candles)", len(candles))
 
-                    # Broadcast candles + indicators to UI
+                    # Broadcast refresh to UI
                     ind = _engine.last_indicators
                     await _do_broadcast({
                         "type":    "candles",
-                        "candles": candles[-100:],   # last 100 for chart
+                        "candles": candles[-100:],
                     })
                     await _do_broadcast({
                         "type":       "indicators",
                         "indicators": _safe_ind(ind),
                     })
                 except Exception as exc:
-                    logger.warning("Candle refresh failed (will retry): %s", exc)
+                    logger.warning("Candle REST sync failed: %s", exc)
 
             # Broadcast price tick
             await _do_broadcast({
@@ -453,7 +457,7 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
             raw, _ = await asyncio.gather(
                 _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200),
                 asyncio.gather(
-                    _ws.switch_symbol(new_sym),
+                    _ws.switch_symbol(new_sym, interval=cfg.timeframe),
                     _executor.prepare_symbol(new_sym, cfg.leverage),
                 ),
                 return_exceptions=True,
@@ -969,6 +973,60 @@ def _on_trade(event: Dict) -> None:
     )
 
 
+def _on_kline(event: Dict) -> None:
+    """
+    Called on every kline WS tick for the active symbol.
+    Updates candles[-1] in real-time; on close finalizes and broadcasts.
+    """
+    global _last_candles_fetch
+
+    if _engine is None or not _engine.candles:
+        return
+
+    candles  = _engine.candles
+    is_closed = event["closed"]
+    kline = {
+        "open":   event["open"],
+        "high":   event["high"],
+        "low":    event["low"],
+        "close":  event["close"],
+        "volume": event["volume"],
+        "time":   event["time"],
+    }
+
+    last_time = candles[-1]["time"]
+    if kline["time"] == last_time:
+        # Update the forming candle in-place (price moving, candle not done)
+        candles[-1]["high"]   = max(candles[-1]["high"],  kline["high"])
+        candles[-1]["low"]    = min(candles[-1]["low"],   kline["low"])
+        candles[-1]["close"]  = kline["close"]
+        candles[-1]["volume"] = kline["volume"]
+    elif kline["time"] > last_time:
+        # New candle started — append it (previous is already closed)
+        candles.append(kline.copy())
+        if len(candles) > 250:
+            _engine.candles = candles[-250:]
+            candles = _engine.candles
+
+    # Always recompute indicators so gates reflect current price
+    _engine.update_candles(_engine.candles)
+
+    if is_closed:
+        ind = _engine.last_indicators
+        loop = asyncio.get_running_loop()
+        loop.create_task(_do_broadcast({
+            "type":    "candles",
+            "candles": _engine.candles[-100:],
+        }))
+        loop.create_task(_do_broadcast({
+            "type":       "indicators",
+            "indicators": _safe_ind(ind),
+        }))
+        logger.debug("_on_kline: candle closed t=%d  candles=%d",
+                     kline["time"], len(_engine.candles))
+        _last_candles_fetch = time.time()   # suppress REST sync for 5 min
+
+
 def _on_depth(event: Dict) -> None:
     _flow.on_depth(event)
     asyncio.get_running_loop().call_soon(
@@ -1435,9 +1493,13 @@ async def lifespan(app: FastAPI):
             logger.error("Startup position sync failed: %s", exc)
 
     _ws = BinanceWebSocket(
-        cfg.symbol, cfg.trading_mode, on_trade=_on_trade, on_depth=_on_depth,
+        cfg.symbol, cfg.trading_mode,
+        on_trade=_on_trade,
+        on_depth=_on_depth,
+        on_kline=_on_kline,
         on_error=_on_exchange_error,
     )
+    _ws.set_interval(cfg.timeframe)
     await _ws.start()
 
     ticker_task = asyncio.create_task(_ticker_loop())
@@ -2025,9 +2087,13 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             # Reconnect WS to correct stream URL for the new mode
             await _ws.stop()
             _ws = BinanceWebSocket(
-                cfg2.symbol, new_mode, on_trade=_on_trade, on_depth=_on_depth,
+                cfg2.symbol, new_mode,
+                on_trade=_on_trade,
+                on_depth=_on_depth,
+                on_kline=_on_kline,
                 on_error=_on_exchange_error,
             )
+            _ws.set_interval(cfg2.timeframe)
             await _ws.start()
             _last_candles_fetch = 0.0
 
