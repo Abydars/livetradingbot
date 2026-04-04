@@ -695,10 +695,17 @@ async def _scan_symbols(cfg) -> None:
 
         # ── Phase 1 — 24h ticker filter ──────────────────────────────────
         tickers = await _rest._fetch_24h_tickers()
+        # Build the valid USDT perp set from already-loaded symbol_info.
+        # Perpetual USDT-M symbols never contain "_"; delivery contracts do
+        # (e.g. BTCUSDT_231229).  This avoids an extra REST call.
+        valid_perps = {
+            s for s, info in _rest.symbol_info.items()
+            if s.endswith("USDT") and "_" not in s and info.status == "TRADING"
+        }
         candidates = []
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
+            if sym not in valid_perps:
                 continue
             pcp   = float(t.get("priceChangePercent", 0))
             qvol  = float(t.get("quoteVolume", 0))
