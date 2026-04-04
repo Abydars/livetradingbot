@@ -746,6 +746,146 @@ class TradingEngine:
         self._push_session()
 
     # ------------------------------------------------------------------
+    # Close helpers
+    # ------------------------------------------------------------------
+
+    async def _close_position(
+        self,
+        cfg: BotConfig,
+        price: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        """Standard close: TP hit, time exit, manual reset, trail exit."""
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            sess      = self._session
+            direction = sess["direction"]
+            avg_price = sess["avg_price"]
+            qty       = sess["qty"]
+            side      = "SELL" if direction == "LONG" else "BUY"
+
+            # ── Place exit order ─────────────────────────────────────────
+            if cfg.trading_mode == "paper":
+                fill_price = price
+                if direction == "LONG":
+                    fill_price *= (1 - cfg.paper_slippage_pct / 100)
+                else:
+                    fill_price *= (1 + cfg.paper_slippage_pct / 100)
+            else:
+                order = await self._executor.place_market_order(
+                    cfg.symbol, side, qty, reduce_only=True, current_price=price
+                )
+                self._bot_close_order_ids.add(int(order.get("orderId", 0)))
+                fill_price = float(order.get("avgPrice") or price)
+
+            # ── PnL ──────────────────────────────────────────────────────
+            if direction == "LONG":
+                pnl_usdt = (fill_price - avg_price) * qty
+            else:
+                pnl_usdt = (avg_price - fill_price) * qty
+            pnl_usdt -= self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
+
+            # ── Persist + log ─────────────────────────────────────────────
+            await close_session(
+                sess["id"],
+                exit_price=fill_price,
+                pnl_usdt=pnl_usdt,
+                exit_reason=reason,
+            )
+            self._pos_log(
+                "close",
+                direction=direction,
+                price=fill_price,
+                qty=qty,
+                symbol=cfg.symbol,
+                mode=cfg.trading_mode,
+                pnl_usdt=pnl_usdt,
+                reason=reason,
+            )
+            await notify(cfg.discord_webhook, "TRADE_CLOSE", {
+                "symbol":       cfg.symbol,
+                "direction":    direction,
+                "price":        fill_price,
+                "pnl_usdt":     pnl_usdt,
+                "reason":       reason,
+                "trading_mode": cfg.trading_mode,
+            })
+
+            # ── Reset scalp state ─────────────────────────────────────────
+            self._session            = None
+            self._scalp_tp_price     = None
+            self._scalp_sl_price     = None
+            self._scalp_tp_pct       = 0.0
+            self._scalp_sl_pct       = 0.0
+            self._scalp_atr_pct      = 0.0
+            self._entry_candle_time  = 0
+            self._trail_activated    = False
+            self._trail_price        = None
+            self._last_exit_time     = time.time()
+            self._clear_level_overrides("position closed")
+
+            # ── Notify UI ─────────────────────────────────────────────────
+            sign  = "+" if pnl_usdt >= 0 else ""
+            color = "green" if pnl_usdt >= 0 else "red"
+            msg   = (
+                f"{_mode_prefix(cfg.trading_mode)}"
+                f"CLOSE {direction} @ {fill_price:.4f}  "
+                f"PnL={sign}{pnl_usdt:.2f} USDT  reason={reason}"
+            )
+            logger.info("TradingEngine: %s", msg)
+            self._broadcast({"type": "notification", "text": msg})
+            self._push_session()
+
+            # ── Trigger immediate scanner run ─────────────────────────────
+            try:
+                import sys
+                mod = sys.modules.get("__main__")
+                if mod and hasattr(mod, "_force_scan"):
+                    mod._force_scan = True
+            except Exception:
+                pass
+
+        except Exception:
+            logger.exception("TradingEngine: _close_position failed (reason=%s)", reason)
+            raise
+        finally:
+            self._closing = False
+
+    async def _emergency_close(
+        self,
+        cfg: BotConfig,
+        price: float,
+        pnl_pct: float,
+    ) -> None:
+        """Hard stop-loss close. Retries once on failure."""
+        if self._closing:
+            return
+        sess      = self._session
+        direction = sess["direction"] if sess else "?"
+        sl_price  = self._scalp_sl_price or 0.0
+        logger.warning(
+            "TradingEngine: EMERGENCY CLOSE — stop loss hit  price=%.6f  sl=%.6f  pnl=%.2f%%",
+            price, sl_price, pnl_pct,
+        )
+        self._last_stop_time = time.time()
+        self._broadcast({
+            "type": "notification",
+            "text": f"STOP LOSS — closing {direction} @ {price:.4f}",
+        })
+        try:
+            await self._close_position(cfg, price, pnl_pct, "stop_loss")
+        except Exception:
+            logger.exception("TradingEngine: _emergency_close first attempt failed — retrying in 2s")
+            await asyncio.sleep(2)
+            try:
+                await self._close_position(cfg, price, pnl_pct, "stop_loss")
+            except Exception:
+                logger.exception("TradingEngine: _emergency_close retry also failed")
+
+    # ------------------------------------------------------------------
     # Forced close (API-level reset)
     # ------------------------------------------------------------------
 
