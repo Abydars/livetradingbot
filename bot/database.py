@@ -81,6 +81,28 @@ CREATE TABLE IF NOT EXISTS pos_log (
     payload TEXT    NOT NULL,
     ts      INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS session_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    date            TEXT NOT NULL,
+    session         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+
+    asian_high      REAL,
+    asian_low       REAL,
+
+    london_hunted   TEXT,
+    london_hunt_min INTEGER,
+    london_hunt_pts REAL,
+    london_direction TEXT,
+
+    ny_behavior     TEXT,
+    ny_open_price   REAL,
+    ny_close_price  REAL,
+
+    created_at      INTEGER DEFAULT (strftime('%s','now')),
+    UNIQUE(date, session, symbol)
+);
 """
 
 _DEFAULT_CONFIG: Dict[str, str] = {
@@ -144,13 +166,22 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "breakout_vol_pace_min": "2.0",
     "breakout_flow_min":     "0.25",
     "opposite_entry":        "0",
-    # SMC strategy parameters
+    # SMC strategy parameters (kept for schema compatibility — no longer used by engine)
     "smc_sl_buffer_pts":    "3.0",
     "smc_max_sl_pts":       "15.0",
     "smc_min_rr":           "2.0",
     "smc_ob_lookback":      "30",
     "smc_fvg_min_gap_pct":  "0.05",
     "smc_ob_strength_mult": "1.5",
+    # Session + Key Level + Pattern strategy parameters
+    "session_proximity_pts":   "25.0",
+    "session_prob_threshold":  "0.60",
+    "session_max_trades":      "2",
+    "session_sl_buffer_pts":   "4.0",
+    "session_min_rr":          "2.0",
+    "session_history_bars":    "30",
+    "session_round_interval":  "0",
+    "session_timezone_offset": "5",
 }
 
 
@@ -229,6 +260,26 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             event   TEXT    NOT NULL,
             payload TEXT    NOT NULL,
             ts      INTEGER NOT NULL
+        )"""
+    )
+    # Create session_history table if missing (older DBs won't have it)
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS session_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            TEXT NOT NULL,
+            session         TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            asian_high      REAL,
+            asian_low       REAL,
+            london_hunted   TEXT,
+            london_hunt_min INTEGER,
+            london_hunt_pts REAL,
+            london_direction TEXT,
+            ny_behavior     TEXT,
+            ny_open_price   REAL,
+            ny_close_price  REAL,
+            created_at      INTEGER DEFAULT (strftime('%s','now')),
+            UNIQUE(date, session, symbol)
         )"""
     )
     await db.commit()
@@ -647,3 +698,74 @@ async def get_tv_alerts(limit: int = 50) -> List[Dict[str, Any]]:
         ) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Session history CRUD (session-aware pattern strategy)
+# ---------------------------------------------------------------------------
+
+async def save_session_history(record: dict) -> None:
+    """Insert or update a session_history record (upsert by date+session+symbol)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO session_history
+               (date, session, symbol, asian_high, asian_low,
+                london_hunted, london_hunt_min, london_hunt_pts, london_direction,
+                ny_behavior, ny_open_price, ny_close_price)
+               VALUES (:date, :session, :symbol, :asian_high, :asian_low,
+                       :london_hunted, :london_hunt_min, :london_hunt_pts, :london_direction,
+                       :ny_behavior, :ny_open_price, :ny_close_price)
+               ON CONFLICT(date, session, symbol) DO UPDATE SET
+                   asian_high       = excluded.asian_high,
+                   asian_low        = excluded.asian_low,
+                   london_hunted    = excluded.london_hunted,
+                   london_hunt_min  = excluded.london_hunt_min,
+                   london_hunt_pts  = excluded.london_hunt_pts,
+                   london_direction = excluded.london_direction,
+                   ny_behavior      = excluded.ny_behavior,
+                   ny_open_price    = excluded.ny_open_price,
+                   ny_close_price   = excluded.ny_close_price""",
+            {
+                "date":             record.get("date", ""),
+                "session":          record.get("session", ""),
+                "symbol":           record.get("symbol", ""),
+                "asian_high":       record.get("asian_high"),
+                "asian_low":        record.get("asian_low"),
+                "london_hunted":    record.get("london_hunted"),
+                "london_hunt_min":  record.get("london_hunt_min"),
+                "london_hunt_pts":  record.get("london_hunt_pts"),
+                "london_direction": record.get("london_direction"),
+                "ny_behavior":      record.get("ny_behavior"),
+                "ny_open_price":    record.get("ny_open_price"),
+                "ny_close_price":   record.get("ny_close_price"),
+            },
+        )
+        await db.commit()
+
+
+async def get_session_history(symbol: str, session: str, bars: int = 30) -> List[Dict[str, Any]]:
+    """Return last N session_history rows for symbol + session type, newest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM session_history WHERE symbol=? AND session=? "
+            "ORDER BY date DESC LIMIT ?",
+            (symbol, session, bars),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_asian_range(symbol: str, date: str) -> Dict[str, Any]:
+    """Return {asian_high, asian_low} for a given date, or {} if not recorded."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT asian_high, asian_low FROM session_history "
+            "WHERE symbol=? AND date=? AND session='asian' LIMIT 1",
+            (symbol, date),
+        )
+        row = await cursor.fetchone()
+        if row and row["asian_high"] is not None:
+            return {"asian_high": row["asian_high"], "asian_low": row["asian_low"]}
+        return {}

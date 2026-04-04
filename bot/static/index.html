@@ -1261,10 +1261,11 @@
       <div id="sig-reason">Waiting…</div>
       <!-- Scalp gate status — updated by updateSignalPanel() -->
       <div id="sig-gates">
-        <div class="gate-row" id="gate-15M_BIAS">    <span class="gate-icon">–</span><span class="gate-name">15M BIAS</span>    <span class="gate-val"></span></div>
-        <div class="gate-row" id="gate-5M_ZONE">     <span class="gate-icon">–</span><span class="gate-name">5M ZONE</span>     <span class="gate-val"></span></div>
-        <div class="gate-row" id="gate-1M_TRIGGER">  <span class="gate-icon">–</span><span class="gate-name">1M TRIGGER</span>  <span class="gate-val"></span></div>
-        <div class="gate-row" id="gate-SL___R_R">    <span class="gate-icon">–</span><span class="gate-name">SL / R:R</span>    <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-SESSION">     <span class="gate-icon">–</span><span class="gate-name">SESSION</span>     <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-PROBABILITY"> <span class="gate-icon">–</span><span class="gate-name">PROBABILITY</span> <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-KEY_LEVEL">   <span class="gate-icon">–</span><span class="gate-name">KEY LEVEL</span>   <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-PATTERN">     <span class="gate-icon">–</span><span class="gate-name">PATTERN</span>     <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-R_R">         <span class="gate-icon">–</span><span class="gate-name">R:R</span>         <span class="gate-val"></span></div>
       </div>
     </section>
 
@@ -2294,10 +2295,11 @@ function updateSignalPanel(sig) {
   // Gates are tracked in window._lastGates (set by entry_blocked handler)
   const gateMap = window._lastGates || {};
   const gateIds = {
-    '15M BIAS':   '15M_BIAS',
-    '5M ZONE':    '5M_ZONE',
-    '1M TRIGGER': '1M_TRIGGER',
-    'SL / R:R':   'SL___R_R',
+    'SESSION':     'SESSION',
+    'PROBABILITY': 'PROBABILITY',
+    'KEY LEVEL':   'KEY_LEVEL',
+    'PATTERN':     'PATTERN',
+    'R:R':         'R_R',
   };
   for (const [name, id] of Object.entries(gateIds)) {
     const row = document.getElementById('gate-' + id);

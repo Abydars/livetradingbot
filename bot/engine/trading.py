@@ -1,11 +1,11 @@
 """
-engine/trading.py — Scalping state machine.
+engine/trading.py — Session-Aware Pattern Strategy.
 
 State flow:
-  IDLE → _try_entry() [7 gates pass] → SCALP_OPEN
-  SCALP_OPEN → price >= scalp_tp_price  → _close_position (take_profit)
-  SCALP_OPEN → price <= scalp_sl_price  → _emergency_close (stop_loss)
-  SCALP_OPEN → elapsed >= max_hold_candles → _close_position (time_exit)
+  IDLE → _try_entry() [5 gates pass] → SESSION_OPEN
+  SESSION_OPEN → price >= scalp_tp_price  → _close_position (take_profit)
+  SESSION_OPEN → price <= scalp_sl_price  → _emergency_close (stop_loss)
+  SESSION_OPEN → elapsed >= max_hold_candles → _close_position (time_exit)
   Any state → _emergency_close() for manual/override stops
 """
 import asyncio
@@ -18,11 +18,12 @@ from database import (
     close_session,
     create_session,
     get_open_session,
+    get_session_history,
     get_today_pnl,
     log_signal,
     update_session,
 )
-from engine.indicators import compute_all, ema as EMA, rsi as RSI, atr as ATR
+from engine.indicators import compute_all
 from engine.orderflow import OrderFlowAnalyzer
 from exchange.order_executor import OrderExecutor
 from notifications import notify
@@ -38,42 +39,6 @@ def _mode_prefix(trading_mode: str) -> str:
 
 def _ts() -> int:
     return int(time.time())
-
-
-def _find_liquidity_pool(
-    candles_1m: List[Dict],
-    bias: str,
-    entry_price: float,
-    sl_pts: float,
-    cfg,
-) -> float:
-    """
-    Find nearest equal highs (LONG) or equal lows (SHORT) in last 50 1M candles.
-    Equal = two highs/lows within 0.05% of each other.
-    Only looks beyond entry in trade direction.
-    Returns pool price, or entry ± 2×sl_pts if none found.
-    """
-    tolerance_pct = 0.0005
-    lookback = candles_1m[-50:] if len(candles_1m) >= 50 else candles_1m
-
-    if bias == "LONG":
-        highs = sorted(c["high"] for c in lookback if c["high"] > entry_price)
-        for i in range(len(highs) - 1):
-            h1, h2 = highs[i], highs[i + 1]
-            if h2 > 0 and abs(h1 - h2) / h2 <= tolerance_pct:
-                pool = (h1 + h2) / 2
-                if (pool - entry_price) >= sl_pts * cfg.smc_min_rr:
-                    return pool
-        return entry_price + sl_pts * cfg.smc_min_rr
-    else:
-        lows = sorted((c["low"] for c in lookback if c["low"] < entry_price), reverse=True)
-        for i in range(len(lows) - 1):
-            l1, l2 = lows[i], lows[i + 1]
-            if l2 > 0 and abs(l1 - l2) / l2 <= tolerance_pct:
-                pool = (l1 + l2) / 2
-                if (entry_price - pool) >= sl_pts * cfg.smc_min_rr:
-                    return pool
-        return entry_price - sl_pts * cfg.smc_min_rr
 
 
 class TradingEngine:
@@ -146,6 +111,18 @@ class TradingEngine:
         self._prev_indicators: Dict = {}
         self.candles: List[Dict] = []
 
+        # Session state
+        self._session_trades_today: Dict[str, int] = {"london": 0, "ny": 0}
+        self._asian_high: float = 0.0
+        self._asian_low:  float = 999_999_999.0
+        self._asian_date: str   = ""   # "YYYY-MM-DD" of current asian range
+
+        # Key levels cache (recomputed each tick)
+        self._key_levels: List[Dict] = []
+
+        # Pattern state
+        self._last_pattern_candle: int = 0  # candle time of last detected pattern
+
     def reset_for_switch(self) -> None:
         """Reset all per-symbol state when switching to a new symbol."""
         self._last_stop_time    = None
@@ -158,6 +135,13 @@ class TradingEngine:
         self._prev_indicators   = {}
         self.last_signal        = {}
         self._effective_leverage = 1   # re-set by main.py after prepare_symbol()
+        # Session strategy state
+        self._asian_high = 0.0
+        self._asian_low  = 999_999_999.0
+        self._asian_date = ""
+        self._session_trades_today = {"london": 0, "ny": 0}
+        self._key_levels = []
+        self._last_pattern_candle = 0
         logger.info("TradingEngine: state reset for symbol switch")
 
     # ------------------------------------------------------------------
@@ -217,51 +201,6 @@ class TradingEngine:
         self._override_sl_price = None
         logger.info("TradingEngine: level overrides cleared (%s)", reason)
         self._broadcast({"type": "level_overrides_cleared"})
-
-    @staticmethod
-    def _compute_smc_levels(
-        bias: str,
-        entry_price: float,
-        sweep_wick: float,
-        candles_1m: List[Dict],
-        cfg,
-    ) -> Dict:
-        """
-        Compute SL and TP for an SMC trade.
-        SL = sweep_wick ± smc_sl_buffer_pts.
-        TP = nearest equal-high/low liquidity pool, minimum smc_min_rr × SL distance.
-        Returns rr_ratio=0.0 if SL > smc_max_sl_pts (trade rejected).
-        """
-        buf = cfg.smc_sl_buffer_pts
-        if bias == "LONG":
-            sl_price = sweep_wick - buf
-            sl_pts   = entry_price - sl_price
-        else:
-            sl_price = sweep_wick + buf
-            sl_pts   = sl_price - entry_price
-
-        if sl_pts > cfg.smc_max_sl_pts or sl_pts <= 0:
-            return {"sl_price": sl_price, "tp_price": 0.0,
-                    "sl_pts": sl_pts, "tp_pts": 0.0, "rr_ratio": 0.0}
-
-        tp_price = _find_liquidity_pool(candles_1m, bias, entry_price, sl_pts, cfg)
-        tp_pts   = abs(tp_price - entry_price)
-        rr_ratio = tp_pts / sl_pts if sl_pts > 0 else 0.0
-
-        if rr_ratio < cfg.smc_min_rr:
-            tp_price = (entry_price + sl_pts * cfg.smc_min_rr
-                        if bias == "LONG"
-                        else entry_price - sl_pts * cfg.smc_min_rr)
-            tp_pts   = abs(tp_price - entry_price)
-            rr_ratio = cfg.smc_min_rr
-
-        return {
-            "sl_price": sl_price,
-            "tp_price": tp_price,
-            "sl_pts":   sl_pts,
-            "tp_pts":   tp_pts,
-            "rr_ratio": rr_ratio,
-        }
 
     @staticmethod
     def _estimate_fees(qty: float, price: float, taker_fee_pct: float) -> float:
@@ -333,144 +272,368 @@ class TradingEngine:
         self.last_indicators  = compute_all(candles)
 
     # ------------------------------------------------------------------
-    # Main tick — called every N seconds by the scheduler
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # SMC strategy — static detection methods
+    # Session strategy — static helper methods
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _get_15m_bias(candles_15m: List[Dict]) -> str:
+    def _get_session(tz_offset: int = 5) -> str:
         """
-        15M bias: EMA 50 only.
-        Price above EMA50 → LONG, below → SHORT.
-        Within 0.10% of EMA50 → NEUTRAL (ambiguous, skip).
+        Returns current session name based on local time (PKT by default).
+        Asian:  04:00–13:00 local
+        London: 13:00–18:00 local
+        NY:     18:00–23:00 local
+        Off:    23:00–04:00 local
         """
-        if len(candles_15m) < 50:
-            return "NEUTRAL"
-        closes = [c["close"] for c in candles_15m]
-        ema50  = EMA(closes, 50)
-        if ema50 is None:
-            return "NEUTRAL"
-        price    = closes[-1]
-        diff_pct = abs(price - ema50) / ema50 * 100
-        if diff_pct < 0.10:
-            return "NEUTRAL"
-        return "LONG" if price > ema50 else "SHORT"
+        import datetime
+        utc_now   = datetime.datetime.utcnow()
+        local_now = utc_now + datetime.timedelta(hours=tz_offset)
+        hour = local_now.hour
+        if 4 <= hour < 13:
+            return "asian"
+        elif 13 <= hour < 18:
+            return "london"
+        elif 18 <= hour < 23:
+            return "ny"
+        else:
+            return "off"
 
     @staticmethod
-    def _find_5m_zones(
+    def _get_local_date(tz_offset: int = 5) -> str:
+        """Return current local date as YYYY-MM-DD string."""
+        import datetime
+        utc_now   = datetime.datetime.utcnow()
+        local_now = utc_now + datetime.timedelta(hours=tz_offset)
+        return local_now.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _minutes_since_session_open(session: str, tz_offset: int = 5) -> int:
+        """Return minutes elapsed since session open."""
+        import datetime
+        session_opens = {"asian": 4, "london": 13, "ny": 18}
+        if session not in session_opens:
+            return 0
+        utc_now   = datetime.datetime.utcnow()
+        local_now = utc_now + datetime.timedelta(hours=tz_offset)
+        open_hour = session_opens[session]
+        open_time = local_now.replace(hour=open_hour, minute=0, second=0, microsecond=0)
+        if local_now < open_time:
+            open_time -= datetime.timedelta(days=1)
+        return int((local_now - open_time).total_seconds() / 60)
+
+    def _update_asian_range(self, candles_1m: List[Dict], session: str, cfg) -> None:
+        """
+        During Asian session: track rolling high/low from 1M candles.
+        Resets at start of each new Asian session (new day).
+        """
+        today = self._get_local_date(cfg.session_timezone_offset)
+        if today != self._asian_date:
+            self._asian_date = today
+            self._asian_high = 0.0
+            self._asian_low  = 999_999_999.0
+
+        if session != "asian":
+            return
+
+        for c in candles_1m[-10:]:
+            if c["high"] > self._asian_high:
+                self._asian_high = c["high"]
+            if c["low"] < self._asian_low:
+                self._asian_low = c["low"]
+
+    @staticmethod
+    def _compute_key_levels(
+        candles_1d: List[Dict],
         candles_5m: List[Dict],
-        bias: str,
+        asian_high: float,
+        asian_low: float,
+        price: float,
         cfg,
     ) -> List[Dict]:
         """
-        Find Order Blocks and Fair Value Gaps on 5M in the bias direction.
-        Returns up to 3 zones, most recent first.
-        Each zone: {type, high, low, index}
+        Compute all active key levels sorted by distance to price.
+        Returns: [{type, price, dist}, ...]
         """
-        if len(candles_5m) < 5 or bias == "NEUTRAL":
-            return []
+        levels = []
 
-        zones    = []
-        lookback = min(cfg.smc_ob_lookback, len(candles_5m) - 3)
+        # PDH / PDL
+        if len(candles_1d) >= 2:
+            prev_day = candles_1d[-2]
+            levels.append({"type": "PDH", "price": prev_day["high"]})
+            levels.append({"type": "PDL", "price": prev_day["low"]})
 
-        # Average body for displacement check
-        bodies   = [abs(candles_5m[i]["close"] - candles_5m[i]["open"])
-                    for i in range(-lookback, -1)]
-        avg_body = sum(bodies) / len(bodies) if bodies else 0.0
+        # Asian High / Low
+        if asian_high > 0:
+            levels.append({"type": "asian_high", "price": asian_high})
+        if asian_low < 999_999_999.0:
+            levels.append({"type": "asian_low", "price": asian_low})
 
-        # ── Order Blocks ────────────────────────────────────────────────
-        for i in range(-lookback, -2):
-            c    = candles_5m[i]
-            body = abs(c["close"] - c["open"])
-            if body == 0:
-                continue
-            next_c = candles_5m[i + 1]
-            disp   = abs(next_c["close"] - next_c["open"])
-            if avg_body > 0 and disp < avg_body * cfg.smc_ob_strength_mult:
-                continue
-            if bias == "LONG":
-                if c["close"] < c["open"] and next_c["close"] > next_c["open"]:
-                    zones.append({"type": "OB", "high": c["open"],
-                                  "low": c["low"], "index": i})
+        # Round Numbers
+        interval = cfg.session_round_interval
+        if interval == 0:
+            if price > 10_000:
+                interval = 500.0
+            elif price > 1_000:
+                interval = 100.0
+            elif price > 100:
+                interval = 50.0
+            elif price > 10:
+                interval = 5.0
+            elif price > 1:
+                interval = 1.0
             else:
-                if c["close"] > c["open"] and next_c["close"] < next_c["open"]:
-                    zones.append({"type": "OB", "high": c["high"],
-                                  "low": c["open"], "index": i})
+                interval = 0.1
 
-        # ── Fair Value Gaps ──────────────────────────────────────────────
-        min_gap = candles_5m[-1]["close"] * (cfg.smc_fvg_min_gap_pct / 100)
-        for i in range(-lookback, -2):
-            c1 = candles_5m[i]
-            c3 = candles_5m[i + 2]
-            if bias == "LONG":
-                gap = c3["low"] - c1["high"]
-                if gap >= min_gap:
-                    zones.append({"type": "FVG", "high": c3["low"],
-                                  "low": c1["high"], "index": i})
-            else:
-                gap = c1["low"] - c3["high"]
-                if gap >= min_gap:
-                    zones.append({"type": "FVG", "high": c1["low"],
-                                  "low": c3["high"], "index": i})
+        if interval > 0:
+            import math
+            nearest_round = round(price / interval) * interval
+            for multiplier in [-2, -1, 0, 1, 2]:
+                rnd_price = nearest_round + multiplier * interval
+                if rnd_price > 0:
+                    levels.append({"type": "round", "price": rnd_price})
 
-        # Most recent first (highest negative index = closest to -1)
-        zones.sort(key=lambda z: z["index"], reverse=True)
-        return zones[:3]
+        # Previous Session High / Low (last 72 5M candles = ~6 hrs)
+        if len(candles_5m) >= 72:
+            prev_session = candles_5m[-144:-72]
+            if prev_session:
+                ps_high = max(c["high"] for c in prev_session)
+                ps_low  = min(c["low"]  for c in prev_session)
+                levels.append({"type": "prev_session_high", "price": ps_high})
+                levels.append({"type": "prev_session_low",  "price": ps_low})
+
+        max_dist = cfg.session_proximity_pts * 10
+        result = []
+        for lv in levels:
+            dist = abs(lv["price"] - price)
+            if dist <= max_dist:
+                lv["dist"] = dist
+                result.append(lv)
+
+        result.sort(key=lambda x: x["dist"])
+        return result
 
     @staticmethod
-    def _check_1m_trigger(
-        candles_1m: List[Dict],
-        zone: Dict,
-        bias: str,
+    def _get_historical_probability(
+        session: str,
+        asian_high: float,
+        asian_low: float,
+        price: float,
+        history: List[Dict],
     ) -> Dict:
         """
-        Check the last CLOSED 1M candle (candles_1m[-2]) for:
-          1. Liquidity sweep (wick penetrated zone boundary)
-          2. Rejection close (closed back inside/through zone)
-          3. Candle strength (close position in top/bottom 40% of range)
-        Returns {triggered, sweep_wick, reason}.
+        Analyze session history and return probability dict:
+        {direction, probability, sample_size, reason}
         """
-        if len(candles_1m) < 3:
-            return {"triggered": False, "sweep_wick": 0.0,
-                    "reason": "not enough 1M candles"}
-        c    = candles_1m[-2]
-        rng  = c["high"] - c["low"]
-        if rng <= 0:
-            return {"triggered": False, "sweep_wick": 0.0,
-                    "reason": "zero-range candle"}
+        if not history or len(history) < 5:
+            return {"direction": "none", "probability": 0.0,
+                    "sample_size": len(history) if history else 0,
+                    "reason": f"insufficient history ({len(history) if history else 0} records, need 5+)"}
 
-        zh = zone["high"]
-        zl = zone["low"]
+        if session == "london":
+            hunted_high = sum(1 for h in history if h.get("london_hunted") == "asian_high")
+            hunted_low  = sum(1 for h in history if h.get("london_hunted") == "asian_low")
+            total       = hunted_high + hunted_low
 
-        if bias == "LONG":
-            if c["low"] >= zl:
-                return {"triggered": False, "sweep_wick": c["low"],
-                        "reason": f"no sweep — low {c['low']:.6g} >= zone_low {zl:.6g}"}
-            if c["close"] <= zl:
-                return {"triggered": False, "sweep_wick": c["low"],
-                        "reason": f"no rejection — close {c['close']:.6g} <= zone_low {zl:.6g}"}
-            close_pos = (c["close"] - c["low"]) / rng
-            if close_pos < 0.60:
-                return {"triggered": False, "sweep_wick": c["low"],
-                        "reason": f"weak candle — close at {close_pos:.0%} of range (need top 40%)"}
-            return {"triggered": True, "sweep_wick": c["low"],
-                    "reason": "LONG trigger confirmed"}
+            if total == 0:
+                return {"direction": "none", "probability": 0.0,
+                        "sample_size": len(history), "reason": "no hunt data yet"}
+
+            prob_high = hunted_high / total
+            prob_low  = hunted_low  / total
+
+            if asian_high > 0 and abs(price - asian_high) < abs(price - asian_low):
+                if prob_high >= 0.60:
+                    return {"direction": "short", "probability": prob_high,
+                            "sample_size": total,
+                            "reason": f"London hunts Asian high {prob_high:.0%} of time"}
+            else:
+                if prob_low >= 0.60:
+                    return {"direction": "long", "probability": prob_low,
+                            "sample_size": total,
+                            "reason": f"London hunts Asian low {prob_low:.0%} of time"}
+
+            return {"direction": "none",
+                    "probability": max(prob_high, prob_low),
+                    "sample_size": total,
+                    "reason": f"probability too low (high={prob_high:.0%}, low={prob_low:.0%})"}
+
+        elif session == "ny":
+            continuation = sum(1 for h in history if h.get("ny_behavior") == "continuation")
+            reversal     = sum(1 for h in history if h.get("ny_behavior") == "reversal")
+            total        = continuation + reversal
+
+            if total == 0:
+                return {"direction": "none", "probability": 0.0,
+                        "sample_size": len(history), "reason": "no NY behavior data"}
+
+            prob_cont = continuation / total
+            prob_rev  = reversal / total
+
+            if prob_cont >= 0.60:
+                return {"direction": "continuation", "probability": prob_cont,
+                        "sample_size": total,
+                        "reason": f"NY continues London {prob_cont:.0%} of time"}
+            elif prob_rev >= 0.60:
+                return {"direction": "reversal", "probability": prob_rev,
+                        "sample_size": total,
+                        "reason": f"NY reverses London {prob_rev:.0%} of time"}
+
+            return {"direction": "none", "probability": max(prob_cont, prob_rev),
+                    "sample_size": total, "reason": "NY probability insufficient"}
+
+        return {"direction": "none", "probability": 0.0,
+                "sample_size": 0, "reason": f"unknown session: {session}"}
+
+    @staticmethod
+    def _check_candle_pattern(
+        candles_1m: List[Dict],
+        expected_direction: str,
+    ) -> Dict:
+        """
+        Check last CLOSED candle (candles[-2]) for pin bar, engulfing, or inside bar.
+        Returns {pattern, detected, sl_extreme, reason}
+        """
+        if len(candles_1m) < 4:
+            return {"pattern": "none", "detected": False,
+                    "sl_extreme": 0.0, "reason": "not enough candles"}
+
+        c  = candles_1m[-2]
+        c1 = candles_1m[-3]
+
+        candle_range = c["high"] - c["low"]
+        if candle_range <= 0:
+            return {"pattern": "none", "detected": False,
+                    "sl_extreme": 0.0, "reason": "zero range candle"}
+
+        body       = abs(c["close"] - c["open"])
+        body_pct   = body / candle_range
+        upper_wick = c["high"] - max(c["open"], c["close"])
+        lower_wick = min(c["open"], c["close"]) - c["low"]
+
+        # ── Pin Bar ───────────────────────────────────────────────────────
+        if expected_direction == "long":
+            long_lower_wick = lower_wick >= candle_range * 0.60
+            small_body      = body_pct <= 0.30
+            close_high      = (c["close"] - c["low"]) / candle_range >= 0.60
+            if long_lower_wick and small_body and close_high:
+                return {"pattern": "pin_bar", "detected": True,
+                        "sl_extreme": c["low"],
+                        "reason": f"Bullish pin bar — lower wick {lower_wick/candle_range:.0%}"}
         else:
-            if c["high"] <= zh:
-                return {"triggered": False, "sweep_wick": c["high"],
-                        "reason": f"no sweep — high {c['high']:.6g} <= zone_high {zh:.6g}"}
-            if c["close"] >= zh:
-                return {"triggered": False, "sweep_wick": c["high"],
-                        "reason": f"no rejection — close {c['close']:.6g} >= zone_high {zh:.6g}"}
-            close_pos = (c["close"] - c["low"]) / rng
-            if close_pos > 0.40:
-                return {"triggered": False, "sweep_wick": c["high"],
-                        "reason": f"weak candle — close at {close_pos:.0%} of range (need bottom 40%)"}
-            return {"triggered": True, "sweep_wick": c["high"],
-                    "reason": "SHORT trigger confirmed"}
+            long_upper_wick = upper_wick >= candle_range * 0.60
+            small_body      = body_pct <= 0.30
+            close_low       = (c["close"] - c["low"]) / candle_range <= 0.40
+            if long_upper_wick and small_body and close_low:
+                return {"pattern": "pin_bar", "detected": True,
+                        "sl_extreme": c["high"],
+                        "reason": f"Bearish pin bar — upper wick {upper_wick/candle_range:.0%}"}
+
+        # ── Engulfing ─────────────────────────────────────────────────────
+        c1_body_high = max(c1["open"], c1["close"])
+        c1_body_low  = min(c1["open"], c1["close"])
+        c_body_high  = max(c["open"],  c["close"])
+        c_body_low   = min(c["open"],  c["close"])
+
+        if expected_direction == "long":
+            bullish_engulf = (
+                c["close"] > c["open"] and
+                c_body_low  < c1_body_low and
+                c_body_high > c1_body_high
+            )
+            if bullish_engulf:
+                return {"pattern": "engulfing", "detected": True,
+                        "sl_extreme": c["low"],
+                        "reason": "Bullish engulfing — strong momentum shift"}
+        else:
+            bearish_engulf = (
+                c["close"] < c["open"] and
+                c_body_high > c1_body_high and
+                c_body_low  < c1_body_low
+            )
+            if bearish_engulf:
+                return {"pattern": "engulfing", "detected": True,
+                        "sl_extreme": c["high"],
+                        "reason": "Bearish engulfing — strong momentum shift"}
+
+        # ── Inside Bar Breakout ───────────────────────────────────────────
+        c2 = candles_1m[-4] if len(candles_1m) >= 4 else None
+        if c2:
+            mother   = c1
+            inside   = c2
+            breakout = c
+
+            inside_is_inside = (
+                inside["high"] <= mother["high"] and
+                inside["low"]  >= mother["low"]
+            )
+            if inside_is_inside:
+                if expected_direction == "long" and breakout["close"] > mother["high"]:
+                    return {"pattern": "inside_bar", "detected": True,
+                            "sl_extreme": inside["low"],
+                            "reason": f"Inside bar bullish breakout above {mother['high']:.6g}"}
+                elif expected_direction == "short" and breakout["close"] < mother["low"]:
+                    return {"pattern": "inside_bar", "detected": True,
+                            "sl_extreme": inside["high"],
+                            "reason": f"Inside bar bearish breakout below {mother['low']:.6g}"}
+
+        return {"pattern": "none", "detected": False,
+                "sl_extreme": 0.0,
+                "reason": "no pattern detected (pin bar, engulfing, or inside bar)"}
+
+    @staticmethod
+    def _compute_session_levels(
+        direction: str,
+        entry_price: float,
+        sl_extreme: float,
+        key_levels: List[Dict],
+        cfg,
+    ) -> Dict:
+        """
+        Compute SL and TP for session trade.
+        SL: sl_extreme ± cfg.session_sl_buffer_pts
+        TP: next key level beyond entry with R:R >= session_min_rr, else fallback
+        """
+        buf = cfg.session_sl_buffer_pts
+
+        if direction == "long":
+            sl_price = sl_extreme - buf
+            sl_dist  = entry_price - sl_price
+        else:
+            sl_price = sl_extreme + buf
+            sl_dist  = sl_price - entry_price
+
+        if sl_dist <= 0:
+            return {"sl_price": sl_price, "tp_price": 0.0,
+                    "sl_pts": 0.0, "tp_pts": 0.0, "rr_ratio": 0.0}
+
+        tp_price = 0.0
+        for lv in sorted(key_levels, key=lambda x: x["dist"]):
+            if direction == "long" and lv["price"] > entry_price:
+                tp_dist = lv["price"] - entry_price
+                if tp_dist / sl_dist >= cfg.session_min_rr:
+                    tp_price = lv["price"]
+                    break
+            elif direction == "short" and lv["price"] < entry_price:
+                tp_dist = entry_price - lv["price"]
+                if tp_dist / sl_dist >= cfg.session_min_rr:
+                    tp_price = lv["price"]
+                    break
+
+        if tp_price == 0.0:
+            if direction == "long":
+                tp_price = entry_price + sl_dist * cfg.session_min_rr
+            else:
+                tp_price = entry_price - sl_dist * cfg.session_min_rr
+
+        tp_pts   = abs(tp_price - entry_price)
+        rr_ratio = tp_pts / sl_dist if sl_dist > 0 else 0.0
+
+        return {
+            "sl_price": sl_price,
+            "tp_price": tp_price,
+            "sl_pts":   sl_dist,
+            "tp_pts":   tp_pts,
+            "rr_ratio": rr_ratio,
+        }
 
     # ------------------------------------------------------------------
     # Main tick
@@ -482,27 +645,43 @@ class TradingEngine:
         price: float,
         candles_5m: List[Dict],
         candles_15m: List[Dict],
+        candles_1d: List[Dict] = None,
         allow_entry: bool = True,
-        htf_bias: str = "NEUTRAL",   # kept for UI display compat
+        htf_bias: str = "NEUTRAL",
     ) -> None:
-        """Main tick — SMC 3-timeframe: 15M bias | 5M zone | 1M trigger."""
-        bias_15m = self._get_15m_bias(candles_15m)
-        zones_5m = (self._find_5m_zones(candles_5m, bias_15m, cfg)
-                    if bias_15m != "NEUTRAL" else [])
+        """Main tick — Session + Key Level + Pattern strategy."""
+        if candles_1d is None:
+            candles_1d = []
+
+        candles_1m = self.candles
+
+        session = self._get_session(cfg.session_timezone_offset)
+        self._update_asian_range(candles_1m, session, cfg)
+
+        self._key_levels = self._compute_key_levels(
+            candles_1d, candles_5m,
+            self._asian_high, self._asian_low,
+            price, cfg,
+        )
+
+        session_display = session.upper()
+        trades_left = cfg.session_max_trades - self._session_trades_today.get(session, 0)
 
         self.last_signal = {
-            "direction":      bias_15m,
+            "direction":      "NEUTRAL",
             "strength":       0.5,
             "composite":      0.0,
-            "filters_passed": len(zones_5m) > 0,
-            "reason":         f"15M {bias_15m} | {len(zones_5m)} zone(s) on 5M",
+            "filters_passed": session in ("london", "ny"),
+            "reason":         (
+                f"{session_display} | Asian H={self._asian_high:.4g} "
+                f"L={self._asian_low:.4g} | Trades left: {trades_left}"
+            ),
         }
         self._broadcast({"type": "signal", "data": self.last_signal})
 
         if self._session is None:
             if allow_entry:
-                await self._try_entry(cfg, price, bias_15m, zones_5m,
-                                      candles_5m, candles_15m)
+                await self._try_entry(cfg, price, session, candles_5m, candles_1d)
             else:
                 self._broadcast({
                     "type":   "entry_blocked",
@@ -513,168 +692,188 @@ class TradingEngine:
             await self._manage_position(cfg, price)
 
     # ------------------------------------------------------------------
-    # SMC entry
+    # Session entry
     # ------------------------------------------------------------------
 
     async def _try_entry(
         self,
         cfg: BotConfig,
         price: float,
-        bias_15m: str,
-        zones_5m: List[Dict],
+        session: str,
         candles_5m: List[Dict],
-        candles_15m: List[Dict],
+        candles_1d: List[Dict],
     ) -> None:
         """
-        SMC 3-timeframe entry.
-        Gate 1: 15M bias (EMA50)
-        Gate 2: 5M zone (OB or FVG) exists in bias direction
-        Gate 3: 1M trigger (sweep + rejection + strength) on last closed candle
-        Gate 4: SL within max_sl_pts and R:R >= smc_min_rr
+        Session-Aware Pattern entry.
+        Gate 1: Session active (London or NY, past first 5 min, trades remaining)
+        Gate 2: Historical probability >= threshold
+        Gate 3: Key level nearby (within session_proximity_pts)
+        Gate 4: Candle pattern confirmed (pin bar, engulfing, inside bar)
+        Gate 5: R:R >= session_min_rr
         """
-        def _block(reason: str, gates: dict = {}) -> None:
-            self._broadcast({"type": "entry_blocked", "reason": reason,
-                             "gates": gates})
-
         candles_1m = self.candles
-
-        if len(candles_1m) < 10:
-            _block(f"Warming up: {len(candles_1m)}/10 candles")
-            return
-        cooldown_left = cfg.entry_cooldown_s - (time.time() - self._last_exit_time)
-        if cooldown_left > 0:
-            _block(f"Cooldown: {cooldown_left:.0f}s remaining")
-            return
-
-        # ── Gate 1: 15M Bias ─────────────────────────────────────────────
         gates: Dict[str, tuple] = {}
-        if bias_15m == "NEUTRAL":
-            gates["15M BIAS"] = (False, "price too close to EMA50 — wait")
+
+        # ── Gate 1: Session Active ────────────────────────────────────────
+        minutes_open = self._minutes_since_session_open(session, cfg.session_timezone_offset)
+
+        if session == "asian":
+            gates["SESSION"] = (False, "Asian session — observe only, no entries")
+        elif session == "off":
+            gates["SESSION"] = (False, "Off-hours — no trading")
+        elif minutes_open < 5:
+            gates["SESSION"] = (False, f"{session.upper()} open — waiting 5 min (spread wide)")
         else:
-            if len(candles_15m) >= 50:
-                e50 = EMA([c["close"] for c in candles_15m], 50)
-                gates["15M BIAS"] = (True, f"{bias_15m} | EMA50={e50:.6g}")
+            trades_done = self._session_trades_today.get(session, 0)
+            if trades_done >= cfg.session_max_trades:
+                gates["SESSION"] = (False,
+                    f"{session.upper()} max trades reached ({trades_done}/{cfg.session_max_trades})")
             else:
-                gates["15M BIAS"] = (True, bias_15m)
+                remaining = cfg.session_max_trades - trades_done
+                gates["SESSION"] = (True,
+                    f"{session.upper()} | {minutes_open}min open | {remaining} trades left")
 
-        # ── Gate 2: 5M Zone ───────────────────────────────────────────────
-        if not zones_5m:
-            gates["5M ZONE"] = (False,
-                                f"no OB/FVG found in {bias_15m} direction")
-        else:
-            z = zones_5m[0]
-            gates["5M ZONE"] = (True,
-                                f"{z['type']} {z['low']:.6g}–{z['high']:.6g}")
+        # ── Gate 2: Historical Probability ───────────────────────────────
+        history = await get_session_history(cfg.symbol, session, cfg.session_history_bars)
+        prob    = self._get_historical_probability(
+            session, self._asian_high, self._asian_low, price, history
+        )
 
-        # ── Gate 3: 1M Trigger ────────────────────────────────────────────
-        trigger     = {"triggered": False, "sweep_wick": 0.0,
-                       "reason": "no zone to check"}
-        active_zone = None
-        if zones_5m:
-            for zone in zones_5m:
-                t = self._check_1m_trigger(candles_1m, zone, bias_15m)
-                trigger = t
-                if t["triggered"]:
-                    active_zone = zone
-                    break
-        gates["1M TRIGGER"] = (trigger["triggered"], trigger["reason"])
-
-        # ── Gate 4: SL size and R:R ───────────────────────────────────────
-        levels = None
-        if trigger["triggered"] and active_zone:
-            levels = self._compute_smc_levels(
-                bias_15m, price, trigger["sweep_wick"], candles_1m, cfg
+        if prob["probability"] < cfg.session_prob_threshold:
+            gates["PROBABILITY"] = (
+                False,
+                f"{prob['probability']:.0%} < {cfg.session_prob_threshold:.0%} ({prob['reason']})"
             )
-            sl_pts   = levels["sl_pts"]
-            rr_ratio = levels["rr_ratio"]
-            if rr_ratio <= 0 or sl_pts > cfg.smc_max_sl_pts:
-                gates["SL / R:R"] = (False,
-                    f"SL {sl_pts:.1f}pts > max {cfg.smc_max_sl_pts:.0f}pts")
-            elif rr_ratio < cfg.smc_min_rr:
-                gates["SL / R:R"] = (False,
-                    f"R:R {rr_ratio:.2f} < {cfg.smc_min_rr:.1f} minimum")
-            else:
-                gates["SL / R:R"] = (True,
-                    f"SL={sl_pts:.1f}pts  R:R={rr_ratio:.2f}:1")
         else:
-            gates["SL / R:R"] = (False, "waiting for trigger")
+            gates["PROBABILITY"] = (
+                True,
+                f"{prob['probability']:.0%} → {prob['direction'].upper()} ({prob['sample_size']} samples)"
+            )
 
-        # ── Broadcast gate status ─────────────────────────────────────────
-        all_passed   = all(v[0] for v in gates.values())
-        failed_gate  = next((k for k, v in gates.items() if not v[0]), None)
+        expected_dir = "none"
+        if prob["direction"] in ("long", "continuation"):
+            expected_dir = "long"
+        elif prob["direction"] in ("short", "reversal"):
+            expected_dir = "short"
+
+        # ── Gate 3: Key Level Proximity ───────────────────────────────────
+        nearby_level = None
+        for lv in self._key_levels:
+            if lv["dist"] <= cfg.session_proximity_pts:
+                nearby_level = lv
+                break
+
+        if nearby_level is None:
+            if self._key_levels:
+                first = self._key_levels[0]
+                gates["KEY LEVEL"] = (False,
+                    f"no level within {cfg.session_proximity_pts:.0f}pts | nearest: "
+                    f"{first['type']}@{first['price']:.4g} ({first['dist']:.1f}pts)")
+            else:
+                gates["KEY LEVEL"] = (False, "no levels computed")
+        else:
+            gates["KEY LEVEL"] = (True,
+                f"{nearby_level['type']} @ {nearby_level['price']:.4g} "
+                f"({nearby_level['dist']:.1f}pts away)")
+
+        # ── Gate 4: Candle Pattern ────────────────────────────────────────
+        pattern = {"pattern": "none", "detected": False, "sl_extreme": 0.0,
+                   "reason": "waiting for pattern"}
+        if expected_dir != "none" and gates.get("KEY LEVEL", (False,))[0]:
+            pattern = self._check_candle_pattern(candles_1m, expected_dir)
+
+        if pattern["detected"]:
+            gates["PATTERN"] = (True,
+                f"{pattern['pattern'].replace('_', ' ').title()} — {pattern['reason']}")
+        else:
+            gates["PATTERN"] = (False, pattern["reason"])
+
+        # ── Gate 5: R:R Check ─────────────────────────────────────────────
+        levels: Dict = {}
+        if pattern["detected"] and expected_dir != "none":
+            levels = self._compute_session_levels(
+                expected_dir, price, pattern["sl_extreme"],
+                self._key_levels, cfg,
+            )
+            rr = levels.get("rr_ratio", 0.0)
+            if rr < cfg.session_min_rr:
+                gates["R:R"] = (False, f"{rr:.2f} < {cfg.session_min_rr:.1f} minimum")
+            else:
+                gates["R:R"] = (True,
+                    f"{rr:.2f}:1  SL={levels['sl_pts']:.1f}pts  TP→{levels['tp_price']:.4g}")
+        else:
+            gates["R:R"] = (False, "waiting for pattern to compute R:R")
+
+        # ── Broadcast ─────────────────────────────────────────────────────
+        all_passed  = all(v[0] for v in gates.values())
+        failed_gate = next((k for k, v in gates.items() if not v[0]), None)
         broadcast_reason = (
-            f"All gates passed — entering {bias_15m}"
+            f"All gates passed — entering {expected_dir.upper()}"
             if all_passed
             else f"Entry blocked: {failed_gate} — {gates[failed_gate][1]}"
         )
-        self._broadcast({"type": "entry_blocked", "reason": broadcast_reason,
-                         "gates": gates})
+        self._broadcast({
+            "type":   "entry_blocked",
+            "reason": broadcast_reason,
+            "gates":  gates,
+        })
+
         if not all_passed:
+            return
+
+        # ── Cooldown check ────────────────────────────────────────────────
+        if time.time() - self._last_exit_time < cfg.entry_cooldown_s:
             return
 
         # ── Daily loss check ──────────────────────────────────────────────
         if cfg.max_daily_loss_usdt > 0:
             today_pnl = await get_today_pnl()
             if today_pnl < -cfg.max_daily_loss_usdt:
-                self._broadcast({
-                    "type":   "entry_blocked",
-                    "reason": f"Daily loss limit reached ({today_pnl:.2f} USDT)",
-                    "gates":  gates,
-                })
                 return
 
         # ── Place order ───────────────────────────────────────────────────
-        effective_leverage  = (self._effective_leverage
-                               if self._effective_leverage > 0 else cfg.leverage)
+        effective_leverage  = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
         fee_factor          = 1.0 + (cfg.taker_fee_pct / 100)
         fee_adjusted_margin = cfg.margin_usdt / fee_factor
-        qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin,
-                                      effective_leverage, price)
+        qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
-        entry_direction = bias_15m
+        entry_direction = expected_dir.upper()
         if cfg.opposite_entry:
-            entry_direction = "SHORT" if bias_15m == "LONG" else "LONG"
+            entry_direction = "SHORT" if entry_direction == "LONG" else "LONG"
 
         side  = "BUY" if entry_direction == "LONG" else "SELL"
-        order = await self._executor.place_market_order(
-            cfg.symbol, side, qty, current_price=price
-        )
+        order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
         fill_price = float(order.get("avgPrice") or price)
-        order_id   = int(order.get("orderId", 0))
-        if order_id:
-            self._pending_fills[order_id] = {
-                "type": "entry", "prior_qty": 0.0, "prior_avg": 0.0
-            }
 
-        # Recompute levels from fill price using actual entry direction
-        levels = self._compute_smc_levels(
-            entry_direction, fill_price, trigger["sweep_wick"], candles_1m, cfg
+        order_id = int(order.get("orderId", 0))
+        if order_id:
+            self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
+
+        lv = self._compute_session_levels(
+            entry_direction.lower(), fill_price,
+            pattern["sl_extreme"], self._key_levels, cfg,
         )
 
         await create_session(
             symbol=cfg.symbol, direction=entry_direction,
             entry_price=fill_price, qty=qty, margin=cfg.margin_usdt,
             leverage=effective_leverage,
-            entry_reason=(
-                f"smc|{entry_direction}|{active_zone['type']}"
-                + ("|opposite" if cfg.opposite_entry else "")
-            ),
-            signal_strength=0.8, signal_price=price,
+            entry_reason=f"session|{session}|{pattern['pattern']}|{nearby_level['type']}",
+            signal_strength=prob["probability"],
+            signal_price=price,
         )
         self._session         = await get_open_session()
         self._trail_activated = False
         self._trail_price     = None
         self._breakeven_armed = False
 
-        self._scalp_tp_price    = levels["tp_price"]
-        self._scalp_sl_price    = levels["sl_price"]
-        self._scalp_tp_pct      = (abs(levels["tp_price"] - fill_price)
-                                   / fill_price * 100 if fill_price else 0.0)
-        self._scalp_sl_pct      = (abs(levels["sl_price"] - fill_price)
-                                   / fill_price * 100 if fill_price else 0.0)
+        self._scalp_tp_price    = lv["tp_price"]
+        self._scalp_sl_price    = lv["sl_price"]
+        self._scalp_tp_pct      = abs(lv["tp_price"] - fill_price) / fill_price * 100 if fill_price else 0.0
+        self._scalp_sl_pct      = abs(lv["sl_price"] - fill_price) / fill_price * 100 if fill_price else 0.0
         self._scalp_atr_pct     = 0.0
         self._entry_candle_time = self.candles[-1]["time"] if self.candles else 0
 
@@ -686,25 +885,22 @@ class TradingEngine:
             scalp_sl_pct=self._scalp_sl_pct,
             scalp_atr_pct=0.0,
             scalp_entry_candle_time=self._entry_candle_time,
-            smc_zone_type=active_zone["type"],
-            smc_zone_high=active_zone["high"],
-            smc_zone_low=active_zone["low"],
-            smc_sweep_low=trigger["sweep_wick"],
         )
 
-        rr = levels["rr_ratio"]
+        self._session_trades_today[session] = self._session_trades_today.get(session, 0) + 1
+
+        rr  = lv["rr_ratio"]
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
-            f"SMC {entry_direction} @ {fill_price:.6g}  "
-            + (f"[signal={bias_15m}→FLIPPED]  " if cfg.opposite_entry else "")
-            + f"TP={self._scalp_tp_price:.6g} (+{self._scalp_tp_pct:.2f}%)  "
+            f"SESSION {entry_direction} @ {fill_price:.6g}  "
+            f"TP={self._scalp_tp_price:.6g} (+{self._scalp_tp_pct:.2f}%)  "
             f"SL={self._scalp_sl_price:.6g} (-{self._scalp_sl_pct:.2f}%)  "
-            f"R:R={rr:.2f}  Zone={active_zone['type']}"
+            f"R:R={rr:.2f}  {session.upper()} | {pattern['pattern']} | {prob['probability']:.0%}"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("open", direction=entry_direction, price=fill_price,
-                      qty=qty, symbol=cfg.symbol, mode=cfg.trading_mode,
+        self._pos_log("open", direction=entry_direction, price=fill_price, qty=qty,
+                      symbol=cfg.symbol, mode=cfg.trading_mode,
                       tp=self._scalp_tp_price, sl=self._scalp_sl_price, rr=rr)
         self._push_session()
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
@@ -712,8 +908,9 @@ class TradingEngine:
             "price": fill_price, "margin": cfg.margin_usdt,
             "tp_price": self._scalp_tp_price, "sl_price": self._scalp_sl_price,
             "rr_ratio": rr, "trading_mode": cfg.trading_mode,
-            "zone_type": active_zone["type"],
+            "session": session, "pattern": pattern["pattern"],
         })
+
     # ------------------------------------------------------------------
     # Position management — 3 exits: TP / SL / time
     # ------------------------------------------------------------------

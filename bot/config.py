@@ -94,13 +94,15 @@ class BotConfig:
     breakout_flow_min:      float
     opposite_entry:         bool
 
-    # SMC strategy parameters
-    smc_sl_buffer_pts:   float
-    smc_max_sl_pts:      float
-    smc_min_rr:          float
-    smc_ob_lookback:     int
-    smc_fvg_min_gap_pct: float
-    smc_ob_strength_mult: float
+    # Session + Key Level + Pattern strategy parameters
+    session_proximity_pts:   float
+    session_prob_threshold:  float
+    session_max_trades:      int
+    session_sl_buffer_pts:   float
+    session_min_rr:          float
+    session_history_bars:    int
+    session_round_interval:  float
+    session_timezone_offset: int
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -213,12 +215,14 @@ async def load_config() -> BotConfig:
         breakout_vol_pace_min=_f("breakout_vol_pace_min", 2.0),
         breakout_flow_min=_f("breakout_flow_min", 0.25),
         opposite_entry=_b("opposite_entry", False),
-        smc_sl_buffer_pts=_f("smc_sl_buffer_pts", 3.0),
-        smc_max_sl_pts=_f("smc_max_sl_pts", 15.0),
-        smc_min_rr=_f("smc_min_rr", 2.0),
-        smc_ob_lookback=_i("smc_ob_lookback", 30),
-        smc_fvg_min_gap_pct=_f("smc_fvg_min_gap_pct", 0.05),
-        smc_ob_strength_mult=_f("smc_ob_strength_mult", 1.5),
+        session_proximity_pts=_f("session_proximity_pts", 25.0),
+        session_prob_threshold=_f("session_prob_threshold", 0.60),
+        session_max_trades=_i("session_max_trades", 2),
+        session_sl_buffer_pts=_f("session_sl_buffer_pts", 4.0),
+        session_min_rr=_f("session_min_rr", 2.0),
+        session_history_bars=_i("session_history_bars", 30),
+        session_round_interval=_f("session_round_interval", 0.0),
+        session_timezone_offset=_i("session_timezone_offset", 5),
         api_key=api_key,
         api_secret=api_secret,
     )
