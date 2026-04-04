@@ -124,6 +124,17 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "strength_sizing":       "1",
     "strength_size_min":     "0.5",
     "stoch_signal":          "1",
+    # Scalping config fields
+    "sl_pct_min":            "0.20",
+    "sl_pct_max":            "0.60",
+    "tp_pct_min":            "0.40",
+    "tp_pct_max":            "1.20",
+    "min_rr_ratio":          "2.0",
+    "max_hold_candles":      "8",
+    "entry_cooldown_s":      "60",
+    "min_body_ratio":        "0.45",
+    "min_vol_ratio":         "1.30",
+    "min_flow_score":        "0.15",
 }
 
 
@@ -166,6 +177,13 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("entry_adaptive",       "TEXT"),
         ("trail_pct_mult",       "REAL DEFAULT 1.0"),
         ("margin_envelope",      "REAL DEFAULT 0.0"),
+        # Scalping: locked TP/SL prices for restart recovery
+        ("scalp_tp_price",       "REAL"),
+        ("scalp_sl_price",       "REAL"),
+        ("scalp_tp_pct",         "REAL"),
+        ("scalp_sl_pct",         "REAL"),
+        ("scalp_atr_pct",        "REAL"),
+        ("scalp_entry_candle_time", "INTEGER DEFAULT 0"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")

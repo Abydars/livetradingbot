@@ -568,26 +568,23 @@
     #sig-strength { font-size: 12px; }
     #sig-reason   { font-size: 10px; color: var(--muted); margin-bottom: 8px; line-height: 1.4; }
 
-    .sbar { margin-bottom: 5px; }
-    .sbar-hd {
+    /* ── Scalp gate rows ── */
+    #sig-gates { margin-top: 6px; }
+    .gate-row {
       display: flex;
-      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--border);
       font-size: 10px;
-      color: var(--muted);
-      margin-bottom: 2px;
     }
-    .sbar-track {
-      position: relative;
-      height: 5px;
-      background: var(--bg2);
-      border: 1px solid var(--border);
-    }
-    .sbar-mid {
-      position: absolute;
-      left: 50%; top: 0;
-      width: 1px; height: 100%;
-      background: var(--border);
-    }
+    .gate-icon { font-size: 12px; width: 14px; text-align: center; }
+    .gate-name { flex: 1; color: var(--muted); font-weight: 600; letter-spacing: 0.3px; }
+    .gate-val  { font-size: 10px; color: var(--text); min-width: 55px; text-align: right; }
+    .gate-row.pass .gate-icon { color: var(--green); }
+    .gate-row.pass .gate-name { color: var(--text); }
+    .gate-row.fail .gate-icon { color: var(--red); }
+    .gate-row.fail .gate-name { color: var(--red); opacity: 0.8; }
     .sbar-fill {
       position: absolute;
       top: 0; height: 100%;
@@ -1262,28 +1259,15 @@
         <span id="scanner-badge" class="scanner-badge momentum" title="Active scanner type"></span>
       </div>
       <div id="sig-reason">Waiting…</div>
-      <div id="sig-bars">
-        <!-- 5 component bars rendered by JS -->
-        <div class="sbar" id="sb-flow">
-          <div class="sbar-hd"><span>FLOW</span><span id="sv-flow">0.00</span></div>
-          <div class="sbar-track"><div class="sbar-mid"></div><div class="sbar-fill" id="sf-flow"></div></div>
-        </div>
-        <div class="sbar" id="sb-trend">
-          <div class="sbar-hd"><span>TREND</span><span id="sv-trend">0.00</span></div>
-          <div class="sbar-track"><div class="sbar-mid"></div><div class="sbar-fill" id="sf-trend"></div></div>
-        </div>
-        <div class="sbar" id="sb-momentum">
-          <div class="sbar-hd"><span>MOMENTUM</span><span id="sv-momentum">0.00</span></div>
-          <div class="sbar-track"><div class="sbar-mid"></div><div class="sbar-fill" id="sf-momentum"></div></div>
-        </div>
-        <div class="sbar" id="sb-mean_rev">
-          <div class="sbar-hd"><span>MEAN REV</span><span id="sv-mean_rev">0.00</span></div>
-          <div class="sbar-track"><div class="sbar-mid"></div><div class="sbar-fill" id="sf-mean_rev"></div></div>
-        </div>
-        <div class="sbar" id="sb-rsi">
-          <div class="sbar-hd"><span>RSI</span><span id="sv-rsi">0.00</span></div>
-          <div class="sbar-track"><div class="sbar-mid"></div><div class="sbar-fill" id="sf-rsi"></div></div>
-        </div>
+      <!-- Scalp gate status — updated by updateSignalPanel() -->
+      <div id="sig-gates">
+        <div class="gate-row" id="gate-CANDLE_STRUCTURE"><span class="gate-icon">–</span><span class="gate-name">CANDLE STRUCTURE</span><span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-VOLUME">          <span class="gate-icon">–</span><span class="gate-name">VOLUME</span>          <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-EMA_STACK">       <span class="gate-icon">–</span><span class="gate-name">EMA STACK</span>       <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-ORDER_FLOW">      <span class="gate-icon">–</span><span class="gate-name">ORDER FLOW</span>      <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-RSI_ZONE">        <span class="gate-icon">–</span><span class="gate-name">RSI ZONE</span>        <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-ATR_RANGE">       <span class="gate-icon">–</span><span class="gate-name">ATR RANGE</span>       <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-RR_RATIO">        <span class="gate-icon">–</span><span class="gate-name">R:R RATIO</span>       <span class="gate-val"></span></div>
       </div>
     </section>
 
@@ -1364,9 +1348,6 @@ let curTrailPrice  = null;
 let curTrailActive = false;
 let curTpPrice  = null;
 let curSlPrice  = null;
-let curRescueMode       = false;
-let curRescueTrailPrice = null;
-let curMarginEnvelope   = 0;
 let configData     = {};
 
 // Manual level overrides — set by arrow buttons, cleared on position change
@@ -1435,8 +1416,8 @@ let _tpLine    = null;
 let _slLine    = null;
 let _trailLine = null;
 let _hedgeLines = [];   // one price line per open hedge
-let _dcaLines   = [];   // DCA trigger level lines on chart
-let _rescueLine = null; // rescue trail price line on chart
+let _dcaLines   = [];
+let _rescueLine = null;
 
 // entry/exit markers [ {time, position, color, shape, text} ]
 let _markers = [];
@@ -1731,10 +1712,15 @@ function dispatch(msg) {
     }
 
     case 'signal':
-      if (msg.data) updateSignalPanel(msg.data);
+      if (msg.data) { window._lastSig = msg.data; updateSignalPanel(msg.data); }
       break;
     case 'entry_blocked':
       if (msg.reason) updateEntryBlockedReason(msg.reason);
+      // Store gate status for signal panel
+      if (msg.gates) {
+        window._lastGates = msg.gates;
+        updateSignalPanel(window._lastSig || {});
+      }
       break;
 
     case 'level_overrides_cleared':
@@ -1748,42 +1734,17 @@ function dispatch(msg) {
       const nowOpen  = msg.session?.status === 'open';
       window._sessionOpen = nowOpen;
       curSession     = msg.session;
-      curHedges      = msg.hedges || [];
+      curHedges      = [];
       curTrailPrice  = msg.trail_price  ?? null;
       curTrailActive = !!msg.trail_active;
-      curTpPrice          = msg.tp_price  ?? null;
-      curSlPrice          = msg.sl_price  ?? null;
-      curRescueMode       = msg.rescue_mode        ?? false;
-      curRescueTrailPrice = msg.rescue_trail_price ?? null;
-      curMarginEnvelope   = msg.margin_envelope    ?? 0;
-      // Draw rescue trail price line
-      if (_rescueLine) { _removeLine(_rescueLine); _rescueLine = null; }
-      if (msg.rescue_mode && msg.rescue_trail_price && csSeries) {
-        _rescueLine = csSeries.createPriceLine({
-          price:            msg.rescue_trail_price,
-          color:            'rgba(245,158,11,0.70)',
-          lineWidth:        1,
-          lineStyle:        LightweightCharts.LineStyle.Dashed,
-          axisLabelVisible: true,
-          title:            'RESCUE',
-        });
-      }
-      // Draw DCA level lines
-      _dcaLines.forEach(l => _removeLine(l));
-      _dcaLines = [];
-      if (msg.dca_prices?.length && csSeries) {
-        msg.dca_prices.forEach((p, i) => {
-          const line = csSeries.createPriceLine({
-            price:            p,
-            color:            'rgba(240,180,41,0.50)',
-            lineWidth:        1,
-            lineStyle:        LightweightCharts.LineStyle.Dashed,
-            axisLabelVisible: true,
-            title:            i === 0 ? 'DCA 1' : i === 1 ? 'DCA 2' : 'DCA 3',
-          });
-          _dcaLines.push(line);
-        });
-      }
+      curTpPrice     = msg.tp_price  ?? null;
+      curSlPrice     = msg.sl_price  ?? null;
+      // Scalp metrics
+      window._curScalpTpPct     = msg.scalp_tp_pct     ?? 0;
+      window._curScalpSlPct     = msg.scalp_sl_pct     ?? 0;
+      window._curScalpAtrPct    = msg.scalp_atr_pct    ?? 0;
+      window._curElapsedCandles = msg.elapsed_candles  ?? 0;
+      window._curMaxCandles     = window._cfgMaxHoldCandles ?? 8;
       // Sync manual overrides from engine (keeps other tabs in sync too)
       if (msg.override_tp_price !== undefined) _overrideTpPrice = msg.override_tp_price;
       if (msg.override_sl_price !== undefined) _overrideSlPrice = msg.override_sl_price;
@@ -1825,6 +1786,7 @@ function dispatch(msg) {
     case 'config':
       configData = msg.config || {};
       renderConfig(configData);
+      if (configData.max_hold_candles) window._cfgMaxHoldCandles = parseInt(configData.max_hold_candles) || 8;
       // Show/hide Scan Now button based on TV scanner mode
       const scanNowBtn = document.getElementById('scan-now-btn');
       if (scanNowBtn) {
@@ -2127,9 +2089,8 @@ function clearTradeLevels() {
   _trailLine = _removeLine(_trailLine);
   _hedgeLines.forEach(l => _removeLine(l));
   _hedgeLines = [];
-  _dcaLines.forEach(l => _removeLine(l));
   _dcaLines = [];
-  if (_rescueLine) { _removeLine(_rescueLine); _rescueLine = null; }
+  _rescueLine = null;
 }
 
 function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
@@ -2331,39 +2292,32 @@ function updateSignalPanel(sig) {
     }
   }
 
-  // Scanner type badge
-  const scanBadge = document.getElementById('scanner-badge');
-  if (scanBadge) {
-    const stype = sig.scanner_type || 'momentum';
-    scanBadge.className = 'scanner-badge ' + stype;
-    scanBadge.textContent = stype === 'breakout' ? 'BREAKOUT'
-      : stype === 'trendpull' ? 'TREND↗'
-      : stype === 'breakdown' ? 'BRKDWN↘'
-      : '';
-    scanBadge.title = 'Signal weights: ' + stype;
-  }
-
-  // Component bars: each value is -1 … +1
-  const comps = sig.components || {};
-  for (const key of ['flow', 'trend', 'momentum', 'mean_rev', 'rsi']) {
-    const v    = comps[key] ?? 0;
-    const valEl = document.getElementById(`sv-${key}`);
-    const barEl = document.getElementById(`sf-${key}`);
-    if (!valEl || !barEl) continue;
-
-    valEl.textContent = (v >= 0 ? '+' : '') + v.toFixed(2);
-    valEl.style.color = v > 0 ? '#3fb950' : v < 0 ? '#f85149' : '#586069';
-
-    // bar fills from centre (50%) outward
-    const pct = Math.min(Math.abs(v), 1) * 50;   // 0–50 %
-    if (v >= 0) {
-      barEl.style.left       = '50%';
-      barEl.style.width      = pct + '%';
-      barEl.style.background = '#3fb950';
+  // Gate status rows — updated from entry_blocked or signal messages
+  // Gates are tracked in window._lastGates (set by entry_blocked handler)
+  const gateMap = window._lastGates || {};
+  const gateIds = {
+    'CANDLE STRUCTURE': 'CANDLE_STRUCTURE',
+    'VOLUME':           'VOLUME',
+    'EMA STACK':        'EMA_STACK',
+    'ORDER FLOW':       'ORDER_FLOW',
+    'RSI ZONE':         'RSI_ZONE',
+    'ATR RANGE':        'ATR_RANGE',
+    'R:R RATIO':        'RR_RATIO',
+  };
+  for (const [name, id] of Object.entries(gateIds)) {
+    const row = document.getElementById('gate-' + id);
+    if (!row) continue;
+    const icon = row.querySelector('.gate-icon');
+    const val  = row.querySelector('.gate-val');
+    if (name in gateMap) {
+      const [passed, value] = gateMap[name];
+      row.className   = 'gate-row ' + (passed ? 'pass' : 'fail');
+      icon.textContent = passed ? '✓' : '✗';
+      val.textContent  = value || '';
     } else {
-      barEl.style.left       = (50 - pct) + '%';
-      barEl.style.width      = pct + '%';
-      barEl.style.background = '#f85149';
+      row.className    = 'gate-row';
+      icon.textContent = '–';
+      val.textContent  = '';
     }
   }
 }
@@ -2393,126 +2347,66 @@ function updatePositionPanel() {
     : '';
 
   // PnL at each level
-  const tpPnl  = levelPnL(tpPrice);
-  const slPnl  = levelPnL(slPrice);
-  const fmtLvlPnl = (pnl, cls) =>
-    pnl !== null ? `<span class="level-pnl ${pnl >= 0 ? 'cg' : 'cr'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toFixed(2)}</span>` : '';
+  // Scalp levels
+  const scalp_tp_pct  = window._curScalpTpPct  ?? 0;
+  const scalp_sl_pct  = window._curScalpSlPct  ?? 0;
+  const scalp_atr_pct = window._curScalpAtrPct ?? 0;
+  const rr = scalp_sl_pct > 0 ? (scalp_tp_pct / scalp_sl_pct).toFixed(2) : '—';
+  const elapsedCandles = window._curElapsedCandles ?? 0;
+  const maxCandles     = window._curMaxCandles ?? 8;
 
-  const tpRow = `<div class="pr">
-    <span class="prk">Trail Arm</span>
+  const tpRow = tpPrice != null ? `<div class="pr">
+    <span class="prk" style="color:var(--green)">TP</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('tp',-1)">▼</button>
       <span style="color:var(--green)">${fmtPrice(tpPrice)}</span>
-      ${fmtLvlPnl(tpPnl)}
+      <span style="font-size:9px;opacity:.7">(+${scalp_tp_pct.toFixed(2)}%)</span>
       <button class="btn-adj" onclick="adjustLevel('tp',+1)">▲</button>
     </span>
-  </div>`;
+  </div>` : '';
 
   const slRow = slPrice != null ? `<div class="pr">
-    <span class="prk">Last Resort SL</span>
+    <span class="prk" style="color:var(--red)">SL</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
       <span style="color:var(--red)">${fmtPrice(slPrice)}</span>
-      ${fmtLvlPnl(slPnl)}
+      <span style="font-size:9px;opacity:.7">(-${scalp_sl_pct.toFixed(2)}%)</span>
       <button class="btn-adj" onclick="adjustLevel('sl',+1)">▲</button>
     </span>
   </div>` : '';
 
-  // SL proximity warning
-  let slProximityWarning = '';
-  if (curSlPrice && lastPrice && curSession) {
-    const avg = curSession.avg_price;
-    const lev = curSession.leverage || 1;
-    const liqPct    = (1.0 / lev) * 100;
-    const slPct     = liqPct * 0.80;
-    const cutoffPct = slPct * 0.80;
-    const pricePct  = curSession.direction === 'LONG'
-      ? (lastPrice - avg) / avg * 100
-      : (avg - lastPrice) / avg * 100;
-    if (pricePct <= -cutoffPct) {
-      slProximityWarning = `<div style="font-size:9px;color:var(--amber,#f59e0b);text-align:right;margin-top:2px">⚠ DCA blocked near SL</div>`;
-    }
-  }
-
-  // Rescue mode row
-  const rescueRow = curRescueMode
-    ? `<div class="pr">
-         <span class="prk" style="color:var(--amber,#f59e0b)">⚠ Rescue Trail</span>
-         <span class="prv" style="color:var(--amber,#f59e0b)">
-           ${curRescueTrailPrice ? fmtPrice(curRescueTrailPrice) : 'armed'}
-         </span>
-       </div>`
-    : '';
-
-  // Margin envelope progress bar
-  const envelope   = curMarginEnvelope ?? 0;
-  const marginUsed = s.margin ?? 0;
-  const envPct     = envelope > 0 ? Math.min(marginUsed / envelope * 100, 100) : 0;
-  const envColor   = envPct >= 80 ? 'var(--red)' : envPct >= 55 ? 'var(--amber,#f59e0b)' : 'var(--green)';
-  const envelopeRow = envelope > 0
-    ? `<div class="pr">
-         <span class="prk">Margin Used</span>
-         <span class="prv" style="color:${envColor}">
-           $${marginUsed.toFixed(2)} / $${envelope.toFixed(2)}
-           <span style="font-size:9px;opacity:.7">(${envPct.toFixed(0)}%)</span>
-         </span>
-       </div>
-       <div style="height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin:2px 0 4px">
-         <div style="height:100%;width:${envPct}%;background:${envColor};border-radius:2px;transition:width .3s"></div>
-       </div>`
-    : '';
+  // Time left progress bar
+  const timeBarPct = maxCandles > 0 ? Math.min(elapsedCandles / maxCandles * 100, 100) : 0;
+  const timeColor  = timeBarPct >= 80 ? 'var(--red)' : timeBarPct >= 55 ? 'var(--amber,#f59e0b)' : 'var(--muted)';
+  const timeRow = `<div class="pr">
+    <span class="prk">Time Left</span>
+    <span class="prv" style="color:${timeColor}">${elapsedCandles}/${maxCandles} candles</span>
+  </div>
+  <div style="height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin:2px 0 4px">
+    <div style="height:100%;width:${timeBarPct}%;background:${timeColor};border-radius:2px;transition:width .3s"></div>
+  </div>`;
 
   posEl.innerHTML = `
-    ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
-    ${pr('Symbol',       s.symbol || currentSymbol)}
-    ${s.signal_price ? pr('Signal Price', fmtPrice(s.signal_price)) : ''}
-    ${pr('Entry Price',  fmtPrice(s.entry_price))}
-    ${pr('Avg Price',    fmtPrice(s.avg_price))}
+    ${pr('Direction',   `<span class="prv ${dir}">${s.direction}</span>`)}
+    ${pr('Symbol',      s.symbol || currentSymbol)}
+    ${pr('Entry',       fmtPrice(s.entry_price))}
     ${tpRow}
     ${slRow}
-    ${slProximityWarning}
-    ${rescueRow}
+    ${pr('R:R',         rr + ':1')}
+    ${scalp_atr_pct > 0 ? pr('ATR', scalp_atr_pct.toFixed(2) + '%') : ''}
+    ${timeRow}
     ${trailRow}
-    ${pr('Qty',       s.qty)}
-    ${envelopeRow}
-    ${pr('Leverage',  s.leverage + 'x')}
-    ${pr('DCA #',     s.dca_count)}
-    ${pr('Hedge #',   s.hedge_count)}
-    ${pr('Duration',  fmtDur(elapsed))}
+    ${pr('Qty',         s.qty)}
+    ${pr('Margin',      '$' + (s.margin ?? 0).toFixed(2))}
+    ${pr('Leverage',    s.leverage + 'x')}
+    ${pr('Duration',    fmtDur(elapsed))}
     <div id="pos-pnl-row" class="pr"><span class="prk">Unrealised PnL</span><span class="prv" id="pos-pnl">--</span></div>
     <button id="btn-close-pos" onclick="closePosition()">✕ CLOSE POSITION</button>
   `;
 
   refreshPnL();
 
-  // Hedges
-  const openHedges = curHedges.filter(h => h.status === 'open');
-  if (openHedges.length) {
-    hedgeCard.style.display = 'block';
-    hedgeEl.innerHTML = openHedges.map((h, i) => {
-      const hdir = h.direction === 'LONG' ? 'long' : 'short';
-      const hPnl = lastPrice
-        ? (h.direction === 'LONG'
-            ? (lastPrice - h.entry_price) * h.qty
-            : (h.entry_price - lastPrice) * h.qty)
-        : null;
-      const hPnlTxt = hPnl !== null
-        ? `${hPnl >= 0 ? '+' : ''}$${hPnl.toFixed(2)}`
-        : '--';
-      const hPnlCls = hPnl !== null ? (hPnl >= 0 ? 'cg' : 'cr') : '';
-      const elapsed = h.open_time ? (Date.now() / 1000 - h.open_time) : 0;
-      return `<div class="hedge-box">
-        <div class="pr"><span class="prk">Hedge #${i + 1}</span><span class="prv ${hdir}">${h.direction}</span></div>
-        ${pr('Entry',    fmtPrice(h.entry_price))}
-        ${pr('Qty',      h.qty)}
-        ${pr('Margin',   '$' + h.margin.toFixed(2))}
-        ${pr('Duration', fmtDur(elapsed))}
-        <div class="pr"><span class="prk">Unreal PnL</span><span class="prv hedge-pnl ${hPnlCls}" data-dir="${h.direction}" data-entry="${h.entry_price}" data-qty="${h.qty}">${hPnlTxt}</span></div>
-      </div>`;
-    }).join('');
-  } else {
-    hedgeCard.style.display = 'none';
-  }
+  hedgeCard.style.display = 'none';
 }
 
 function refreshPnL() {
@@ -2862,47 +2756,44 @@ const TF_OPTIONS = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1
 
 const CFG_SCHEMA = [
   { section: 'Trading', fields: [
-    { key: 'leverage',          label: 'Leverage',            type: 'number' },
-    { key: 'margin_usdt',       label: 'Margin (USDT)',       type: 'number' },
-    { key: 'max_dca',            label: 'Max DCA',              type: 'number' },
-    { key: 'smart_dca_gate',    label: 'Smart DCA Gate',       type: 'toggle' },
-    { key: 'smart_dca_signals', label: 'DCA Reversal Signals', type: 'number' },
-    { key: 'dca_multiplier',    label: 'DCA Multiplier',       type: 'number' },
-    { key: 'max_re_hedge',      label: 'Max Re-hedges',        type: 'number' },
-    { key: 'partial_tp',        label: 'Partial TP',          type: 'toggle' },
-    { key: 'partial_tp_ratio',  label: 'Partial TP Ratio',    type: 'number' },
+    { key: 'leverage',         label: 'Leverage',           type: 'number' },
+    { key: 'margin_usdt',      label: 'Margin (USDT)',      type: 'number' },
+    { key: 'partial_tp',       label: 'Partial TP Trail',   type: 'toggle' },
+    { key: 'partial_tp_ratio', label: 'Partial TP Ratio',   type: 'number' },
   ]},
-  { section: 'Signal', fields: [
-    { key: 'min_signal_strength', label: 'Min Signal Strength', type: 'number' },
-    { key: 'htf_filter',          label: 'HTF Filter',          type: 'toggle' },
-    { key: 'htf_timeframe', label: 'HTF Timeframe (empty=auto)', type: 'text' },
-    { key: 'strength_sizing',     label: 'Strength Sizing',     type: 'toggle' },
-    { key: 'strength_size_min',   label: 'Min Size Scale',      type: 'number' },
+  { section: 'Scalping', fields: [
+    { key: 'sl_pct_min',       label: 'SL Min (%)',         type: 'number' },
+    { key: 'sl_pct_max',       label: 'SL Max (%)',         type: 'number' },
+    { key: 'tp_pct_min',       label: 'TP Min (%)',         type: 'number' },
+    { key: 'tp_pct_max',       label: 'TP Max (%)',         type: 'number' },
+    { key: 'min_rr_ratio',     label: 'Min R:R Ratio',      type: 'number' },
+    { key: 'max_hold_candles', label: 'Max Hold (candles)', type: 'number' },
+    { key: 'entry_cooldown_s', label: 'Entry Cooldown (s)', type: 'number' },
+    { key: 'min_body_ratio',   label: 'Min Body Ratio',     type: 'number' },
+    { key: 'min_vol_ratio',    label: 'Min Volume Ratio',   type: 'number' },
+    { key: 'min_flow_score',   label: 'Min Flow Score',     type: 'number' },
   ]},
   { section: 'Risk', fields: [
-    { key: 'breakeven_stop',        label: 'Breakeven Stop',         type: 'toggle' },
-    { key: 'last_resort_sl_buffer', label: 'Last Resort SL Buffer',  type: 'number' },
-    { key: 'cooldown_after_stop_s', label: 'Stop Cooldown (s)',      type: 'number' },
-    { key: 'max_daily_loss_usdt',   label: 'Max Daily Loss (USDT)',  type: 'number' },
-    { key: 'taker_fee_pct',         label: 'Taker Fee (%)',          type: 'number' },
-    { key: 'paper_slippage_pct',    label: 'Paper Slippage (%)',     type: 'number' },
+    { key: 'cooldown_after_stop_s', label: 'Stop Cooldown (s)',     type: 'number' },
+    { key: 'max_daily_loss_usdt',   label: 'Max Daily Loss (USDT)', type: 'number' },
+    { key: 'taker_fee_pct',         label: 'Taker Fee (%)',         type: 'number' },
+    { key: 'paper_slippage_pct',    label: 'Paper Slippage (%)',    type: 'number' },
+  ]},
+  { section: 'Filter', fields: [
+    { key: 'htf_filter',    label: 'HTF Filter',              type: 'toggle' },
+    { key: 'htf_timeframe', label: 'HTF Timeframe (empty=auto)', type: 'text' },
   ]},
   { section: 'System', fields: [
-    { key: 'trading_mode',     label: 'Trading Mode',             type: 'select', options: ['paper','demo','live'] },
-    { key: 'auto_switch',      label: 'Auto Symbol Switch',       type: 'toggle' },
-    { key: 'scan_interval_s',  label: 'Scan Interval (s)',        type: 'number' },
-    { key: 'flow_warmup_mult', label: 'Flow Warmup Multiplier',   type: 'number' },
-    { key: 'auto_leverage',      label: 'Auto Leverage (ATR-based)', type: 'toggle' },
-    { key: 'signal_persist_ticks', label: 'Signal Persist Ticks (0=off)', type: 'number' },
-    { key: 'switch_threshold', label: 'Switch Threshold (ratio)', type: 'number' },
+    { key: 'trading_mode',      label: 'Trading Mode',            type: 'select', options: ['paper','demo','live'] },
+    { key: 'auto_switch',       label: 'Auto Symbol Switch',      type: 'toggle' },
+    { key: 'scan_interval_s',   label: 'Scan Interval (s)',       type: 'number' },
+    { key: 'auto_leverage',     label: 'Auto Leverage',           type: 'toggle' },
+    { key: 'switch_threshold',  label: 'Switch Threshold (ratio)', type: 'number' },
     { key: 'entry_wait_candles', label: 'Entry Wait (candles)',   type: 'number' },
-    { key: 'scanner_top_n',    label: 'Scanner Top N',            type: 'number' },
-    { key: 'tv_scanner_enabled', label: 'TradingView Scanner',       type: 'toggle' },
-    { key: 'tv_secret',          label: 'TV Webhook Secret',         type: 'text'   },
-    { key: 'scanner_momentum',  label: 'Scanner: Momentum',        type: 'toggle' },
-    { key: 'scanner_breakout',  label: 'Scanner: Breakout',        type: 'toggle' },
-    { key: 'scanner_trendpull', label: 'Scanner: Trend Pullback',  type: 'toggle' },
-    { key: 'discord_webhook',  label: 'Discord Webhook',          type: 'text', wide: true },
+    { key: 'scanner_top_n',     label: 'Scanner Top N',           type: 'number' },
+    { key: 'tv_scanner_enabled', label: 'TradingView Scanner',    type: 'toggle' },
+    { key: 'tv_secret',          label: 'TV Webhook Secret',      type: 'text'   },
+    { key: 'discord_webhook',   label: 'Discord Webhook',         type: 'text', wide: true },
   ]},
 ];
 

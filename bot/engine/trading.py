@@ -1,13 +1,12 @@
 """
-engine/trading.py — DCA + Hedge state machine.
+engine/trading.py — Scalping state machine.
 
 State flow:
-  IDLE → open_main() → MAIN_OPEN
-  MAIN_OPEN → price adverse → dca() (up to max_dca)
-  MAIN_OPEN → price adverse beyond hedge_trigger → open_hedge()
-  HEDGE_OPEN → price recovers → close_hedge()
-  MAIN_OPEN/HEDGE_OPEN → TP hit → close_all()
-  Any state → hard_stop hit → emergency_close()
+  IDLE → _try_entry() [7 gates pass] → SCALP_OPEN
+  SCALP_OPEN → price >= scalp_tp_price  → _close_position (take_profit)
+  SCALP_OPEN → price <= scalp_sl_price  → _emergency_close (stop_loss)
+  SCALP_OPEN → elapsed >= max_hold_candles → _close_position (time_exit)
+  Any state → _emergency_close() for manual/override stops
 """
 import asyncio
 import logging
@@ -16,19 +15,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config import BotConfig
 from database import (
-    close_hedge,
     close_session,
-    create_hedge,
     create_session,
-    get_open_hedges,
     get_open_session,
     get_today_pnl,
     log_signal,
     update_session,
 )
-from engine.indicators import compute_all
+from engine.indicators import compute_all, ema as EMA, rsi as RSI, atr as ATR
 from engine.orderflow import OrderFlowAnalyzer
-from engine.signal import SignalEngine, _ENTRY_THRESHOLD
 from exchange.order_executor import OrderExecutor
 from notifications import notify
 
@@ -60,22 +55,15 @@ class TradingEngine:
         self._executor = executor
         self._flow = flow
         self._broadcast = broadcast
-        self._signal_engine = SignalEngine()
 
         # Runtime state (re-loaded from DB on startup)
         self._session: Optional[Dict] = None
-        self._hedges: List[Dict] = []
 
         # Set True during _close_position / _emergency_close so that concurrent
         # ACCOUNT_UPDATE events (pa=0) don't trigger a spurious external-close.
         self._closing: bool = False
 
-        # Trailing TP tracking
-        self._trail_activated: bool = False
-        self._trail_price: Optional[float] = None
-        self._trail_pct_mult: float = 1.0   # tighten-only multiplier, updated on candle close
-
-        # Pending fill tracking: order_id → {"type": "entry"|"dca", "prior_qty": float, "prior_avg": float}
+        # Pending fill tracking: order_id → {"type": "entry", "prior_qty": float, "prior_avg": float}
         # Used by _on_user_data in main.py to compute correct blended average from true fill price.
         self._pending_fills: Dict[int, Dict] = {}
 
@@ -83,106 +71,53 @@ class TradingEngine:
         # does not treat them as external closes.
         self._bot_close_order_ids: set = set()
 
-        # Minimum time gate between DCAs — set on each DCA execution
-        self._last_dca_time: Optional[float] = None
-
-        # Smart SL: counts consecutive ticks of strong opposite signal in loss
-        self._smart_sl_ticks: int = 0
-
-        # Signal degradation exit: counts ticks of NEUTRAL while position losing
-        self._signal_degraded_ticks: int = 0
-
-        # Signal persistence: count consecutive ticks holding the same direction.
-        # Entry only fires after signal holds for N ticks — prevents entering on
-        # a single noisy tick that immediately flips back to NEUTRAL.
-        self._entry_signal_ticks: int = 0
-        self._entry_signal_dir:   str = "NEUTRAL"
-
-        # Rescue mode: set after rescue DCA, arms a tight trail to minimize loss
-        self._rescue_mode:        bool          = False
-        self._rescue_trail_price: Optional[float] = None   # best price seen since rescue DCA
-
-        # Margin envelope: theoretical max capital across entry + all DCAs (set at entry)
-        self._margin_envelope: float = 0.0
-
-        # Adaptive risk parameters — two copies:
-        #   _adaptive      : refreshed every tick (current market conditions)
-        #   _entry_adaptive: locked at trade entry, updated on each DCA
-        self._adaptive: Dict[str, float] = {}
-        self._entry_adaptive: Dict[str, float] = {}
-
         # Manual level overrides set from the UI.
-        # When set, these replace the ATR-computed TP arm / hard-stop prices.
-        # Cleared automatically when DCA fires, a hedge opens, or position closes.
+        # Cleared automatically when position closes.
         self._override_tp_price: Optional[float] = None
         self._override_sl_price: Optional[float] = None
-
-        # Breakeven stop — set after a DCA recovery to prevent giving back profit
-        self._breakeven_stop_price: Optional[float] = None
-        self._last_resort_buffer_cache: float = 0.80  # updated each tick from cfg
 
         # Stop cooldown: set to time.time() after hard stop, cleared on normal close.
         self._last_stop_time: Optional[float] = None
 
-        # Partial TP: True once we have closed the first fraction; reset on full close.
-        self._partial_tp_done: bool = False
+        # --- Scalping state ---
+        # Locked at entry, restored on restart from DB.
+        self._scalp_tp_price: Optional[float] = None   # absolute TP price
+        self._scalp_sl_price: Optional[float] = None   # absolute SL price
+        self._scalp_tp_pct:   float = 0.0              # TP% used (for display)
+        self._scalp_sl_pct:   float = 0.0              # SL% used (for display)
+        self._scalp_atr_pct:  float = 0.0              # ATR% at entry (for display)
+
+        # Time-based exit: candle open-time when entry was placed
+        self._entry_candle_time: int = 0
+
+        # Cooldown: timestamp of last position exit (any reason)
+        self._last_exit_time: float = 0.0
+
+        # Optional partial-TP trail (armed at 60% of tp_pct)
+        self._trail_activated: bool = False
+        self._trail_price: Optional[float] = None
 
         # Leverage locked at switch time — set by main.py after prepare_symbol().
-        # Used at entry so we size against the same leverage that's set on the exchange.
         self._effective_leverage: int = 1
 
-        # Latest indicators (cached each tick for broadcast)
+        # Latest indicators / candles (cached each tick for broadcast)
         self.last_signal: Dict = {}
-        self._scanner_type: str = "momentum"   # scanner type that found current symbol
+        self._scanner_type: str = "momentum"
         self.last_indicators:  Dict = {}
-        self._prev_indicators: Dict = {}   # indicators from the tick before last — used for slope checks
+        self._prev_indicators: Dict = {}
         self.candles: List[Dict] = []
 
     def reset_for_switch(self) -> None:
-        """
-        Reset all per-symbol state when switching to a new symbol.
-        Prevents stale signal counts, flow data, cooldowns and momentum
-        multipliers from a previous symbol contaminating the new one.
-        Called by _do_switch() before loading new symbol candles.
-        """
-        # Signal persistence — must start fresh on new symbol
-        self._entry_signal_ticks   = 0
-        self._entry_signal_dir     = "NEUTRAL"
-
-        # Momentum and trail state — symbol-specific, meaningless on new symbol
-        self._trail_pct_mult       = 1.0
-        self._signal_degraded_ticks = 0
-        self._smart_sl_ticks       = 0
-
-        # DCA and stop cooldowns — these are per-trade, not per-symbol
-        # Reset so new symbol isn't penalised for previous symbol's losses
-        self._last_dca_time        = None
-        self._last_stop_time       = None
-
-        # Rescue mode — must not carry over
-        self._rescue_mode          = False
-        self._rescue_trail_price   = None
-
-        # Flow — old symbol's order flow is meaningless for new symbol
-        # Flow warmup in _ticker_loop handles the transition window
+        """Reset all per-symbol state when switching to a new symbol."""
+        self._last_stop_time    = None
+        self._trail_activated   = False
+        self._trail_price       = None
         self._flow.reset()
-
-        # Trail state — no open position so these are irrelevant
-        # but reset for cleanliness
-        self._trail_activated      = False
-        self._trail_price          = None
-
-        # Candles and indicators — old symbol's data must not leak into new symbol.
-        # Cleared here so any tick() that fires before update_candles() computes
-        # a clean NEUTRAL signal, and update_candles() sets _prev_indicators={}
-        # (not old symbol's last_indicators) on the first call for the new symbol.
-        self.candles             = []
-        self.last_indicators     = {}
-        self._prev_indicators    = {}
-        self.last_signal         = {}
+        self.candles            = []
+        self.last_indicators    = {}
+        self._prev_indicators   = {}
+        self.last_signal        = {}
         self._effective_leverage = 1   # re-set by main.py after prepare_symbol()
-        self._margin_envelope    = 0.0
-
         logger.info("TradingEngine: state reset for symbol switch")
 
     # ------------------------------------------------------------------
@@ -190,87 +125,34 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     def _push_session(self) -> None:
-        """Push current session + hedges + trade-level prices to all WS clients."""
-        tp_price = sl_price = None
+        """Push current session + scalp TP/SL prices to all WS clients."""
+        tp_price = self._override_tp_price or self._scalp_tp_price
+        sl_price = self._override_sl_price or self._scalp_sl_price
 
-        if self._session:
-            entry    = self._session["entry_price"]
-            avg      = self._session["avg_price"]
-            d        = self._session["direction"]
-            leverage = self._session["leverage"]
-
-            # TP arm: requires _entry_adaptive (locked at entry).
-            # Only compute if available — after restart it may not be set yet,
-            # and will be populated on the next tick when _manage_position runs.
-            ref = self._entry_adaptive or self._adaptive
-            if ref:
-                tp = ref["tp_pct"]
-                # After DCA, _check_tp() arms the trail from avg_price not entry_price.
-                # Display must match so the UI shows the price that will actually trigger.
-                dca_count = self._session.get("dca_count", 0)
-                ref_price = avg if dca_count > 0 else entry
-                if d == "LONG":
-                    tp_price = ref_price * (1 + tp / 100)
-                else:
-                    tp_price = ref_price * (1 - tp / 100)
-
-            # SL: does NOT need ref — only uses session values + buffer cache.
-            # This works correctly even after restart when ref is empty.
-            if self._breakeven_stop_price is not None:
-                sl_price = self._breakeven_stop_price
-            else:
-                buffer  = self._last_resort_buffer_cache
-                liq_pct = (1.0 / leverage) if leverage > 0 else 0.10
-                sl_pct  = liq_pct * buffer
-                if d == "LONG":
-                    sl_price = avg * (1 - sl_pct)
-                else:
-                    sl_price = avg * (1 + sl_pct)
-        # Compute DCA level prices for chart display.
-        # Shows next 3 potential DCA levels from current avg price.
-        dca_prices = []
-        if self._session and self._entry_adaptive and sl_price is not None:
-            s_avg      = self._session.get("avg_price", 0)
-            s_dir      = self._session.get("direction", "LONG")
-            s_dca_done = self._session.get("dca_count", 0)
-            step_pct   = self._entry_adaptive.get("dca_step_pct", 0)
-            max_dca    = self._entry_adaptive.get("max_dca", 3)
-            remaining  = max(0, max_dca - s_dca_done)
-
-            if s_avg > 0 and step_pct > 0 and remaining > 0:
-                _liq_pct  = (1.0 / leverage) * 100 if leverage > 0 else 10.0
-                _sl_pct   = _liq_pct * self._last_resort_buffer_cache
-                _safe     = _sl_pct * 0.85
-                _max_step = _safe / remaining if remaining > 0 else step_pct
-                eff_step  = min(step_pct, _max_step)
-
-                for i in range(1, remaining + 1):
-                    dist = s_avg * eff_step / 100 * i
-                    if s_dir == "LONG":
-                        dca_price = s_avg - dist
-                        if dca_price <= sl_price:
-                            break
-                    else:
-                        dca_price = s_avg + dist
-                        if dca_price >= sl_price:
-                            break
-                    dca_prices.append(round(dca_price, 8))
+        # Compute elapsed candles for time-exit display
+        elapsed_candles = 0
+        if self._session and self._entry_candle_time and self.candles:
+            tf_secs = max(60, (self.candles[-1]["time"] - self.candles[-2]["time"])
+                          if len(self.candles) >= 2 else 60)
+            cur_candle_time = self.candles[-1]["time"]
+            elapsed_candles = max(0, (cur_candle_time - self._entry_candle_time) // tf_secs)
 
         self._broadcast({
-            "type":                  "session",
-            "session":               self._session,
-            "hedges":                self._hedges,
-            "trail_price":           self._trail_price,
-            "trail_active":          self._trail_activated,
-            "tp_price":              tp_price,
-            "sl_price":              sl_price,
-            "override_tp_price":     self._override_tp_price,
-            "override_sl_price":     self._override_sl_price,
-            "breakeven_stop_price":  self._breakeven_stop_price,
-            "dca_prices":            dca_prices,
-            "rescue_mode":           self._rescue_mode,
-            "rescue_trail_price":    self._rescue_trail_price,
-            "margin_envelope":       self._margin_envelope,
+            "type":              "session",
+            "session":           self._session,
+            "hedges":            [],
+            "trail_price":       self._trail_price,
+            "trail_active":      self._trail_activated,
+            "tp_price":          tp_price,
+            "sl_price":          sl_price,
+            "override_tp_price": self._override_tp_price,
+            "override_sl_price": self._override_sl_price,
+            "dca_prices":        [],
+            # Scalp-specific display fields
+            "scalp_tp_pct":      self._scalp_tp_pct,
+            "scalp_sl_pct":      self._scalp_sl_pct,
+            "scalp_atr_pct":     self._scalp_atr_pct,
+            "elapsed_candles":   elapsed_candles,
         })
 
     def _pos_log(self, event: str, **kw) -> None:
@@ -296,35 +178,46 @@ class TradingEngine:
         self._broadcast({"type": "level_overrides_cleared"})
 
     @staticmethod
-    def _compute_adaptive(
+    def _compute_scalp_levels(
         atr: float,
         price: float,
-        strength: float = 0.0,
+        direction: str,
+        entry_price: float,
+        cfg,
     ) -> Dict[str, float]:
         """
-        Derive all risk thresholds from ATR, optionally scaled by signal strength.
+        Compute ATR-based scalping TP and SL percentages and prices.
 
-        strength: signal strength at entry (0.0–1.0).
-          tp_pct and trail_pct scale up with stronger signals so high-conviction
-          entries get more room to run before the trail fires.
-          DCA, hedge, and stop thresholds are ATR-only (unchanged).
-
-        Ordering guaranteed:
-          dca_step < hedge_trigger < hard_stop
-          trail_pct < tp_pct
-          min_profit_pct < tp_pct
+        Returns dict with:
+          atr_pct, tp_pct, sl_pct, rr_ratio,
+          tp_price, sl_price
+        All clamped to configured min/max bounds.
+        R:R is verified — returns rr_ratio < cfg.min_rr_ratio if rejected.
         """
-        atr_pct  = (atr / price * 100) if price > 0 else 1.0
-        s        = max(0.0, min(1.0, strength))
-        tp_scale = 1.0 + s          # 0%→1.0×  35%→1.35×  70%→1.70×
-        tr_scale = 1.0 + s * 0.5   # 0%→1.0×  35%→1.175× 70%→1.35×
+        atr_pct = (atr / price * 100) if price > 0 else 1.0
+
+        raw_tp = atr_pct * 2.5
+        raw_sl = atr_pct * 1.0
+
+        tp_pct = max(cfg.tp_pct_min, min(cfg.tp_pct_max, raw_tp))
+        sl_pct = max(cfg.sl_pct_min, min(cfg.sl_pct_max, raw_sl))
+
+        rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 0.0
+
+        if direction == "LONG":
+            tp_price = entry_price * (1 + tp_pct / 100)
+            sl_price = entry_price * (1 - sl_pct / 100)
+        else:
+            tp_price = entry_price * (1 - tp_pct / 100)
+            sl_price = entry_price * (1 + sl_pct / 100)
+
         return {
-            "tp_pct":            max(atr_pct * 2.5, 0.8)  * tp_scale,
-            "trail_pct":         max(atr_pct * 1.0, 0.25) * tr_scale,
-            "min_profit_pct":    max(atr_pct * 0.3, 0.10),
-            "dca_step_pct":      max(atr_pct * 1.5, 0.50),
-            "hedge_trigger_pct": max(atr_pct * 3.0, 1.00),
-            "hard_stop_pct":     max(atr_pct * 5.0, 2.00),
+            "atr_pct":  atr_pct,
+            "tp_pct":   tp_pct,
+            "sl_pct":   sl_pct,
+            "rr_ratio": rr_ratio,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
         }
 
     @staticmethod
@@ -337,183 +230,49 @@ class TradingEngine:
         notional = qty * price
         return notional * (taker_fee_pct / 100)
 
-    @staticmethod
-    def _momentum_trail_mult(ind: Dict, direction: str) -> float:
-        """
-        Compute a tighten-only trail multiplier based on current momentum state.
-        Returns 1.0 (unchanged), 0.7 (fading), or 0.5 (exhausted).
-
-        STRONG    → 1.0: MACD hist aligned with direction AND RSI in healthy zone
-        FADING    → 0.7: MACD hist flat/shrinking OR RSI approaching extreme
-        EXHAUSTED → 0.5: MACD hist reversed against direction OR RSI beyond extreme
-
-        direction: "LONG" or "SHORT" — used to interpret MACD and RSI correctly.
-        """
-        rsi_val   = ind.get("rsi")
-        macd_data = ind.get("macd")
-
-        if rsi_val is None or macd_data is None:
-            return 1.0
-
-        hist = macd_data.get("hist", 0.0)
-
-        if direction == "LONG":
-            macd_aligned  = hist > 0
-            macd_reversed = hist < 0
-            rsi_exhausted = rsi_val > 73
-            rsi_fading    = 68 <= rsi_val <= 73
-        else:  # SHORT
-            macd_aligned  = hist < 0
-            macd_reversed = hist > 0
-            rsi_exhausted = rsi_val < 27
-            rsi_fading    = 27 <= rsi_val <= 32
-
-        if rsi_exhausted or macd_reversed:
-            return 0.5
-        if rsi_fading or not macd_aligned:
-            return 0.7
-        return 1.0
-
-    @staticmethod
-    def _count_reversal_signals(ind: Dict, direction: str, prev_ind: Dict = None) -> int:
-        """
-        Count reversal indicators confirming a potential bounce (0–4).
-        Used to gate DCA entries when smart_dca_gate is enabled.
-        """
-        count = 0
-        rsi_val   = ind.get("rsi")
-        bb        = ind.get("bollinger")
-        macd_data = ind.get("macd")
-
-        # Signal 1: RSI pullback zone (relaxed from 35/65 to catch gradual dips)
-        if rsi_val is not None:
-            if direction == "LONG" and rsi_val < 40:
-                count += 1
-            elif direction == "SHORT" and rsi_val > 60:
-                count += 1
-
-        # Signal 2: Bollinger Band lower/upper range (relaxed from 5%/95% to 20%/80%)
-        if bb is not None:
-            pct_b = bb.get("pct_b", 0.5)
-            if direction == "LONG" and pct_b <= 0.20:
-                count += 1
-            elif direction == "SHORT" and pct_b >= 0.80:
-                count += 1
-
-        # Signal 3: MACD histogram slope improving (catches the turn, not the full reversal).
-        # Slope check: hist moving toward zero is the real DCA opportunity.
-        # Fallback to absolute check when prev_ind not available.
-        if macd_data is not None and prev_ind is not None:
-            hist      = macd_data.get("hist", 0.0)
-            prev_macd = prev_ind.get("macd")
-            prev_hist = prev_macd.get("hist", 0.0) if prev_macd else 0.0
-            if direction == "LONG" and hist > prev_hist:
-                count += 1
-            elif direction == "SHORT" and hist < prev_hist:
-                count += 1
-        elif macd_data is not None:
-            hist = macd_data.get("hist", 0.0)
-            if direction == "LONG" and hist > 0:
-                count += 1
-            elif direction == "SHORT" and hist < 0:
-                count += 1
-
-        # Signal 4: StochRSI extreme (genuinely oversold/overbought)
-        sr = ind.get("stoch_rsi")
-        if sr is not None:
-            k = float(sr.get("k", 50.0))
-            if direction == "LONG" and k < 20:
-                count += 1
-            elif direction == "SHORT" and k > 80:
-                count += 1
-
-        return count
-
     # ------------------------------------------------------------------
     # Level prices helper (used by WS initial-state and _push_session)
     # ------------------------------------------------------------------
 
     def get_level_prices(self):
         """Return (tp_price, sl_price) for the current session, or (None, None).
-        Uses the same formulas as _push_session() for consistency.
-        Manual overrides take priority."""
+        Manual overrides take priority over locked scalp levels."""
         if not self._session:
             return None, None
-        entry    = self._session["entry_price"]
-        avg      = self._session["avg_price"]
-        d        = self._session["direction"]
-        leverage = self._session["leverage"]
-
-        # TP: needs _entry_adaptive — may be empty right after restart
-        computed_tp = None
-        ref = self._entry_adaptive or self._adaptive
-        if ref:
-            tp = ref["tp_pct"]
-            computed_tp = entry * (1 + tp / 100) if d == "LONG" else entry * (1 - tp / 100)
-
-        # SL: last resort SL — does NOT need ref
-        if self._breakeven_stop_price is not None:
-            computed_sl = self._breakeven_stop_price
-        else:
-            buffer  = self._last_resort_buffer_cache
-            liq_pct = (1.0 / leverage) if leverage > 0 else 0.10
-            sl_pct  = liq_pct * buffer
-            computed_sl = avg * (1 - sl_pct) if d == "LONG" else avg * (1 + sl_pct)
-
-        return (
-            self._override_tp_price if self._override_tp_price is not None else computed_tp,
-            self._override_sl_price if self._override_sl_price is not None else computed_sl,
-        )
+        tp = self._override_tp_price if self._override_tp_price is not None else self._scalp_tp_price
+        sl = self._override_sl_price if self._override_sl_price is not None else self._scalp_sl_price
+        return tp, sl
 
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
 
     async def restore_state(self) -> None:
-        """Re-load open session + hedges from DB after restart."""
+        """Re-load open session from DB after restart and re-arm TP/SL."""
         self._session = await get_open_session()
         if self._session:
-            self._hedges = await get_open_hedges(self._session["id"])
-            # Restore trailing-stop state so it survives restarts
-            self._trail_activated = bool(self._session.get("trail_active", 0))
-            self._trail_price     = self._session.get("trail_price") or None
-
-            import json as _json
             sess = self._session
 
-            # Rescue mode
-            self._rescue_mode        = bool(sess.get("rescue_mode", 0))
-            self._rescue_trail_price = sess.get("rescue_trail_price") or None
+            self._scalp_tp_price      = sess.get("scalp_tp_price") or None
+            self._scalp_sl_price      = sess.get("scalp_sl_price") or None
+            self._scalp_tp_pct        = float(sess.get("scalp_tp_pct") or 0.0)
+            self._scalp_sl_pct        = float(sess.get("scalp_sl_pct") or 0.0)
+            self._scalp_atr_pct       = float(sess.get("scalp_atr_pct") or 0.0)
+            self._entry_candle_time   = int(sess.get("scalp_entry_candle_time") or 0)
 
-            # Breakeven stop
-            self._breakeven_stop_price = sess.get("breakeven_stop_price") or None
-
-            # Entry adaptive thresholds
-            raw_adaptive = sess.get("entry_adaptive")
-            if raw_adaptive:
-                try:
-                    self._entry_adaptive = _json.loads(raw_adaptive)
-                except Exception:
-                    self._entry_adaptive = {}
-
-            # Trail pct multiplier
-            self._trail_pct_mult = float(sess.get("trail_pct_mult") or 1.0)
-
-            # Margin envelope
-            self._margin_envelope = float(sess.get("margin_envelope") or 0.0)
+            # Restore optional partial-TP trail
+            self._trail_activated = bool(sess.get("trail_active", 0))
+            self._trail_price     = sess.get("trail_price") or None
 
             logger.info(
-                "TradingEngine: restored session id=%d dir=%s hedges=%d trail=%s@%.6f "
-                "rescue=%s breakeven=%s trail_mult=%.2f adaptive_keys=%d",
-                self._session["id"],
-                self._session["direction"],
-                len(self._hedges),
+                "TradingEngine: restored session id=%d dir=%s tp=%.6f sl=%.6f "
+                "entry_candle=%d trail=%s",
+                sess["id"],
+                sess["direction"],
+                self._scalp_tp_price or 0.0,
+                self._scalp_sl_price or 0.0,
+                self._entry_candle_time,
                 self._trail_activated,
-                self._trail_price or 0.0,
-                self._rescue_mode,
-                self._breakeven_stop_price,
-                self._trail_pct_mult,
-                len(self._entry_adaptive),
             )
 
     # ------------------------------------------------------------------
@@ -525,122 +284,44 @@ class TradingEngine:
         self._scanner_type = scanner_type
 
     def update_candles(self, candles: List[Dict]) -> None:
-        prev_last_time = self.candles[-1]["time"] if self.candles else 0
-        self.candles = candles
-        self._prev_indicators = self.last_indicators   # save before overwrite
+        self.candles          = candles
+        self._prev_indicators = self.last_indicators
         self.last_indicators  = compute_all(candles)
-
-        new_last_time = candles[-1]["time"] if candles else 0
-        if new_last_time != prev_last_time and self._session:
-            self._adjust_trail_on_candle_close()
-
-    def _adjust_trail_on_candle_close(self) -> None:
-        """
-        Called on every confirmed candle close while trail is active.
-
-        Two adjustments per candle close:
-
-        1. Trail Stop tightening (_trail_pct_mult):
-           Tighten-only multiplier based on momentum state (RSI/MACD).
-           Never widens — only the next ratchet will be tighter.
-
-        2. Trail Arm (tp_pct) live recalculation:
-           Recalculate tp_pct from current ATR so the Trail Arm breathes
-           with market volatility. No directional lock — both tighter and
-           wider moves are allowed. Hard floor: Trail Arm must never enter
-           the loss zone (LONG: must stay above entry + min_profit_pct;
-           SHORT: must stay below entry - min_profit_pct).
-        """
-        if not self._session or not self._entry_adaptive:
-            return
-
-        direction = self._session["direction"]
-        entry     = self._session["entry_price"]
-        ind       = self.last_indicators
-
-        # ── 1. Trail Stop tightening — only when trail is armed ──
-        # _trail_pct_mult tightens the gap between price and trail_stop on the
-        # next ratchet. No point running this before trail is active.
-        if self._trail_activated:
-            new_mult = self._momentum_trail_mult(ind, direction)
-            if new_mult < self._trail_pct_mult:
-                old_mult = self._trail_pct_mult
-                self._trail_pct_mult = new_mult
-                logger.info(
-                    "TradingEngine: trail tightened on candle close  "
-                    "mult %.2f → %.2f  (rsi=%.1f  macd_hist=%.6f)",
-                    old_mult,
-                    new_mult,
-                    ind.get("rsi") or 0.0,
-                    (ind.get("macd") or {}).get("hist", 0.0),
-                )
-
-        # ── 2. Trail Arm (tp_pct) live recalculation ──
-        atr_val = ind.get("atr")
-        price   = ind.get("price") or entry
-        if not atr_val or atr_val <= 0 or price <= 0:
-            return
-
-        atr_pct     = atr_val / price * 100
-        min_profit  = self._entry_adaptive.get("min_profit_pct", 0.10)
-        old_tp_pct  = self._entry_adaptive["tp_pct"]
-
-        # Recalculate tp_pct from current ATR using same formula as _compute_adaptive.
-        # Preserve the original strength-based scale that was applied at entry.
-        # Extract implied scale from original tp_pct vs baseline so we don't need
-        # to store strength separately.
-        baseline_tp = max(atr_pct * 2.5, 0.8)   # unscaled baseline
-        new_tp_pct  = baseline_tp
-
-        # Floor 1: Trail Arm must stay in profit zone (above entry for LONG).
-        new_tp_pct = max(new_tp_pct, min_profit)
-
-        # Floor 2: Trail Arm must always be ABOVE current price for LONG,
-        # BELOW current price for SHORT. If ATR shrinks so much that the
-        # computed Trail Arm would be at or below current price, force it
-        # at least 1×ATR beyond current price so trail can't fire immediately.
-        if price > 0 and atr_pct > 0:
-            if direction == "LONG":
-                min_arm_price  = price * (1 + atr_pct / 100)   # at least 1 ATR above current
-                min_arm_tp_pct = (min_arm_price / entry - 1) * 100 if entry > 0 else new_tp_pct
-                new_tp_pct     = max(new_tp_pct, min_arm_tp_pct)
-            else:  # SHORT
-                min_arm_price  = price * (1 - atr_pct / 100)   # at least 1 ATR below current
-                min_arm_tp_pct = (1 - min_arm_price / entry) * 100 if entry > 0 else new_tp_pct
-                new_tp_pct     = max(new_tp_pct, min_arm_tp_pct)
-
-        if abs(new_tp_pct - old_tp_pct) >= 0.05:   # only update if meaningful change (>0.05%)
-            self._entry_adaptive["tp_pct"] = new_tp_pct
-
-            # Recompute trail_pct proportionally (keep same ratio as original)
-            old_trail = self._entry_adaptive.get("trail_pct", max(atr_pct * 1.0, 0.25))
-            ratio      = old_trail / old_tp_pct if old_tp_pct > 0 else 0.40
-            new_trail  = max(new_tp_pct * ratio, 0.10)
-            self._entry_adaptive["trail_pct"] = new_trail
-
-            direction_label = "UP" if new_tp_pct > old_tp_pct else "DOWN"
-            new_arm = entry * (1 + new_tp_pct / 100) if direction == "LONG" \
-                      else entry * (1 - new_tp_pct / 100)
-            logger.info(
-                "TradingEngine: Trail Arm recalculated on candle close %s "
-                "tp_pct %.3f%% → %.3f%%  arm=%.6f  (atr_pct=%.3f%%)",
-                direction_label, old_tp_pct, new_tp_pct, new_arm, atr_pct,
-            )
-            # Push updated tp_price to UI — _push_session reads from _entry_adaptive
-            self._push_session()
-
 
     # ------------------------------------------------------------------
     # Main tick — called every N seconds by the scheduler
     # ------------------------------------------------------------------
 
     async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
-        ind = self.last_indicators
+        ind          = self.last_indicators
         flow_summary = self._flow.summarize()
-        signal = self._signal_engine.compute(self.candles, flow_summary, ind, self._prev_indicators, scanner_type=self._scanner_type)
+
+        # Build a lightweight signal dict for gate broadcast / HTF checks.
+        # Direction is derived from EMA stack in Gate 3 of _try_entry,
+        # so here we only compute a simple composite for the UI signal broadcast.
+        ema9  = ind.get("ema9")
+        ema21 = ind.get("ema21")
+        ema50 = ind.get("ema50")
+        if ema9 and ema21 and ema50:
+            if ema9 > ema21 > ema50 and price > ema9:
+                sig_dir = "LONG"
+            elif ema9 < ema21 < ema50 and price < ema9:
+                sig_dir = "SHORT"
+            else:
+                sig_dir = "NEUTRAL"
+        else:
+            sig_dir = "NEUTRAL"
+
+        signal = {
+            "direction": sig_dir,
+            "strength": 0.5,
+            "components": {"flow": flow_summary.get("score", 0.0)},
+            "composite": flow_summary.get("score", 0.0),
+            "filters_passed": True,
+            "reason": "",
+        }
         self.last_signal = signal
 
-        # Broadcast signal to UI
         self._broadcast({"type": "signal", "data": {
             **signal,
             "flow_warmup": flow_warmup,
@@ -668,295 +349,250 @@ class TradingEngine:
         flow_warmup: bool = False,
         htf_bias: str = "NEUTRAL",
     ) -> None:
-        direction = signal["direction"]
-        strength  = signal["strength"]
+        """
+        7-gate scalping entry. All gates must pass simultaneously.
+        Logs which gate failed for entry_blocked broadcast.
+        Entry is ONLY on a closed candle — never mid-candle.
+        """
+        gates = {}   # gate_name → (passed: bool, value: str)
 
-        def _blocked(reason: str) -> None:
-            """Broadcast why entry was blocked so UI can display it."""
-            self._broadcast({"type": "entry_blocked", "reason": reason})
+        def _blocked(gate: str, reason: str) -> None:
+            gates[gate] = (False, reason)
+            self._broadcast({
+                "type": "entry_blocked",
+                "reason": f"Entry blocked: {gate} — {reason}",
+                "gates": gates,
+            })
 
-        # During flow warmup window after auto-switch, the flow component (28% weight)
-        # Flow warmup window — order flow is empty immediately after a symbol switch.
-        # Block all entries until the flow window is fully warmed up.
-        # Signal is still computed and broadcast normally so the UI shows the
-        # technical picture, but no position will be opened.
-        if flow_warmup:
-            logger.debug("TradingEngine: flow warmup in progress — entry blocked")
+        # Need at least 60 candles for all indicators
+        if len(self.candles) < 60:
             return
 
-        if direction == "NEUTRAL":
-            # Smart counter handling: preserve the persistence counter if the composite
-            # is leaning toward a direction (near threshold) and filters didn't block it.
-            # Only reset if signal is genuinely flat or a filter hard-blocked the entry.
-            #
-            # Case A: composite near threshold (>60% of threshold) → signal is leaning,
-            #         may cross next tick — preserve counter so we don't lose progress.
-            # Case B: composite is flat (near zero) or filters blocked → reset counter,
-            #         signal has no real edge right now.
-            comp       = signal.get("composite", 0.0)
-            leaning    = abs(comp) >= (_ENTRY_THRESHOLD * 0.6)   # within 60% of ±0.20
-            filter_ok  = signal.get("filters_passed", True)       # True = not filter-blocked
-            if not leaning or not filter_ok:
-                self._entry_signal_ticks = 0
-                self._entry_signal_dir   = "NEUTRAL"
-            _blocked(f"NEUTRAL composite {comp:+.3f} — {'leaning, holding counter' if leaning and filter_ok else 'no edge'}")
+        # ── Gate 7 — Entry cooldown ──────────────────────────────────────────
+        elapsed_since_exit = time.time() - self._last_exit_time
+        if elapsed_since_exit < cfg.entry_cooldown_s:
+            remaining = cfg.entry_cooldown_s - elapsed_since_exit
+            _blocked("COOLDOWN", f"{remaining:.0f}s remaining after last exit")
             return
 
-        if strength < cfg.min_signal_strength:
-            # Preserve counter — signal is directional but weak.
-            # It may strengthen next tick without changing direction.
-            _blocked(f"strength {strength*100:.0f}% < min {cfg.min_signal_strength*100:.0f}%")
-            return
-
-        if not flow_warmup and not signal["filters_passed"]:
-            # Filter hard-blocked — fundamental market condition wrong (RSI extreme,
-            # counter-trend). Reset counter because entry won't happen until condition changes.
-            self._entry_signal_ticks = 0
-            self._entry_signal_dir   = "NEUTRAL"
-            _blocked(signal.get("reason", "entry filter blocked"))
-            return
-
-        # Signal persistence filter: require the same directional signal to hold
-        # for N consecutive ticks before allowing entry. A signal that appears for
-        # one tick and disappears is likely noise. N scales with timeframe so that
-        # on 1m the filter is 3 seconds and on 15m it is 45 seconds.
-        persist_needed = cfg.signal_persist_ticks
-        if persist_needed <= 0:
-            persist_needed = 0   # disabled — skip persistence check entirely
-        if direction == "NEUTRAL":
-            pass  # NEUTRAL doesn't reset the counter — signal is still leaning
-        elif direction == self._entry_signal_dir:
-            self._entry_signal_ticks += 1
-        else:
-            # Opposite direction — reset counter and start fresh
-            self._entry_signal_dir   = direction
-            self._entry_signal_ticks = 1
-
-        if persist_needed > 0 and self._entry_signal_ticks < persist_needed:
-            logger.debug(
-                "TradingEngine: entry pending — signal %s confirmed %d/%d ticks",
-                direction, self._entry_signal_ticks, persist_needed,
-            )
-            _blocked(f"waiting signal persistence {self._entry_signal_ticks}/{persist_needed} ticks")
-            return
-
-        # HTF confirmation: if the higher timeframe has a clear directional bias,
-        # block entries that go counter to it. "NEUTRAL" means no HTF data yet or
-        # the EMAs are mixed — in that case we allow the entry through.
-        if cfg.htf_filter and htf_bias != "NEUTRAL" and htf_bias != direction:
-            logger.debug(
-                "TradingEngine: entry blocked — HTF bias %s disagrees with signal %s",
-                htf_bias, direction,
-            )
-            _blocked(f"HTF {htf_bias} contradicts signal {direction}")
-            return
-
-        # Flow confirmation gate: real-time order flow must agree with direction.
-        # All other components (EMA, MACD, RSI) are historical — flow is right now.
-        # LONG needs taker buyers dominant (flow > 0).
-        # SHORT needs taker sellers dominant (flow < 0).
-        if not flow_warmup:
-            flow_score = signal["components"].get("flow", 0.0)
-            if direction == "LONG" and flow_score <= 0:
-                logger.debug(
-                    "TradingEngine: LONG blocked — flow negative (%.3f), sellers dominant",
-                    flow_score,
-                )
-                _blocked(f"flow {flow_score:+.2f} — sellers dominant, waiting for buyers")
-                return
-            if direction == "SHORT" and flow_score >= 0:
-                logger.debug(
-                    "TradingEngine: SHORT blocked — flow positive (%.3f), buyers dominant",
-                    flow_score,
-                )
-                _blocked(f"flow {flow_score:+.2f} — buyers dominant, waiting for sellers")
+        # ── HTF filter (Gate 0) — block counter-trend entries ─────────────
+        if cfg.htf_filter and htf_bias != "NEUTRAL":
+            direction_from_signal = signal.get("direction", "NEUTRAL")
+            if direction_from_signal != "NEUTRAL" and htf_bias != direction_from_signal:
+                _blocked("HTF", f"HTF bias {htf_bias} contradicts signal {direction_from_signal}")
                 return
 
-        # Stop cooldown: block re-entry for N seconds after a hard stop
-        if self._last_stop_time is not None:
-            elapsed = time.time() - self._last_stop_time
-            if elapsed < cfg.cooldown_after_stop_s:
-                remaining = cfg.cooldown_after_stop_s - elapsed
-                logger.debug(
-                    "TradingEngine: entry blocked — stop cooldown %.0fs remaining",
-                    remaining,
-                )
-                _blocked(f"stop cooldown — {remaining:.0f}s remaining")
-                return
-
-        # Daily loss circuit breaker
+        # ── Daily loss circuit breaker ────────────────────────────────────
         if cfg.max_daily_loss_usdt > 0:
             today_pnl = await get_today_pnl()
             if today_pnl < -cfg.max_daily_loss_usdt:
-                logger.warning(
-                    "TradingEngine: entry blocked — daily loss limit "
-                    "(today=%.4f, limit=-%.4f)", today_pnl, cfg.max_daily_loss_usdt,
-                )
-                _blocked(f"daily loss limit reached ({today_pnl:.2f} USDT)")
+                _blocked("DAILY_LOSS", f"limit reached ({today_pnl:.2f} USDT)")
                 return
 
-        # Validate market conditions before committing to a trade
-        if atr_val <= 0:
-            logger.info("TradingEngine: skipping entry — ATR unavailable")
+        # ── Require closed candle ────────────────────────────────────────
+        if len(self.candles) < 2 or atr_val <= 0:
+            return
+        c = self.candles[-2]   # last CLOSED candle
+        high_  = c["high"];  low_ = c["low"]
+        open_  = c["open"];  close_ = c["close"]
+        full_range = high_ - low_
+        if full_range <= 0:
             return
 
-        # Price action filter: wick rejection + candle direction confirmation.
-        # Uses the last CLOSED candle (candles[-2]) not the live candle (candles[-1])
-        # so we're reading completed price structure, not an in-progress candle.
-        #
-        # Wick rejection: if the last candle's shadow in the signal direction
-        # is > 60% of the total range, price was rejected at that level — risky entry.
-        # Example: pump wick (TAGUSDT) = long upper wick → bearish rejection → no LONG.
-        #
-        # Candle direction: the last closed candle body must agree with signal direction.
-        # A bearish close (red candle) during a LONG signal = price still falling.
-        if len(self.candles) >= 2:
-            c      = self.candles[-2]   # last confirmed closed candle
-            high_  = c["high"]
-            low_   = c["low"]
-            open_  = c["open"]
-            close_ = c["close"]
-            range_ = high_ - low_
+        body        = abs(close_ - open_)
+        upper_wick  = high_ - max(open_, close_)
+        lower_wick  = min(open_, close_) - low_
+        vol_last    = c["volume"]
 
-            if range_ > 0:
-                upper_wick = high_ - max(open_, close_)
-                lower_wick = min(open_, close_) - low_
-                _WICK_THRESHOLD = 0.60   # wick > 60% of range = rejection
-
-                if direction == "LONG" and upper_wick / range_ > _WICK_THRESHOLD:
-                    _blocked(
-                        f"bearish wick rejection — upper wick {upper_wick/range_*100:.0f}% "
-                        f"of candle range (>{_WICK_THRESHOLD*100:.0f}% threshold)"
-                    )
-                    return
-
-                if direction == "SHORT" and lower_wick / range_ > _WICK_THRESHOLD:
-                    _blocked(
-                        f"bullish wick rejection — lower wick {lower_wick/range_*100:.0f}% "
-                        f"of candle range (>{_WICK_THRESHOLD*100:.0f}% threshold)"
-                    )
-                    return
-
-                # Candle direction confirmation: body must agree with signal direction.
-                # Skip if candle is a doji (body < 10% of range — indecision, allow through).
-                body = abs(close_ - open_)
-                is_doji = body / range_ < 0.10
-                if not is_doji:
-                    if direction == "LONG" and close_ < open_:
-                        _blocked("bearish candle — waiting for bullish close to confirm LONG")
-                        return
-                    if direction == "SHORT" and close_ > open_:
-                        _blocked("bullish candle — waiting for bearish close to confirm SHORT")
-                        return
-
-        entry_adaptive = self._compute_adaptive(atr_val, price, strength)
-        if entry_adaptive["tp_pct"] < 0.4:
-            logger.info(
-                "TradingEngine: skipping entry — TP too tight (%.3f%% < 0.40%%)",
-                entry_adaptive["tp_pct"],
-            )
-            _blocked(f"TP too tight ({entry_adaptive['tp_pct']:.2f}% < 0.40%)")
-            await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
+        # ── Gate 1 — Candle structure ─────────────────────────────────────
+        body_ratio = body / full_range
+        if body_ratio < cfg.min_body_ratio:
+            _blocked("CANDLE STRUCTURE", f"body ratio {body_ratio:.2f} < {cfg.min_body_ratio:.2f}")
             return
 
-        # Use leverage locked at switch time — already set on the exchange via prepare_symbol().
-        # Recalculating here would produce a different value than what Binance has, causing
-        # the position to be sized at the wrong leverage.
-        atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
+        direction_from_candle = "LONG" if close_ > open_ else "SHORT"
+        direction = signal.get("direction", "NEUTRAL")
+        if direction == "NEUTRAL":
+            return
+
+        if direction == "LONG":
+            if close_ <= open_:
+                _blocked("CANDLE STRUCTURE", "bearish candle for LONG")
+                return
+            if upper_wick / full_range > 0.35:
+                _blocked("CANDLE STRUCTURE", f"upper wick {upper_wick/full_range:.0%} > 35%")
+                return
+        else:  # SHORT
+            if close_ >= open_:
+                _blocked("CANDLE STRUCTURE", "bullish candle for SHORT")
+                return
+            if lower_wick / full_range > 0.35:
+                _blocked("CANDLE STRUCTURE", f"lower wick {lower_wick/full_range:.0%} > 35%")
+                return
+        gates["CANDLE STRUCTURE"] = (True, f"body {body_ratio:.0%}")
+
+        # ── Gate 2 — Volume confirmation ──────────────────────────────────
+        vol_window = [c2["volume"] for c2 in self.candles[-22:-2]]
+        if len(vol_window) < 10:
+            return
+        vol_avg = sum(vol_window) / len(vol_window)
+        vol_ratio = vol_last / vol_avg if vol_avg > 0 else 0.0
+        if vol_ratio < cfg.min_vol_ratio:
+            _blocked("VOLUME", f"vol ratio {vol_ratio:.2f}x < {cfg.min_vol_ratio:.2f}x")
+            return
+        gates["VOLUME"] = (True, f"{vol_ratio:.1f}×")
+
+        # ── Gate 3 — EMA momentum stack ───────────────────────────────────
+        closes = [c2["close"] for c2 in self.candles]
+        ema9  = EMA(closes, 9)
+        ema21 = EMA(closes, 21)
+        ema50 = EMA(closes, 50)
+        if ema9 is None or ema21 is None or ema50 is None:
+            return
+        if direction == "LONG":
+            ema_ok = ema9 > ema21 > ema50 and price > ema9
+        else:
+            ema_ok = ema9 < ema21 < ema50 and price < ema9
+        if not ema_ok:
+            _blocked("EMA STACK", f"ema9={ema9:.4f} ema21={ema21:.4f} ema50={ema50:.4f}")
+            return
+        gates["EMA STACK"] = (True, f"ema9={ema9:.4f}")
+
+        # ── Gate 4 — Order flow agreement ─────────────────────────────────
+        flow_data = self._flow.summarize()
+        flow_score = flow_data.get("score", 0.0)
+        flow_count = flow_data.get("trade_count", 0)
+        if flow_count < 10:
+            _blocked("ORDER FLOW", f"only {flow_count} trades in window (need 10)")
+            return
+        if direction == "LONG" and flow_score < cfg.min_flow_score:
+            _blocked("ORDER FLOW", f"score {flow_score:+.2f} < +{cfg.min_flow_score:.2f}")
+            return
+        if direction == "SHORT" and flow_score > -cfg.min_flow_score:
+            _blocked("ORDER FLOW", f"score {flow_score:+.2f} > -{cfg.min_flow_score:.2f}")
+            return
+        gates["ORDER FLOW"] = (True, f"{flow_score:+.2f}")
+
+        # ── Gate 5 — RSI not at extreme ───────────────────────────────────
+        rsi_val = RSI(closes, 14)
+        if rsi_val is None:
+            return
+        if direction == "LONG" and not (35 <= rsi_val <= 75):
+            _blocked("RSI ZONE", f"RSI {rsi_val:.1f} outside 35–75 for LONG")
+            return
+        if direction == "SHORT" and not (25 <= rsi_val <= 65):
+            _blocked("RSI ZONE", f"RSI {rsi_val:.1f} outside 25–65 for SHORT")
+            return
+        gates["RSI ZONE"] = (True, f"{rsi_val:.1f}")
+
+        # ── Gate 6 — ATR-based volatility range ───────────────────────────
+        atr_pct = (atr_val / price * 100) if price > 0 else 0.0
+        if atr_pct < 0.15:
+            _blocked("ATR RANGE", f"ATR {atr_pct:.3f}% < 0.15% (not enough range)")
+            return
+        if atr_pct > 3.0:
+            _blocked("ATR RANGE", f"ATR {atr_pct:.3f}% > 3.0% (too chaotic)")
+            return
+        gates["ATR RANGE"] = (True, f"{atr_pct:.2f}%")
+
+        # ── Gate 0 / R:R check — compute scalp levels ────────────────────
+        levels = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
+        rr_ratio = levels["rr_ratio"]
+        if rr_ratio < cfg.min_rr_ratio:
+            _blocked("R:R RATIO", f"{rr_ratio:.2f} < {cfg.min_rr_ratio:.2f} minimum")
+            await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
+                             signal.get("components", {}), "skip")
+            return
+        gates["R:R RATIO"] = (True, f"{rr_ratio:.2f}:1")
+
+        # ── All gates passed — place order ────────────────────────────────
         effective_leverage = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
 
-        # High ATR guard: verify DCA step fits within Last Resort SL distance.
-        # Uses the switch-time leverage (already set on exchange) so the check is consistent.
-        liq_pct         = (1.0 / effective_leverage) * 100 if effective_leverage > 0 else 10.0
-        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
-        dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
-        if dca_step_would_be >= last_resort_pct:
-            _blocked(
-                f"ATR too high ({atr_pct_cur:.1f}%) — DCA step ({dca_step_would_be:.1f}%) "
-                f"would exceed SL distance ({last_resort_pct:.1f}%) at {effective_leverage}x leverage"
-            )
-            return
-
-        # Strength-based sizing: scale margin linearly with strength, floored at strength_size_min.
-        # strength_size_min is a sizing floor only — entry is already gated above by min_signal_strength.
-        if cfg.strength_sizing:
-            scale = max(strength, cfg.strength_size_min)
-            effective_margin = cfg.margin_usdt * scale
-        else:
-            effective_margin = cfg.margin_usdt
-
-        # Deduct entry taker fee so total margin consumed stays within cfg.margin_usdt.
+        # Fixed margin sizing — no strength scaling
         fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
-        fee_adjusted_margin = effective_margin / fee_factor
+        fee_adjusted_margin = cfg.margin_usdt / fee_factor
         qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
         side = "BUY" if direction == "LONG" else "SELL"
-        order = await self._executor.place_market_order(
-            cfg.symbol, side, qty, current_price=price
-        )
+        order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
         fill_price = float(order.get("avgPrice") or price)
 
-        # Track this order so _on_user_data can correct fill price if avgPrice was "0"
         order_id = int(order.get("orderId", 0))
         if order_id:
             self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
 
-        session_id = await create_session(
+        # Recompute scalp levels from fill_price (accurate TP/SL prices)
+        levels = self._compute_scalp_levels(atr_val, fill_price, direction, fill_price, cfg)
+
+        await create_session(
             symbol=cfg.symbol,
             direction=direction,
             entry_price=fill_price,
             qty=qty,
-            margin=effective_margin,
+            margin=cfg.margin_usdt,
             leverage=effective_leverage,
-            entry_reason=signal["reason"],
-            signal_strength=strength,
+            entry_reason=f"scalp|{direction}",
+            signal_strength=signal.get("strength", 0.0),
             signal_price=price,
         )
         self._session = await get_open_session()
-        self._hedges = []
         self._trail_activated = False
-        self._trail_price = None
-        self._entry_adaptive = entry_adaptive  # locked for life of this trade
-        self._entry_adaptive["max_dca"] = cfg.max_dca  # stored for _push_session access
-        self._last_resort_buffer_cache = cfg.last_resort_sl_buffer  # needed by first _push_session
-        self._margin_envelope = sum(
-            cfg.margin_usdt * (cfg.dca_multiplier ** i)
-            for i in range(cfg.max_dca + 1)
-        )
-        import json as _json
+        self._trail_price     = None
+
+        # Lock scalp levels
+        self._scalp_tp_price    = levels["tp_price"]
+        self._scalp_sl_price    = levels["sl_price"]
+        self._scalp_tp_pct      = levels["tp_pct"]
+        self._scalp_sl_pct      = levels["sl_pct"]
+        self._scalp_atr_pct     = levels["atr_pct"]
+
+        # Track candle time for time-based exit
+        self._entry_candle_time = self.candles[-1]["time"] if self.candles else 0
+
+        # Persist locked levels to DB for restart recovery
         await update_session(
             self._session["id"],
-            entry_adaptive=_json.dumps(self._entry_adaptive),
-            margin_envelope=self._margin_envelope,
+            scalp_tp_price=self._scalp_tp_price,
+            scalp_sl_price=self._scalp_sl_price,
+            scalp_tp_pct=self._scalp_tp_pct,
+            scalp_sl_pct=self._scalp_sl_pct,
+            scalp_atr_pct=self._scalp_atr_pct,
+            scalp_entry_candle_time=self._entry_candle_time,
         )
 
-        await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
+        await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
+                         signal.get("components", {}), "entry")
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
-            f"OPEN {direction} @ {fill_price:.4f}  "
-            f"qty={qty}  margin={effective_margin}  strength={strength:.2f}"
+            f"SCALP {direction} @ {fill_price:.4f}  "
+            f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
+            f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
+            f"R:R={rr_ratio:.2f}  ATR={atr_pct:.2f}%"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
         self._pos_log("open", direction=direction, price=fill_price, qty=qty,
-                      symbol=cfg.symbol, mode=cfg.trading_mode)
+                      symbol=cfg.symbol, mode=cfg.trading_mode,
+                      tp=self._scalp_tp_price, sl=self._scalp_sl_price, rr=rr_ratio)
         self._push_session()
 
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
             "symbol":    cfg.symbol,
             "direction": direction,
             "price":     fill_price,
-            "margin":    effective_margin,
-            "strength":  strength,
+            "margin":    cfg.margin_usdt,
+            "tp_price":  self._scalp_tp_price,
+            "sl_price":  self._scalp_sl_price,
+            "rr_ratio":  rr_ratio,
             "trading_mode": cfg.trading_mode,
         })
 
     # ------------------------------------------------------------------
-    # Position management
+    # Position management — 3 exits: TP / SL / time
     # ------------------------------------------------------------------
 
     async def _manage_position(
@@ -967,1365 +603,131 @@ class TradingEngine:
         ind: Dict,
         atr_val: float,
     ) -> None:
-        sess        = self._session
-        direction   = sess["direction"]
-        avg_price   = sess["avg_price"]
-        qty         = sess["qty"]
-        leverage    = sess["leverage"]
-        dca_count   = sess["dca_count"]
-        hedge_count = sess["hedge_count"]
+        sess      = self._session
+        direction = sess["direction"]
+        avg_price = sess["avg_price"]
+        qty       = sess["qty"]
+        leverage  = sess["leverage"]
 
-        # Refresh _adaptive with current ATR for informational purposes
-        if atr_val > 0 and price > 0:
-            self._adaptive = self._compute_adaptive(atr_val, price)
-
-        # _entry_adaptive is locked at entry; if missing (e.g. after a restart),
-        # initialise from current ATR once and keep it fixed from here on.
-        if not self._entry_adaptive:
-            self._entry_adaptive = self._adaptive or self._compute_adaptive(price * 0.005, price)
-            logger.info(
-                "TradingEngine: entry_adaptive initialised from current ATR "
-                "(tp=%.3f%% sl=%.3f%%)",
-                self._entry_adaptive["tp_pct"],
-                self._entry_adaptive["hard_stop_pct"],
-            )
-
-        # Cache last_resort_sl_buffer so _push_session() can compute correct SL display
-        self._last_resort_buffer_cache = cfg.last_resort_sl_buffer
-
-        # ALL risk decisions use the locked entry levels — never the live ATR
-        p = self._entry_adaptive
-
-        entry_price = sess["entry_price"]
-
-        # price_pct: movement from avg — used for hard stop, hedge trigger, DCA, PnL
-        # entry_pct: movement from original entry — used only for TP arm trigger
         if direction == "LONG":
-            price_pct = (price - avg_price)   / avg_price   * 100
-            entry_pct = (price - entry_price) / entry_price * 100
+            pnl_pct = (price - avg_price) / avg_price * 100 * leverage
         else:
-            price_pct = (avg_price   - price) / avg_price   * 100
-            entry_pct = (entry_price - price) / entry_price * 100
-        pnl_pct = price_pct * leverage
+            pnl_pct = (avg_price - price) / avg_price * 100 * leverage
 
-        # ---- Stop loss checks -----------------------------------------------
-        # Priority 1: Manual UI override
+        # ── Recover locked levels on restart if missing ───────────────────
+        if self._scalp_tp_price is None or self._scalp_sl_price is None:
+            if atr_val > 0:
+                levels = self._compute_scalp_levels(atr_val, avg_price, direction, avg_price, cfg)
+                self._scalp_tp_price = levels["tp_price"]
+                self._scalp_sl_price = levels["sl_price"]
+                self._scalp_tp_pct   = levels["tp_pct"]
+                self._scalp_sl_pct   = levels["sl_pct"]
+                self._scalp_atr_pct  = levels["atr_pct"]
+                logger.warning(
+                    "TradingEngine: scalp levels missing — re-derived from ATR "
+                    "tp=%.4f sl=%.4f", self._scalp_tp_price, self._scalp_sl_price,
+                )
+            else:
+                return  # ATR not ready yet
+
+        # ── Manual UI override SL ─────────────────────────────────────────
         if self._override_sl_price is not None:
             sl_hit = (
                 (direction == "LONG"  and price <= self._override_sl_price) or
                 (direction == "SHORT" and price >= self._override_sl_price)
             )
             if sl_hit:
-                logger.warning(
-                    "TradingEngine: OVERRIDE SL HIT  price=%.4f  sl=%.4f",
-                    price, self._override_sl_price,
-                )
+                logger.warning("TradingEngine: OVERRIDE SL HIT  price=%.6f  sl=%.6f",
+                               price, self._override_sl_price)
                 await self._emergency_close(cfg, price, pnl_pct)
                 return
 
-        # Priority 2: Breakeven stop — set after DCA recovery
-        if self._breakeven_stop_price is not None:
-            be_hit = (
-                (direction == "LONG"  and price <= self._breakeven_stop_price) or
-                (direction == "SHORT" and price >= self._breakeven_stop_price)
+        # ── Exit A — Take Profit ──────────────────────────────────────────
+        tp_price = self._override_tp_price or self._scalp_tp_price
+
+        # Optional partial-TP trail (arm at 60% of tp distance)
+        if cfg.partial_tp and not self._trail_activated:
+            entry = sess["entry_price"]
+            tp_dist = abs(tp_price - entry)
+            arm_dist = tp_dist * 0.60
+            if direction == "LONG":
+                arm_at = entry + arm_dist
+                if price >= arm_at:
+                    trail_dist = tp_dist * 0.30
+                    self._trail_activated = True
+                    self._trail_price     = price - trail_dist
+                    await update_session(sess["id"], trail_active=1,
+                                        trail_price=self._trail_price)
+                    logger.info("TradingEngine: partial-TP trail armed @ %.6f  trail=%.6f",
+                                price, self._trail_price)
+            else:
+                arm_at = entry - arm_dist
+                if price <= arm_at:
+                    trail_dist = tp_dist * 0.30
+                    self._trail_activated = True
+                    self._trail_price     = price + trail_dist
+                    await update_session(sess["id"], trail_active=1,
+                                        trail_price=self._trail_price)
+
+        if self._trail_activated and self._trail_price is not None:
+            trail_dist = abs(tp_price - sess["entry_price"]) * 0.30
+            if direction == "LONG":
+                new_trail = price - trail_dist
+                if new_trail > self._trail_price:
+                    self._trail_price = new_trail
+                    await update_session(sess["id"], trail_price=self._trail_price)
+                if price <= self._trail_price:
+                    logger.info("TradingEngine: PARTIAL-TP TRAIL HIT  price=%.6f  trail=%.6f",
+                                price, self._trail_price)
+                    await self._close_position(cfg, price, pnl_pct, "take_profit_trail")
+                    return
+            else:
+                new_trail = price + trail_dist
+                if new_trail < self._trail_price:
+                    self._trail_price = new_trail
+                    await update_session(sess["id"], trail_price=self._trail_price)
+                if price >= self._trail_price:
+                    await self._close_position(cfg, price, pnl_pct, "take_profit_trail")
+                    return
+        else:
+            # Hard TP: close the moment price crosses tp_price
+            tp_hit = (
+                (direction == "LONG"  and price >= tp_price) or
+                (direction == "SHORT" and price <= tp_price)
             )
-            if be_hit:
-                logger.info(
-                    "TradingEngine: BREAKEVEN STOP HIT  price=%.4f  be_stop=%.4f",
-                    price, self._breakeven_stop_price,
-                )
-                await self._close_position(cfg, price, pnl_pct, "breakeven_stop")
+            if tp_hit:
+                logger.info("TradingEngine: TAKE PROFIT HIT  price=%.6f  tp=%.6f  pnl=%.2f%%",
+                            price, tp_price, pnl_pct)
+                await self._close_position(cfg, price, pnl_pct, "take_profit")
                 return
 
-        # Priority 3: Last resort SL — liquidation buffer, black-swan only
-        # At 10× leverage liq is ~10% away; last_resort_sl_buffer=0.80 → fires at 8%.
-        liq_distance_pct = (1.0 / leverage) * 100
-        last_resort_pct  = liq_distance_pct * cfg.last_resort_sl_buffer
-        if price_pct <= -last_resort_pct:
-            logger.error(
-                "TradingEngine: LAST RESORT SL HIT  price=%.4f  "
-                "liq_dist=%.2f%%  buffer=%.2f  sl_pct=%.2f%%",
-                price, liq_distance_pct, cfg.last_resort_sl_buffer, last_resort_pct,
-            )
+        # ── Exit B — Stop Loss (hard) ─────────────────────────────────────
+        sl_price = self._scalp_sl_price
+        sl_hit = (
+            (direction == "LONG"  and price <= sl_price) or
+            (direction == "SHORT" and price >= sl_price)
+        )
+        if sl_hit:
+            logger.warning("TradingEngine: STOP LOSS HIT  price=%.6f  sl=%.6f  pnl=%.2f%%",
+                           price, sl_price, pnl_pct)
             await self._emergency_close(cfg, price, pnl_pct)
             return
 
-        # ---- Take-profit / trailing TP (entry-based — never drifts with DCA) -
-        if await self._check_tp(cfg, price, entry_pct, pnl_pct, direction, p):
-            return
-
-        # ---- Smart SL: signal-confirmed early exit (priority over DCA) ------
-        # Fires when position has moved meaningfully against us (>= 50% of DCA
-        # step) AND opposite signal confirmed for 5 consecutive ticks.
-        # Using dca_step*0.5 as threshold (not min_profit_pct) prevents false
-        # exits on tiny dips + momentary signal flips — position must be in a
-        # real adverse move before Smart SL considers exiting.
-        # 5 ticks (vs 3) gives more confirmation, reducing false positives.
-        if (
-            price_pct <= -(p["dca_step_pct"] * 0.5)
-            and not self._trail_activated
-            and not self._hedges
-        ):
-            opposite = "SHORT" if direction == "LONG" else "LONG"
-            strong_opposite = (
-                signal["direction"] == opposite
-                and signal["filters_passed"]
-            )
-            if strong_opposite:
-                self._smart_sl_ticks += 1
-                if self._smart_sl_ticks >= max(10, 5 * cfg.tf_minutes):
-                    logger.info(
-                        "TradingEngine: SMART SL — signal %s str=%.2f "
-                        "confirmed %d ticks, price_pct=%.3f%% dca=%d/%d",
-                        signal["direction"], signal["strength"],
-                        self._smart_sl_ticks, price_pct,
-                        dca_count, cfg.max_dca,
-                    )
-                    self._smart_sl_ticks = 0
-                    await self._close_position(cfg, price, pnl_pct, "smart_sl")
-                    return
-            else:
-                self._smart_sl_ticks = 0
-        else:
-            self._smart_sl_ticks = 0
-
-        # ---- Signal degradation exit: conviction gone while losing ----------
-        # If position is losing by at least half a DCA step AND signal has been
-        # NEUTRAL for 15 consecutive ticks (15 seconds), exit cleanly.
-        # Using dca_step*0.5 threshold (same as Smart SL) prevents firing on
-        # tiny dips. 15 ticks gives position time to develop before declaring
-        # conviction lost. This complements Smart SL which handles OPPOSITE
-        # signal — this handles the NEUTRAL case (neither confirms nor denies).
-        if (
-            price_pct <= -(p["dca_step_pct"] * 0.5)
-            and not self._trail_activated
-            and not self._hedges
-            and not self._rescue_mode
-            and signal["direction"] == "NEUTRAL"
-        ):
-            self._signal_degraded_ticks += 1
-            if self._signal_degraded_ticks >= max(15, 15 * cfg.tf_minutes // 3):
-                self._signal_degraded_ticks = 0
-                if dca_count < cfg.max_dca:
-                    # DCA available — rescue: lower avg, then tight trail
-                    logger.info(
-                        "TradingEngine: SIGNAL DEGRADATION — NEUTRAL %d ticks "
-                        "price_pct=%.3f%% dca=%d/%d — executing rescue DCA",
-                        max(15, 15 * cfg.tf_minutes // 3), price_pct,
-                        dca_count, cfg.max_dca,
-                    )
-                    await self._try_rescue_dca(
-                        cfg, price, direction, avg_price, qty, dca_count, atr_val, ind=ind
-                    )
-                else:
-                    # All DCAs exhausted — exit immediately
-                    logger.info(
-                        "TradingEngine: SIGNAL DEGRADATION EXIT — NEUTRAL, "
-                        "no DCA left, price_pct=%.3f%%",
-                        price_pct,
-                    )
-                    await self._close_position(cfg, price, pnl_pct, "signal_degraded")
-                return
-        else:
-            if not self._rescue_mode:
-                self._signal_degraded_ticks = 0
-
-        # ---- Rescue trail: signal-adaptive trail armed after rescue DCA ------
-        # Once rescue mode is active, track the best price and exit on pullback.
-        # Trail width adapts to current signal:
-        #   Signal recovered (same dir) → loosen: 1.0 + strength (1.0×–2.0×)
-        #   Signal NEUTRAL              → tight:  0.5×
-        #   Signal OPPOSITE             → very tight: 0.3× (Smart SL also fires)
-        # This gives the position room to run if conviction returns, while
-        # exiting quickly if the signal stays gone or reverses.
-        if self._rescue_mode and self._rescue_trail_price is not None:
-            if signal["direction"] == direction and signal["filters_passed"]:
-                rescue_mult = 1.0 + signal["strength"]   # 1.0× – 2.0×
-            elif signal["direction"] == "NEUTRAL":
-                rescue_mult = 0.5
-            else:
-                rescue_mult = 0.5   # opposite — tight but with room
-            rescue_trail_pct = p["trail_pct"] * rescue_mult
-            if direction == "LONG":
-                if price > self._rescue_trail_price:
-                    self._rescue_trail_price = price   # ratchet up
-                rescue_level = self._rescue_trail_price * (1 - rescue_trail_pct / 100)
-                trail_hit    = price <= rescue_level
-            else:
-                if price < self._rescue_trail_price:
-                    self._rescue_trail_price = price   # ratchet down
-                rescue_level = self._rescue_trail_price * (1 + rescue_trail_pct / 100)
-                trail_hit    = price >= rescue_level
-            if trail_hit:
+        # ── Exit C — Time-based flat exit ─────────────────────────────────
+        if self._entry_candle_time and self.candles and len(self.candles) >= 2:
+            tf_secs = max(60, self.candles[-1]["time"] - self.candles[-2]["time"])
+            cur_candle_time = self.candles[-1]["time"]
+            elapsed_candles = max(0, (cur_candle_time - self._entry_candle_time) // tf_secs)
+            if elapsed_candles >= cfg.max_hold_candles:
                 logger.info(
-                    "TradingEngine: RESCUE TRAIL fired @ %.6f  "
-                    "best=%.6f  trail_pct=%.3f%%  price_pct=%.3f%%",
-                    price, self._rescue_trail_price, rescue_trail_pct, price_pct,
+                    "TradingEngine: TIME EXIT — %d candles elapsed (max %d)  pnl=%.2f%%",
+                    elapsed_candles, cfg.max_hold_candles, pnl_pct,
                 )
-                self._rescue_mode        = False
-                self._rescue_trail_price = None
-                await update_session(self._session["id"], rescue_mode=0, rescue_trail_price=None)
-                await self._close_position(cfg, price, pnl_pct, "rescue_trail")
+                await self._close_position(cfg, price, pnl_pct, "time_exit")
                 return
 
-        # ---- Hedge management -----------------------------------------------
-        if self._hedges:
-            await self._manage_hedges(cfg, price, price_pct, pnl_pct, p, signal)
-            if self._session is None:
-                return
-
-        # ---- Hedge trigger --------------------------------------------------
-        if (
-            not self._hedges
-            and price_pct <= -p["hedge_trigger_pct"]
-            and hedge_count < cfg.max_re_hedge
-        ):
-            # Force hedge open if price has moved 1.5× the hedge trigger regardless
-            # of signal — at this depth the loss is significant enough that protection
-            # takes priority over signal conviction.
-            force_hedge = price_pct <= -(p["hedge_trigger_pct"] * 1.5)
-
-            if signal["direction"] == direction and signal["filters_passed"] and not force_hedge:
-                logger.info(
-                    "TradingEngine: hedge skipped — signal agrees with main (%s)", direction
-                )
-                self._broadcast({"type": "notification",
-                                 "text": f"Hedge skipped: signal agrees with {direction}"})
-            else:
-                if force_hedge and signal["direction"] == direction:
-                    logger.warning(
-                        "TradingEngine: hedge force-opened at %.2f%% adverse "
-                        "(signal agrees but threshold 1.5× exceeded)",
-                        abs(price_pct),
-                    )
-                await self._open_hedge(cfg, price, direction, qty)
-            return
-
-        # ---- Breakeven stop activation — only AFTER trail is armed ----------
-        # Breakeven purpose: if trail is armed and price reverses hard, ensure
-        # we exit near flat rather than giving back everything.
-        # Do NOT arm before trail — that causes immediate flat closes after DCA.
-        if (
-            cfg.breakeven_stop
-            and dca_count > 0
-            and self._breakeven_stop_price is None
-            and self._trail_activated                       # ← trail must be armed FIRST
-            and price_pct >= p["min_profit_pct"]
-        ):
-            fee_pct = (cfg.taker_fee_pct / 100) * 2
-            if direction == "LONG":
-                be_price = avg_price * (1 + fee_pct)
-            else:
-                be_price = avg_price * (1 - fee_pct)
-            self._breakeven_stop_price = be_price
-            await update_session(self._session["id"], breakeven_stop_price=be_price)
-            logger.info(
-                "TradingEngine: breakeven stop SET @ %.6f  (avg=%.6f  trail_active=True)",
-                be_price, avg_price,
-            )
-            self._broadcast({"type": "notification",
-                             "text": f"Breakeven stop armed @ {be_price:.4f}"})
-            self._push_session()
-
-        # ---- Signal-aware exit: all DCAs used and price has recovered --------
-        # Three-tier decision based on current signal direction and strength.
-        if (
-            dca_count > 0
-            and price_pct > 0
-            and not self._trail_activated
-            and not self._hedges
-        ):
-            sig_dir      = signal.get("direction", "NEUTRAL")
-            sig_strength = signal.get("strength", 0.0)
-            sig_passed   = signal.get("filters_passed", False)
-            strong_threshold = cfg.min_signal_strength * 1.5
-
-            if sig_dir == direction and sig_passed:
-                # Signal confirms trade direction — momentum still valid.
-                # Arm the trail and let the position run rather than cutting early.
-                if sig_strength >= strong_threshold:
-                    # Strong confirmation: normal trail, full run.
-                    logger.info(
-                        "TradingEngine: DCA recovery — signal STRONG %s (%.2f) — "
-                        "arming trail, letting position run",
-                        sig_dir, sig_strength,
-                    )
-                    # Trail will be armed naturally on the next tick when
-                    # _check_tp() sees entry_pct >= tp_pct. Nothing to do here
-                    # except NOT closing — just return to let normal flow continue.
-                else:
-                    # Weak confirmation: arm trail but tighten it proactively.
-                    # Position still has upside but conviction is low.
-                    self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
-                    await update_session(self._session["id"], trail_pct_mult=self._trail_pct_mult)
-                    logger.info(
-                        "TradingEngine: DCA recovery — signal WEAK %s (%.2f) — "
-                        "trail tightened to %.1f×, letting position run",
-                        sig_dir, sig_strength, self._trail_pct_mult,
-                    )
-                self._broadcast({
-                    "type": "notification",
-                    "text": (
-                        f"DCA recovered — signal {sig_dir} ({sig_strength:.2f}) — "
-                        f"trailing, not closing early"
-                    ),
-                })
-
-            elif sig_dir != direction and sig_passed:
-                # Signal has flipped opposite — momentum has ended or reversed.
-                # Take the profit now before the reversal eats it back.
-                logger.info(
-                    "TradingEngine: DCA recovery — signal OPPOSITE %s vs %s — "
-                    "closing now at +%.3f%% before reversal",
-                    sig_dir, direction, price_pct,
-                )
-                await self._close_position(cfg, price, pnl_pct, "profit_first")
-                return
-
-            else:
-                # Signal is NEUTRAL or filters not passed — uncertain market.
-                # Arm the trail and set breakeven stop: protect capital but
-                # don't force an early exit if momentum resumes.
-                self._trail_pct_mult = min(self._trail_pct_mult, 0.7)
-                await update_session(self._session["id"], trail_pct_mult=self._trail_pct_mult)
-                logger.info(
-                    "TradingEngine: DCA recovery — signal NEUTRAL — "
-                    "arming tight trail + breakeven stop",
-                )
-                self._broadcast({
-                    "type": "notification",
-                    "text": (
-                        f"DCA recovered — signal neutral — "
-                        f"tight trail armed, breakeven protected"
-                    ),
-                })
-                # Breakeven stop will be set by the existing block above on the
-                # next tick when price_pct > 0 and dca_count > 0.
-
-        # ---- DCA ------------------------------------------------------------
-        # Compute SL-aware effective DCA step.
-        # Distribute remaining DCAs evenly within the safe zone (85% of distance
-        # from avg_price to Last Resort SL). If ATR-based step fits, use it as-is.
-        # If not, compress spacing so all DCAs fit before the SL fires.
-        _liq_pct      = (1.0 / leverage) * 100 if leverage > 0 else 10.0
-        _sl_pct       = _liq_pct * cfg.last_resort_sl_buffer
-        _remaining    = cfg.max_dca - dca_count
-        _SAFETY       = 0.85
-        _safe_zone    = _sl_pct * _SAFETY   # % distance available (safe)
-        if _remaining > 0:
-            _max_step = _safe_zone / _remaining   # compress if needed
-            _eff_step = min(p["dca_step_pct"], _max_step)
-        else:
-            _eff_step = p["dca_step_pct"]
-
-        if dca_count < cfg.max_dca and price_pct <= -_eff_step and not self._hedges and not self._rescue_mode:
-            opposite = "SHORT" if direction == "LONG" else "LONG"
-
-            # Gate 1: Signal must not actively disagree with main direction
-            if signal["direction"] == opposite and signal["filters_passed"]:
-                logger.info(
-                    "TradingEngine: DCA skipped — signal disagrees (%s vs main %s)",
-                    signal["direction"], direction,
-                )
-                self._broadcast({"type": "notification",
-                                 "text": f"DCA skipped: signal disagrees ({signal['direction']} vs {direction})"})
-                return  # hard return, not just else
-
-            # Gate 1b: Block DCA only when signal is completely NEUTRAL (no direction at all).
-            # Strength is NOT checked here — when price is falling, signal naturally weakens
-            # but that is exactly when DCA is needed. Blocking on low strength would prevent
-            # averaging down at the right moment (as seen in practice: 5.1% strength blocked
-            # a valid DCA when price was -9% from entry with LONG signal still intact).
-            if signal["direction"] == "NEUTRAL":
-                logger.info(
-                    "TradingEngine: DCA skipped — signal fully NEUTRAL, no supporting evidence"
-                )
-                self._broadcast({"type": "notification",
-                                 "text": "DCA skipped: signal NEUTRAL"})
-                return
-
-            # Gate 2: Smart DCA reversal-indicator gate
-            if cfg.smart_dca_gate:
-                reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
-                if reversal_count < cfg.smart_dca_signals:
-                    logger.debug(
-                        "TradingEngine: DCA gated — reversal signals %d/%d",
-                        reversal_count, cfg.smart_dca_signals,
-                    )
-                    self._broadcast({"type": "notification",
-                                     "text": f"DCA gated: {reversal_count}/{cfg.smart_dca_signals} reversal signals"})
-                    return
-
-            # Gate 3: Minimum time between DCAs (prevents rapid DCA burn)
-            # Even if all other gates pass, enforce a cooldown between DCAs.
-            now = time.time()
-            min_dca_gap_s = max(_eff_step * 60, 120)  # at least 2 min, scales with effective step
-            if self._last_dca_time is not None:
-                elapsed = now - self._last_dca_time
-                if elapsed < min_dca_gap_s:
-                    logger.debug(
-                        "TradingEngine: DCA time-gated — %.0fs since last DCA (need %.0fs)",
-                        elapsed, min_dca_gap_s,
-                    )
-                    return
-
-            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val, signal=signal)
-
-    # ------------------------------------------------------------------
-    # Take-profit logic (trailing + fixed floor)
-    # ------------------------------------------------------------------
-
-    async def _check_tp(
-        self,
-        cfg: BotConfig,
-        price: float,
-        entry_pct: float,
-        pnl_pct: float,
-        direction: str,
-        p: Dict[str, float],
-    ) -> bool:
-        """
-        Returns True if position was closed.
-        entry_pct: price movement from original entry price (not avg).
-        Using entry_price keeps the TP arm target fixed — it never drifts
-        downward when DCA lowers avg_price.
-        """
-        tp_pct = p["tp_pct"]
-        # Apply tighten-only momentum multiplier. Floor at 0.10% so trail
-        # never becomes so tight that a single tick triggers an exit.
-        trail_pct = max(p["trail_pct"] * self._trail_pct_mult, 0.10)
-
-        # TP arm: use manual override price if set, else entry-based %
-        if self._override_tp_price is not None:
-            tp_reached = (
-                (direction == "LONG"  and price >= self._override_tp_price) or
-                (direction == "SHORT" and price <= self._override_tp_price)
-            )
-        else:
-            sess      = self._session
-            dca_count = sess["dca_count"] if sess else 0
-            if dca_count > 0:
-                # After DCA, original entry is above avg. Using entry_pct means
-                # trail requires price to reach entry + tp_pct — unreachable
-                # because breakeven fires at avg + fees first.
-                # Solution: arm trail from avg after DCA.
-                avg_p = sess["avg_price"]
-                if direction == "LONG":
-                    pct_from_avg = (price - avg_p) / avg_p * 100
-                else:
-                    pct_from_avg = (avg_p - price) / avg_p * 100
-                tp_reached = pct_from_avg >= tp_pct
-            else:
-                # No DCA — use entry-based TP (original behaviour)
-                tp_reached = entry_pct >= tp_pct
-
-        if tp_reached:
-            if not self._trail_activated:
-                # First time price reaches the TP level — arm the trail
-                self._trail_activated = True
-                if direction == "LONG":
-                    self._trail_price = price * (1 - trail_pct / 100)
-                else:
-                    self._trail_price = price * (1 + trail_pct / 100)
-                logger.info("TradingEngine: trailing TP activated @ %.6f", self._trail_price)
-                await update_session(
-                    self._session["id"],
-                    trail_active=1,
-                    trail_price=self._trail_price,
-                )
-                self._push_session()
-                return False
-            else:
-                # Trail already armed — ratchet it in the favourable direction
-                moved = False
-                if direction == "LONG":
-                    new_trail = price * (1 - trail_pct / 100)
-                    if new_trail > self._trail_price:
-                        self._trail_price = new_trail
-                        moved = True
-                else:
-                    new_trail = price * (1 + trail_pct / 100)
-                    if new_trail < self._trail_price:
-                        self._trail_price = new_trail
-                        moved = True
-                if moved:
-                    await update_session(
-                        self._session["id"],
-                        trail_price=self._trail_price,
-                    )
-                    self._push_session()
-
-        if self._trail_activated and self._trail_price is not None:
-            # Safety: trail_price should never be above current price for SHORT
-            # or below current price for LONG — guard against any edge case.
-            if direction == "LONG" and self._trail_price >= price:
-                # Trail stop is at or above current price — ratchet it down to safe level
-                self._trail_price = price * (1 - max(p["trail_pct"] * self._trail_pct_mult, 0.10) / 100)
-            elif direction == "SHORT" and self._trail_price <= price:
-                self._trail_price = price * (1 + max(p["trail_pct"] * self._trail_pct_mult, 0.10) / 100)
-
-            trail_hit = (
-                (direction == "LONG"  and price <= self._trail_price)
-                or (direction == "SHORT" and price >= self._trail_price)
-            )
-            if trail_hit:
-                # Partial TP: close partial_tp_ratio fraction, keep the rest running
-                if cfg.partial_tp and not self._partial_tp_done:
-                    sess      = self._session
-                    qty       = sess["qty"]
-                    close_qty = self._executor.round_qty(
-                        cfg.symbol, qty * cfg.partial_tp_ratio
-                    )
-                    if 0 < close_qty < qty:
-                        side = "SELL" if direction == "LONG" else "BUY"
-                        order = await self._executor.place_market_order(
-                            cfg.symbol, side, close_qty, reduce_only=True, current_price=price
-                        )
-                        _oid = int(order.get("orderId", 0))
-                        if _oid:
-                            self._bot_close_order_ids.add(_oid)
-                        fill_price = float(order.get("avgPrice") or price)
-                        remain_qty    = qty - close_qty
-                        remain_margin = sess["margin"] * (remain_qty / qty)
-                        partial_realized = pnl_pct / 100 * (sess["margin"] * cfg.partial_tp_ratio)
-                        await update_session(
-                            self._session["id"],
-                            qty=remain_qty,
-                            margin=remain_margin,
-                        )
-                        self._session = await get_open_session()
-                        self._partial_tp_done = True
-                        # Disarm trail so it re-arms on the next TP touch
-                        self._trail_activated = False
-                        self._trail_price     = None
-                        await update_session(self._session["id"], trail_active=0, trail_price=None)
-                        msg = (
-                            f"{_mode_prefix(cfg.trading_mode)}"
-                            f"PARTIAL TP {direction} @ {fill_price:.4f}  "
-                            f"pnl={partial_realized:+.4f}  remain={remain_qty:.6f}"
-                        )
-                        logger.info("TradingEngine: %s", msg)
-                        self._broadcast({"type": "notification", "text": msg})
-                        self._pos_log(
-                            "partial_tp", direction=direction, price=fill_price,
-                            pnl=round(partial_realized, 4),
-                            symbol=cfg.symbol, mode=cfg.trading_mode,
-                        )
-                        self._push_session()
-                        return False
-
-                await self._close_position(cfg, price, pnl_pct, "trailing_tp")
-                return True
-
-        return False
-
-    # ------------------------------------------------------------------
-    # DCA
-    # ------------------------------------------------------------------
-
-    async def _try_dca(
-        self,
-        cfg: BotConfig,
-        price: float,
-        direction: str,
-        avg_price: float,
-        qty: float,
-        dca_count: int,
-        atr_val: float = 0.0,
-        signal: Dict = None,
-    ) -> None:
-        """DCA with 5-second adverse pressure confirmation."""
-        confirmed = self._flow.check_adverse_pressure(direction, required_seconds=5.0)
-        if not confirmed:
-            logger.debug("TradingEngine: DCA pending — adverse pressure not confirmed yet")
-            return
-
-        self._last_dca_time = time.time()
-        self._smart_sl_ticks = 0   # DCA fired — reset smart SL counter
-        self._signal_degraded_ticks = 0
-
-        # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
-        dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
-        # Scale by signal strength — floors at 0.6 so averaging effect stays meaningful
-        if cfg.strength_sizing and signal is not None:
-            sig_strength = signal.get("strength", 1.0)
-            dca_strength_scale = max(sig_strength, 0.6)
-            dca_margin = dca_margin * dca_strength_scale
-
-        # Cumulative margin guard: total deployed must not exceed theoretical max envelope
-        max_total_margin = sum(
-            cfg.margin_usdt * (cfg.dca_multiplier ** i)
-            for i in range(cfg.max_dca + 1)
-        )
-        current_margin = self._session.get("margin", 0.0) if self._session else 0.0
-        if current_margin + dca_margin > max_total_margin * 1.05:
-            logger.warning(
-                "TradingEngine: DCA blocked — cumulative margin %.2f + %.2f would exceed "
-                "max envelope %.2f",
-                current_margin, dca_margin, max_total_margin,
-            )
-            self._broadcast({"type": "notification",
-                             "text": f"DCA blocked: margin envelope exceeded "
-                                     f"(total={current_margin+dca_margin:.1f} > max={max_total_margin:.1f})"})
-            return
-
-        session_leverage = self._session.get("leverage", cfg.leverage)
-        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
-        fee_adjusted_dca_margin = dca_margin / fee_factor
-        new_qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_dca_margin, session_leverage, price)
-        side = "BUY" if direction == "LONG" else "SELL"
-        order = await self._executor.place_market_order(
-            cfg.symbol, side, new_qty, current_price=price
-        )
-        fill_price = float(order.get("avgPrice") or price)
-
-        # Track this order so _on_user_data can reblend with the true fill price.
-        # Store the pre-DCA state so the callback can compute: (prior_avg*prior_qty + fill*new_qty) / total
-        order_id = int(order.get("orderId", 0))
-        if order_id:
-            self._pending_fills[order_id] = {"type": "dca", "prior_qty": qty, "prior_avg": avg_price, "new_qty": new_qty}
-
-        total_qty = qty + new_qty
-        new_avg = (avg_price * qty + fill_price * new_qty) / total_qty
-
-        await update_session(
-            self._session["id"],
-            avg_price=new_avg,
-            qty=total_qty,
-            margin=self._session["margin"] + dca_margin,
-            dca_count=dca_count + 1,
-        )
-        self._session = await get_open_session()
-
-        # Manual overrides no longer make sense after averaging down — clear them
-        # so the engine resumes ATR-based levels for the new avg price.
-        self._clear_level_overrides("dca")
-        self._breakeven_stop_price = None  # will re-arm on next recovery above avg
-        await update_session(self._session["id"], breakeven_stop_price=None)
-
-        # Recalculate risk thresholds from current ATR at DCA time.
-        # Market volatility may have changed since entry; refreshing here keeps
-        # SL/dca/hedge thresholds aligned with actual conditions after each capital add.
-        # tp_pct is preserved: the TP arm is anchored to entry_price and must not
-        # drift when DCA lowers avg_price.
-        if atr_val > 0 and price > 0:
-            old_tp_pct = self._entry_adaptive.get("tp_pct")
-            self._entry_adaptive = self._compute_adaptive(atr_val, price)
-            if old_tp_pct is not None:
-                self._entry_adaptive["tp_pct"] = old_tp_pct
-            import json as _json
-            await update_session(
-                self._session["id"],
-                entry_adaptive=_json.dumps(self._entry_adaptive),
-            )
-            logger.info(
-                "TradingEngine: entry_adaptive recalculated at DCA #%d "
-                "(tp=%.3f%% sl=%.3f%%)",
-                dca_count + 1,
-                self._entry_adaptive["tp_pct"],
-                self._entry_adaptive["hard_stop_pct"],
-            )
-
-        msg = (
-            f"{_mode_prefix(cfg.trading_mode)}"
-            f"DCA #{dca_count+1} {direction} @ {fill_price:.4f}  "
-            f"new_avg={new_avg:.4f}  total_qty={total_qty:.4f}"
-        )
-        logger.info("TradingEngine: %s", msg)
-        self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("dca", direction=direction, price=fill_price, qty=new_qty,
-                      dca_n=dca_count + 1, new_avg=round(new_avg, 6),
-                      symbol=cfg.symbol, mode=cfg.trading_mode)
+        # Update UI with latest position state
         self._push_session()
-
-        await log_signal(cfg.symbol, direction, 0.0, {}, "dca")
-        await notify(cfg.discord_webhook, "TRADE_DCA", {
-            "symbol":    cfg.symbol,
-            "direction": direction,
-            "level":     dca_count + 1,
-            "price":     fill_price,
-            "new_avg":   new_avg,
-            "total_margin": self._session["margin"],
-            "trading_mode": cfg.trading_mode,
-        })
-
-    async def _try_rescue_dca(
-        self,
-        cfg: BotConfig,
-        price: float,
-        direction: str,
-        avg_price: float,
-        qty: float,
-        dca_count: int,
-        atr_val: float = 0.0,
-        ind: Dict = None,
-    ) -> None:
-        """
-        Rescue DCA — bypasses normal signal gates and adverse pressure check.
-        Called when signal degrades while position is losing. Lowers avg
-        price then arms a tight trailing stop to minimize the eventual loss.
-        """
-        # Cooldown: same minimum gap as normal DCA to avoid rapid re-entries
-        now = time.time()
-        eff_step = self._entry_adaptive.get("dca_step_pct", 0.5) if self._entry_adaptive else 0.5
-        min_gap_s = max(eff_step * 60, 120)
-        if self._last_dca_time is not None and (now - self._last_dca_time) < min_gap_s:
-            logger.info(
-                "TradingEngine: rescue DCA cooldown — %.0fs since last DCA (need %.0fs)",
-                now - self._last_dca_time, min_gap_s,
-            )
-            return
-
-        # Require at least 1 reversal signal — rescue is permissive but not blind
-        if ind is not None:
-            reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
-            if reversal_count < 1:
-                logger.info(
-                    "TradingEngine: rescue DCA blocked — 0 reversal signals "
-                    "(RSI/BB/MACD/Stoch all neutral)"
-                )
-                self._broadcast({"type": "notification",
-                                 "text": "Rescue DCA blocked: no reversal signal detected"})
-                return
-
-        dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
-        # Scale by reversal conviction — floors at 0.6 to keep averaging effect meaningful
-        if cfg.strength_sizing and ind is not None:
-            reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
-            rescue_strength_scale = max(reversal_count / 4.0, 0.6)
-            dca_margin = dca_margin * rescue_strength_scale
-
-        # SL proximity guard: block if price is within 20% of last resort SL distance
-        sess_leverage   = self._session.get("leverage", cfg.leverage) if self._session else cfg.leverage
-        liq_pct         = (1.0 / sess_leverage) * 100 if sess_leverage > 0 else 10.0
-        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
-        sl_proximity_cutoff = last_resort_pct * 0.80
-        if avg_price > 0:
-            price_pct_now = ((price - avg_price) / avg_price * 100) if direction == "LONG" \
-                            else ((avg_price - price) / avg_price * 100)
-        else:
-            price_pct_now = 0.0
-        if price_pct_now <= -sl_proximity_cutoff:
-            logger.warning(
-                "TradingEngine: rescue DCA blocked — price_pct=%.2f%% within SL proximity "
-                "(cutoff=%.2f%%, last_resort=%.2f%%)",
-                price_pct_now, sl_proximity_cutoff, last_resort_pct,
-            )
-            self._broadcast({"type": "notification",
-                             "text": f"Rescue DCA blocked: too close to SL "
-                                     f"({price_pct_now:.1f}% vs -{sl_proximity_cutoff:.1f}% limit)"})
-            return
-
-        # Cumulative margin guard: total deployed must not exceed theoretical max envelope
-        max_total_margin = sum(
-            cfg.margin_usdt * (cfg.dca_multiplier ** i)
-            for i in range(cfg.max_dca + 1)
-        )
-        current_margin = self._session.get("margin", 0.0) if self._session else 0.0
-        if current_margin + dca_margin > max_total_margin * 1.05:
-            logger.warning(
-                "TradingEngine: DCA blocked — cumulative margin %.2f + %.2f would exceed "
-                "max envelope %.2f",
-                current_margin, dca_margin, max_total_margin,
-            )
-            self._broadcast({"type": "notification",
-                             "text": f"DCA blocked: margin envelope exceeded "
-                                     f"(total={current_margin+dca_margin:.1f} > max={max_total_margin:.1f})"})
-            return
-
-        session_leverage = self._session.get("leverage", cfg.leverage)
-        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
-        fee_adjusted_dca_margin = dca_margin / fee_factor
-        new_qty    = self._executor.calc_qty(cfg.symbol, fee_adjusted_dca_margin, session_leverage, price)
-        side       = "BUY" if direction == "LONG" else "SELL"
-
-        order = await self._executor.place_market_order(
-            cfg.symbol, side, new_qty, current_price=price
-        )
-        fill_price = float(order.get("avgPrice") or price)
-
-        order_id = int(order.get("orderId", 0))
-        if order_id:
-            self._pending_fills[order_id] = {
-                "type": "dca", "prior_qty": qty,
-                "prior_avg": avg_price, "new_qty": new_qty,
-            }
-
-        total_qty = qty + new_qty
-        new_avg   = (avg_price * qty + fill_price * new_qty) / total_qty
-
-        await update_session(
-            self._session["id"],
-            avg_price=new_avg,
-            qty=total_qty,
-            margin=self._session["margin"] + dca_margin,
-            dca_count=dca_count + 1,
-        )
-        self._session = await get_open_session()
-
-        self._clear_level_overrides("rescue_dca")
-        self._breakeven_stop_price  = None
-        await update_session(self._session["id"], breakeven_stop_price=None)
-        self._last_dca_time         = time.time()
-        self._smart_sl_ticks        = 0
-        self._signal_degraded_ticks = 0
-
-        # Recalculate ATR-based thresholds at DCA price, preserve tp_pct
-        if atr_val > 0 and price > 0:
-            old_tp_pct = self._entry_adaptive.get("tp_pct")
-            self._entry_adaptive = self._compute_adaptive(atr_val, price)
-            if old_tp_pct is not None:
-                self._entry_adaptive["tp_pct"] = old_tp_pct
-            import json as _json
-            await update_session(
-                self._session["id"],
-                entry_adaptive=_json.dumps(self._entry_adaptive),
-            )
-
-        # Arm rescue trail. Initialize best price with a buffer so the trail
-        # doesn't fire on the very first tick due to spread/slippage.
-        # Buffer = 1 DCA step in favorable direction gives the position
-        # minimum room to breathe before trail can trigger.
-        dca_step_pct = self._entry_adaptive.get("dca_step_pct", 0.5)
-        if direction == "LONG":
-            self._rescue_trail_price = fill_price * (1 - dca_step_pct / 100 * 1.0)
-        else:
-            self._rescue_trail_price = fill_price * (1 + dca_step_pct / 100 * 1.0)
-        self._rescue_mode = True
-        await update_session(
-            self._session["id"],
-            rescue_mode=1,
-            rescue_trail_price=self._rescue_trail_price,
-        )
-
-        msg = (
-            f"{_mode_prefix(cfg.trading_mode)}"
-            f"RESCUE DCA #{dca_count+1} {direction} @ {fill_price:.4f}  "
-            f"new_avg={new_avg:.4f}  tight trail armed"
-        )
-        logger.info("TradingEngine: %s", msg)
-        self._broadcast({"type": "notification", "text": msg})
-        self._pos_log(
-            "dca", direction=direction, price=fill_price, qty=new_qty,
-            dca_n=dca_count + 1, new_avg=round(new_avg, 6),
-            symbol=cfg.symbol, mode=cfg.trading_mode,
-        )
-        self._push_session()
-
-        await log_signal(cfg.symbol, direction, 0.0, {}, "rescue_dca")
-        await notify(cfg.discord_webhook, "TRADE_DCA", {
-            "symbol":       cfg.symbol,
-            "direction":    direction,
-            "level":        dca_count + 1,
-            "price":        fill_price,
-            "new_avg":      new_avg,
-            "total_margin": self._session["margin"],
-            "trading_mode": cfg.trading_mode,
-        })
-
-    # ------------------------------------------------------------------
-    # Hedge
-    # ------------------------------------------------------------------
-
-    async def _open_hedge(
-        self,
-        cfg: BotConfig,
-        price: float,
-        main_dir: str,
-        main_qty: float,
-    ) -> None:
-        hedge_dir  = "SHORT" if main_dir == "LONG" else "LONG"
-        hedge_side = "SELL"  if main_dir == "LONG" else "BUY"
-        # Size the hedge to match the current main position (including any DCA).
-        # Using main_qty directly ensures full exposure is offset, not just 1×margin.
-        hedge_qty  = main_qty
-
-        order = await self._executor.place_market_order(
-            cfg.symbol, hedge_side, hedge_qty, current_price=price
-        )
-        fill_price = float(order.get("avgPrice") or price)
-
-        hedge_id = await create_hedge(
-            session_id=self._session["id"],
-            direction=hedge_dir,
-            entry_price=fill_price,
-            qty=hedge_qty,
-            margin=self._session["margin"],  # full accumulated margin incl. DCA
-        )
-        await update_session(
-            self._session["id"],
-            hedge_count=self._session["hedge_count"] + 1,
-        )
-        self._session = await get_open_session()
-        self._hedges = await get_open_hedges(self._session["id"])
-
-        # Overrides are no longer valid once a hedge changes the risk picture
-        self._clear_level_overrides("hedge_open")
-
-        msg = (
-            f"{_mode_prefix(cfg.trading_mode)}"
-            f"HEDGE #{self._session['hedge_count']} {hedge_dir} @ {fill_price:.4f}  qty={hedge_qty}"
-        )
-        logger.info("TradingEngine: %s", msg)
-        self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("hedge_open", direction=hedge_dir, price=fill_price, qty=hedge_qty,
-                      hedge_n=self._session["hedge_count"],
-                      symbol=cfg.symbol, mode=cfg.trading_mode)
-        self._push_session()
-
-        await log_signal(cfg.symbol, hedge_dir, 0.0, {}, "hedge")
-        await notify(cfg.discord_webhook, "HEDGE_OPEN", {
-            "symbol":    cfg.symbol,
-            "direction": hedge_dir,
-            "price":     fill_price,
-            "qty":       hedge_qty,
-            "trading_mode": cfg.trading_mode,
-        })
-
-    async def _manage_hedges(
-        self,
-        cfg: BotConfig,
-        price: float,
-        main_price_pct: float,
-        main_pnl_pct: float,
-        p: Dict[str, float],
-        signal: Dict,
-    ) -> None:
-        """Check if hedges should be closed (recovery or TP)."""
-        sess    = self._session
-        main_dir = sess["direction"]
-
-        for hedge in list(self._hedges):
-            h_dir   = hedge["direction"]
-            h_price = hedge["entry_price"]
-            h_qty   = hedge["qty"]
-
-            if h_dir == "LONG":
-                h_price_pct = (price - h_price) / h_price * 100
-            else:
-                h_price_pct = (h_price - price) / h_price * 100
-
-            # ── Hedge TP: market kept going adverse for main ──────────────
-            if h_price_pct >= p["tp_pct"]:
-                side = "SELL" if h_dir == "LONG" else "BUY"
-                order = await self._executor.place_market_order(
-                    cfg.symbol, side, h_qty, close_hedge=True, current_price=price
-                )
-                fill_price = float(order.get("avgPrice") or price)
-                # PnL = (exit - entry) × qty (futures identity; margin/leverage cancel)
-                if h_dir == "LONG":
-                    h_pnl = (fill_price - h_price) * h_qty
-                else:
-                    h_pnl = (h_price - fill_price) * h_qty
-                await close_hedge(hedge["id"], round(h_pnl, 4))
-                self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
-
-                msg = f"{_mode_prefix(cfg.trading_mode)}HEDGE CLOSED (TP) @ {fill_price:.6f}"
-                logger.info("TradingEngine: %s", msg)
-                self._broadcast({"type": "notification", "text": msg})
-                self._pos_log("hedge_close", direction=h_dir, price=fill_price,
-                              pnl=round(h_pnl, 4), reason="tp",
-                              symbol=cfg.symbol, mode=cfg.trading_mode)
-                self._push_session()
-
-                if main_price_pct >= p["min_profit_pct"]:
-                    await self._close_position(cfg, price, main_pnl_pct, "hedge_tp_close")
-                    return
-
-            # ── Recovery close: main has recovered past fee-breakeven ────
-            # Use min_profit_pct (≥0.10%) rather than 0% so the main has
-            # genuinely covered fees before protection is removed.
-            elif main_price_pct >= p["min_profit_pct"]:
-                # If signal still strongly confirms the hedge direction, defer one
-                # tick — the recovery may be a wick, not a genuine reversal.
-                if (
-                    signal.get("direction") == h_dir
-                    and signal.get("filters_passed", False)
-                    and signal.get("strength", 0.0) >= cfg.min_signal_strength * 1.2
-                ):
-                    logger.debug(
-                        "TradingEngine: recovery close deferred — signal still %s (hedge dir)",
-                        h_dir,
-                    )
-                    continue
-
-                side = "SELL" if h_dir == "LONG" else "BUY"
-                order = await self._executor.place_market_order(
-                    cfg.symbol, side, h_qty, close_hedge=True, current_price=price
-                )
-                fill_price = float(order.get("avgPrice") or price)
-                if h_dir == "LONG":
-                    h_pnl = (fill_price - h_price) * h_qty
-                else:
-                    h_pnl = (h_price - fill_price) * h_qty
-                await close_hedge(hedge["id"], round(h_pnl, 4))
-                self._hedges = [h for h in self._hedges if h["id"] != hedge["id"]]
-
-                msg = (
-                    f"{_mode_prefix(cfg.trading_mode)}"
-                    f"HEDGE CLOSED (recovery) @ {fill_price:.6f}  "
-                    f"hedge_pnl={h_pnl:+.4f}"
-                )
-                logger.info("TradingEngine: %s", msg)
-                self._broadcast({"type": "notification", "text": msg})
-                self._pos_log("hedge_close", direction=h_dir, price=fill_price,
-                              pnl=round(h_pnl, 4), reason="recovery",
-                              symbol=cfg.symbol, mode=cfg.trading_mode)
-                self._push_session()
-
-    # ------------------------------------------------------------------
-    # Close all
-    # ------------------------------------------------------------------
-
-    async def _close_position(
-        self,
-        cfg: BotConfig,
-        price: float,
-        pnl_pct: float,
-        reason: str,
-    ) -> None:
-        self._closing = True
-        try:
-            await self._close_position_inner(cfg, price, pnl_pct, reason)
-        finally:
-            self._closing = False
-
-    async def _close_position_inner(
-        self,
-        cfg: BotConfig,
-        price: float,
-        pnl_pct: float,
-        reason: str,
-    ) -> None:
-        sess      = self._session
-        direction = sess["direction"]
-        qty       = sess["qty"]
-        margin    = sess["margin"]
-        leverage  = sess["leverage"]
-
-        # Close any open hedges first and accumulate their PnL
-        total_hedge_pnl = 0.0
-        for hedge in list(self._hedges):
-            h_side = "SELL" if hedge["direction"] == "LONG" else "BUY"
-            order = await self._executor.place_market_order(
-                cfg.symbol, h_side, hedge["qty"],
-                close_hedge=True, current_price=price,
-            )
-            fill = float(order.get("avgPrice") or price)
-            h_dir = hedge["direction"]
-            if h_dir == "LONG":
-                h_pnl = (fill - hedge["entry_price"]) * hedge["qty"]
-            else:
-                h_pnl = (hedge["entry_price"] - fill) * hedge["qty"]
-            await close_hedge(hedge["id"], round(h_pnl, 4))
-            total_hedge_pnl += h_pnl
-        self._hedges = []
-
-        # Close main
-        side = "SELL" if direction == "LONG" else "BUY"
-        order = await self._executor.place_market_order(
-            cfg.symbol, side, qty, reduce_only=True, current_price=price
-        )
-        _oid = int(order.get("orderId", 0))
-        if _oid:
-            self._bot_close_order_ids.add(_oid)
-        fill_price = float(order.get("avgPrice") or price)
-
-        # Recalculate PnL from the actual fill price, not the tick mark price.
-        # pnl_pct was computed from the last WS price tick in _manage_position();
-        # fill_price is the true exchange-confirmed execution price.
-        avg_price = sess["avg_price"]
-        if direction == "LONG":
-            actual_pnl_pct = (fill_price - avg_price) / avg_price * 100 * leverage
-        else:
-            actual_pnl_pct = (avg_price - fill_price) / avg_price * 100 * leverage
-
-        # Deduct exit taker fee from realized PnL.
-        fees = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
-        realized_pnl = actual_pnl_pct / 100 * margin - fees
-        await close_session(sess["id"], round(realized_pnl, 4), reason,
-                            exit_price=fill_price)
-
-        msg = (
-            f"{_mode_prefix(cfg.trading_mode)}"
-            f"CLOSE {direction} @ {fill_price:.4f}  "
-            f"pnl={realized_pnl:+.4f} USDT ({actual_pnl_pct:+.2f}%)  reason={reason}"
-        )
-        logger.info("TradingEngine: %s", msg)
-        self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("close", direction=direction, price=fill_price,
-                      pnl=round(realized_pnl, 4), pnl_pct=round(actual_pnl_pct, 2),
-                      reason=reason, symbol=cfg.symbol, mode=cfg.trading_mode)
-
-        await log_signal(cfg.symbol, direction, 0.0, {}, "close")
-        await notify(cfg.discord_webhook, "TRADE_CLOSE", {
-            "symbol":    cfg.symbol,
-            "direction": direction,
-            "price":     fill_price,
-            "pnl":       realized_pnl,
-            "pnl_pct":   actual_pnl_pct,
-            "reason":    reason,
-            "trading_mode": cfg.trading_mode,
-        })
-
-        self._session                = None
-        self._hedges                 = []
-        self._trail_activated        = False
-        self._trail_price            = None
-        self._trail_pct_mult         = 1.0
-        self._entry_adaptive         = {}
-        self._override_tp_price      = None
-        self._override_sl_price      = None
-        self._breakeven_stop_price   = None
-        self._partial_tp_done        = False
-        self._last_stop_time         = None   # clear cooldown on normal close
-        self._bot_close_order_ids.clear()
-        self._last_dca_time          = None
-        self._smart_sl_ticks         = 0
-        self._signal_degraded_ticks  = 0
-        self._entry_signal_ticks = 0
-        self._entry_signal_dir   = "NEUTRAL"
-        self._rescue_mode        = False
-        self._rescue_trail_price = None
-        self._push_session()
-
-    async def _emergency_close(
-        self,
-        cfg: BotConfig,
-        price: float,
-        pnl_pct: float,
-    ) -> None:
-        logger.error(
-            "TradingEngine: EMERGENCY CLOSE  pnl_pct=%.2f  price=%.4f", pnl_pct, price
-        )
-        self._broadcast({
-            "type": "notification",
-            "text": f"⚠ HARD STOP triggered @ {price:.4f}  pnl={pnl_pct:+.2f}%",
-        })
-        if self._hedges:
-            hedge_dir = self._hedges[0]["direction"]
-            sig       = self.last_signal
-
-            # Condition A: signal actively confirms hedge direction
-            signal_confirms = (
-                sig.get("direction") == hedge_dir
-                and sig.get("strength", 0.0) >= cfg.min_signal_strength
-                and sig.get("filters_passed", False)
-            )
-            # Condition B: main exhausted its full DCA budget before stopping out
-            all_dcas_used = self._session["dca_count"] >= cfg.max_dca
-
-            if signal_confirms and all_dcas_used:
-                await self._hard_stop_promote_hedge(cfg, price, pnl_pct)
-            else:
-                if not signal_confirms:
-                    logger.info(
-                        "TradingEngine: hedge promotion skipped — "
-                        "signal=%s str=%.2f (need %s @ min %.2f)",
-                        sig.get("direction", "?"), sig.get("strength", 0.0),
-                        hedge_dir, cfg.min_signal_strength,
-                    )
-                if not all_dcas_used:
-                    logger.info(
-                        "TradingEngine: hedge promotion skipped — "
-                        "DCAs not exhausted (%d of %d used)",
-                        self._session["dca_count"], cfg.max_dca,
-                    )
-                await self._close_position(cfg, price, pnl_pct, "hard_stop")
-        else:
-            await self._close_position(cfg, price, pnl_pct, "hard_stop")
-
-        # Discord fires AFTER close — only notify if close actually completed
-        await notify(cfg.discord_webhook, "HARD_STOP", {
-            "symbol":  cfg.symbol,
-            "price":   price,
-            "pnl_pct": pnl_pct,
-            "paper":   cfg.paper_mode,
-        })
-
-        # Arm stop cooldown — prevents immediate re-entry after a hard stop.
-        # Cleared by _close_position_inner on the next normal TP close.
-        self._last_stop_time = time.time()
-
-    async def _hard_stop_promote_hedge(
-        self,
-        cfg: BotConfig,
-        price: float,
-        pnl_pct: float,
-    ) -> None:
-        """
-        Main position hit hard stop while a hedge is open.
-
-        Instead of closing everything:
-          1. Close main Binance position.
-          2. Close 50% of hedge on Binance (lock in partial profit).
-          3. Promote remaining 50% to a new main session with full DCA budget.
-
-        The 50% close reduces exposure before the new main starts, so even
-        if max_dca DCAs fire on the promoted half the total size stays bounded.
-
-        Edge case: if hedge qty == min_qty it cannot be halved — 100% is promoted.
-
-        Example:
-          Main LONG $10 → 2×DCA → $30 total → hedge SHORT $30 opened
-          Main hits hard SL →
-            close main (loss),
-            close SHORT 50% at profit,
-            new MAIN SHORT 50% qty / $15 margin, dca_count=0
-        """
-        self._closing = True
-        try:
-            sess      = self._session
-            direction = sess["direction"]
-            qty       = sess["qty"]
-            margin    = sess["margin"]
-
-            # ── 1. Close main Binance position ─────────────────────────
-            side  = "SELL" if direction == "LONG" else "BUY"
-            order = await self._executor.place_market_order(
-                cfg.symbol, side, qty, reduce_only=True, current_price=price
-            )
-            _oid = int(order.get("orderId", 0))
-            if _oid:
-                self._bot_close_order_ids.add(_oid)
-            fill_price = float(order.get("avgPrice") or price)
-
-            # Recalculate from actual fill price
-            avg_p = sess["avg_price"]
-            if direction == "LONG":
-                actual_pnl_pct = (fill_price - avg_p) / avg_p * 100 * leverage
-            else:
-                actual_pnl_pct = (avg_p - fill_price) / avg_p * 100 * leverage
-
-            fees         = self._estimate_fees(qty, fill_price, cfg.taker_fee_pct)
-            realized_pnl = actual_pnl_pct / 100 * margin - fees
-
-            # ── 2. Close main DB session ────────────────────────────────
-            await close_session(sess["id"], round(realized_pnl, 4), "hard_stop",
-                                exit_price=fill_price)
-            logger.info(
-                "TradingEngine: HARD STOP main CLOSE %s @ %.4f  pnl=%+.4f",
-                direction, fill_price, realized_pnl,
-            )
-            await notify(cfg.discord_webhook, "TRADE_CLOSE", {
-                "symbol":    cfg.symbol,
-                "direction": direction,
-                "price":     fill_price,
-                "pnl":       realized_pnl,
-                "pnl_pct":   actual_pnl_pct,
-                "reason":    "hard_stop",
-                "trading_mode": cfg.trading_mode,
-            })
-
-            # Take the primary hedge; close any extras on Binance (shouldn't happen)
-            primary_hedge = self._hedges[0]
-            for extra in self._hedges[1:]:
-                h_side = "SELL" if extra["direction"] == "LONG" else "BUY"
-                await self._executor.place_market_order(
-                    cfg.symbol, h_side, extra["qty"],
-                    close_hedge=True, current_price=price,
-                )
-                await close_hedge(extra["id"], 0.0)
-
-            h_dir      = primary_hedge["direction"]
-            h_qty      = primary_hedge["qty"]
-            h_margin   = primary_hedge["margin"]
-            h_entry    = primary_hedge["entry_price"]
-
-            if h_dir == "LONG":
-                h_pnl_pct = (price - h_entry) / h_entry * 100
-            else:
-                h_pnl_pct = (h_entry - price) / h_entry * 100
-
-            # ── 3. Close 50% of hedge on Binance ───────────────────────
-            # Floor to step size; if result < min_qty promote 100% instead.
-            half_qty = self._executor.round_qty(cfg.symbol, h_qty * 0.5)
-            if half_qty <= 0:
-                half_qty = 0.0  # skip partial close, promote full position
-
-            if half_qty > 0:
-                h_close_side = "SELL" if h_dir == "LONG" else "BUY"
-                await self._executor.place_market_order(
-                    cfg.symbol, h_close_side, half_qty,
-                    close_hedge=True, current_price=price,
-                )
-                half_pnl = h_pnl_pct / 100 * half_qty * h_entry
-                logger.info(
-                    "TradingEngine: hedge partial close 50%% qty=%.6f  pnl=%+.4f",
-                    half_qty, half_pnl,
-                )
-            else:
-                half_pnl = 0.0
-
-            # Remaining qty and proportional margin for the promoted session
-            keep_qty    = h_qty - half_qty          # exact remainder (both step-aligned)
-            keep_margin = h_margin * (keep_qty / h_qty) if h_qty > 0 else h_margin
-
-            # ── 4. Mark hedge DB record closed ──────────────────────────
-            # Full PnL attributed here; ongoing position tracked by new session.
-            full_h_pnl = h_pnl_pct / 100 * h_qty * h_entry
-            await close_hedge(primary_hedge["id"], round(full_h_pnl, 4))
-
-            # ── 5. Create new main session for the promoted half ────────
-            new_session_id = await create_session(
-                symbol=cfg.symbol,
-                direction=h_dir,
-                entry_price=h_entry,
-                qty=keep_qty,
-                margin=round(keep_margin, 4),
-                leverage=sess["leverage"],
-                entry_reason="hedge_promoted",
-                signal_strength=0.0,
-                signal_price=h_entry,
-            )
-            # dca_count starts at 0 — full DCA budget available on the smaller base.
-            # (No explicit update needed; create_session defaults to dca_count=0.)
-            _ = new_session_id  # id not needed further
-
-            # ── 6. Update engine state ──────────────────────────────────
-            self._session              = await get_open_session()
-            self._hedges               = []
-            self._trail_activated      = False
-            self._trail_price          = None
-            self._trail_pct_mult       = 1.0
-            # Seed entry_adaptive from current ATR so TP/SL are immediately active
-            self._entry_adaptive         = self._adaptive or {}
-            self._override_tp_price      = None
-            self._override_sl_price      = None
-            self._breakeven_stop_price   = None
-            self._pending_fills.clear()  # orphaned fill trackers from old main session
-
-            partial_note = f"50% closed @ {price:.4f}" if half_qty > 0 else "100% promoted (min qty)"
-            msg = (
-                f"{_mode_prefix(cfg.trading_mode)}"
-                f"HEDGE PROMOTED → MAIN {h_dir} @ {h_entry:.4f}  "
-                f"qty={keep_qty}  margin={round(keep_margin, 4)}  "
-                f"({partial_note})  DCA budget reset"
-            )
-            logger.info("TradingEngine: %s", msg)
-            self._broadcast({"type": "notification", "text": msg})
-            self._pos_log(
-                "hedge_promoted",
-                direction=h_dir,
-                price=h_entry,
-                qty=keep_qty,
-                symbol=cfg.symbol,
-                mode=cfg.trading_mode,
-            )
-            self._push_session()
-
-            await log_signal(cfg.symbol, h_dir, 0.0, {}, "hedge_promoted")
-            await notify(cfg.discord_webhook, "HEDGE_PROMOTED", {
-                "symbol":       cfg.symbol,
-                "direction":    h_dir,
-                "price":        h_entry,
-                "qty":          keep_qty,
-                "margin":       round(keep_margin, 4),
-                "partial_close_qty": half_qty,
-                "trading_mode": cfg.trading_mode,
-            })
-        finally:
-            self._closing = False
 
     # ------------------------------------------------------------------
     # Forced close (API-level reset)

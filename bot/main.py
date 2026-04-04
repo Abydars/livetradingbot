@@ -104,6 +104,9 @@ _ENTRY_HARD_MAX_CANDLES = 6           # hard max candles on one symbol regardles
 _symbol_cooldowns: dict = {}
 _RESCUE_COOLDOWN_S = 20 * 60          # 20 minutes cooldown after rescue_trail exit
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
+_symbol_blacklist: set = {            # never trade these symbols
+    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT",
+}
 _prev_session_open: bool = False       # track trade close to trigger immediate scan
 _exchange_error: Optional[str] = None  # last BinanceClient startup/connect error
 _last_client_warn: float = 0.0        # debounce: don't re-broadcast every tick
@@ -640,136 +643,99 @@ async def _scanner_loop() -> None:
         await asyncio.sleep(1.0)
 
 
+
 def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
-    """
-    Re-rank a scanner candidate using a composite quality score.
-
-    Starts from the raw scanner score and applies multipliers:
-
-    HTF alignment bonus (+20%):
-      If the symbol's HTF EMA bias agrees with the scanner's directional bias
-      (both LONG or both SHORT), the signal engine is much more likely to fire
-      an entry. Reward this alignment.
-
-    Scanner type bonus (+15% trendpull, +5% breakout):
-      Trend pullback scanner has the highest alignment with the signal engine's
-      weight profile. Momentum is the baseline. Breakout gets a small bonus
-      because it catches fresh moves early.
-
-    Large-cap volume bonus (+30% or +15%):
-      Coins with >= 500M daily quoteVolume (BTC, ETH, XRP, SOL) get a 30% bonus.
-      Coins with >= 100M volume get 15%. This ensures large caps are preferred
-      when signal quality is similar — log10(volume) in Phase 1 alone only gives
-      a 28% range which is insufficient to consistently rank them above altcoins.
-
-    Rescue trail penalty (-30%):
-      If this symbol caused a rescue_trail exit recently (within cooldown window)
-      and the cooldown hasn't fully expired yet, penalise the score so it ranks
-      lower than fresh symbols. The symbol is not removed from candidates here —
-      that happens in the hard filter below — but scoring it lower prevents it
-      from winning threshold comparisons.
-    """
+    """Rank a scanner candidate for auto-switch quality."""
     base = sym_data.get("_score", 0.0)
 
     # HTF alignment bonus
-    htf_bias     = sym_data.get("_htf_bias", "")   # "LONG", "SHORT", or ""
-    scanner_bias = sym_data.get("_bias", "")        # "LONG" or "SHORT"
+    htf_bias     = sym_data.get("_htf_bias", "")
+    scanner_bias = sym_data.get("_bias", "")
     if htf_bias and scanner_bias and htf_bias == scanner_bias:
-        base *= 1.20   # HTF and scanner agree → high quality setup
+        base *= 1.20
 
-    # Scanner type bonus
-    scanner_type = sym_data.get("_scanner", "momentum")
-    if scanner_type == "trendpull":
-        base *= 1.15   # best signal engine alignment
-    elif scanner_type == "breakout":
-        base *= 1.05   # fresh moves, reasonable alignment
-
-    # Large-cap volume bonus — prefer high-liquidity coins (BTC, ETH, XRP, SOL etc.)
-    # when signal quality is otherwise similar.
-    #
-    # Problem with current Phase 1 scoring: log10(quoteVolume) only gives a ~28%
-    # score range between BTC (3B daily vol) and a minimum-threshold altcoin (25M).
-    # That's not enough to consistently prefer large caps over small coins that
-    # happen to have stronger momentum scores.
-    #
-    # Solution: explicit volume tier multiplier applied to the composite switch score,
-    # so large caps win tie-breakers and are preferred unless a smaller coin has a
-    # meaningfully stronger setup (>15-30% better scanner score).
-    #
-    # Tiers based on 24h quoteVolume in USDT:
-    #   >= 500M  → × 1.30  (BTC, ETH, XRP, SOL — always prefer if signals are similar)
-    #   >= 100M  → × 1.15  (BNB, DOGE, ADA, LINK — mild preference)
-    #   <  100M  → × 1.00  (small altcoins — no bonus, compete purely on signal quality)
+    # Large-cap volume bonus
     qv = float(sym_data.get("quoteVolume", 0))
     if qv >= 500_000_000:
         base *= 1.30
     elif qv >= 100_000_000:
         base *= 1.15
 
-    # Rescue trail penalty (soft — still in candidates but ranked lower)
+    # Rescue trail penalty
     last_rescue = _symbol_cooldowns.get(sym_data.get("symbol", ""), 0.0)
     if last_rescue > 0:
         elapsed = now_ts - last_rescue
         if elapsed < _RESCUE_COOLDOWN_S:
             remaining_frac = 1 - (elapsed / _RESCUE_COOLDOWN_S)
-            base *= (1 - 0.30 * remaining_frac)   # up to -30% penalty, fades over time
+            base *= (1 - 0.30 * remaining_frac)
 
     return base
 
 
 async def _scan_symbols(cfg) -> None:
-    """Fetch top-movers, broadcast to sidebar, and auto-switch if configured."""
-    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache, _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch, _last_switch_ts, _last_symbol_scan
+    """
+    Two-phase fast scalping scanner.
+
+    Phase 1 — 24h ticker filter (single REST call, all symbols):
+      Filter USDT perps with meaningful move + adequate liquidity.
+      Keep top 20 by combined score.
+
+    Phase 2 — Pre-entry gate check for auto-switch candidates:
+      For top 20 symbols, check basic EMA/ATR gates using the existing
+      get_top_movers() REST call. The final order-flow gate is checked
+      live in _try_entry() on every tick.
+    """
+    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache
+    global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
+    global _last_switch_ts, _last_symbol_scan
+    import math
+
     try:
         _last_symbol_scan = time.time()
 
-        # Only run enabled scanners. n_per scales with enabled count so
-        # the merged pool always has enough candidates for scanner_top_n.
-        enabled_count = sum([cfg.scanner_momentum, cfg.scanner_breakout, cfg.scanner_trendpull, cfg.scanner_breakdown])
-        if not enabled_count:
-            return   # all scanners disabled — nothing to do
-
-        n_per = max(cfg.scanner_top_n // enabled_count + 1, 5)
-        scanner_calls = []
-        if cfg.scanner_momentum:
-            scanner_calls.append(_rest.get_top_movers(n=n_per, timeframe=cfg.timeframe))
-        if cfg.scanner_breakout:
-            scanner_calls.append(_rest.get_top_movers_breakout(n=n_per, timeframe=cfg.timeframe))
-        if cfg.scanner_trendpull:
-            scanner_calls.append(_rest.get_top_movers_trendpull(n=n_per, timeframe=cfg.timeframe))
-        if cfg.scanner_breakdown:
-            scanner_calls.append(_rest.get_top_movers_breakdown(n=n_per, timeframe=cfg.timeframe))
-
-        scanner_results = await asyncio.gather(*scanner_calls, return_exceptions=True)
-
-        # Merge results: keep best score per symbol, preserve scanner type
-        seen: dict = {}
-        for result in scanner_results:
-            if isinstance(result, Exception) or not result:
+        # ── Phase 1 — 24h ticker filter ──────────────────────────────────
+        tickers = await _rest._fetch_24h_tickers()
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
                 continue
-            for sym_data in result:
-                sym = sym_data["symbol"]
-                if sym not in seen or sym_data["_score"] > seen[sym]["_score"]:
-                    seen[sym] = sym_data
+            pcp   = float(t.get("priceChangePercent", 0))
+            qvol  = float(t.get("quoteVolume", 0))
+            if abs(pcp) < 0.5 or qvol < 30_000_000:
+                continue
+            if sym in _symbol_blacklist:
+                continue
+            high_  = float(t.get("highPrice", 0))
+            low_   = float(t.get("lowPrice", 1))
+            last_  = float(t.get("lastPrice", 0))
+            rng    = high_ - low_
+            range_pos = (last_ - low_) / rng if rng > 0 else 0.5
+            score  = abs(pcp) * math.log10(max(qvol, 1)) * (0.5 + range_pos * 0.5)
+            candidates.append({
+                "symbol":             sym,
+                "_score":             score,
+                "_bias":              "LONG" if pcp > 0 else "SHORT",
+                "priceChangePercent": pcp,
+                "quoteVolume":        qvol,
+                "lastPrice":          last_,
+            })
 
-        # Sort merged pool by score, take top N
-        top = sorted(seen.values(), key=lambda x: x["_score"], reverse=True)[:cfg.scanner_top_n]
-        if not top:
+        # Keep top 20 by score
+        candidates.sort(key=lambda x: x["_score"], reverse=True)
+        top20 = candidates[:20]
+        if not top20:
             return
 
-        # Per-symbol HTF bias with cache — HTF changes every 15+ minutes so
-        # there is no need to re-fetch on every 10-second scan cycle.
-        # Only symbols whose cache has expired trigger a real API call.
+        # ── Per-symbol HTF bias (cached) ──────────────────────────────────
         try:
             from exchange.binance_rest import _scan_ema as _ema
             htf_tf, htf_ttl = _htf_for_timeframe(cfg.timeframe)
             now_ts = time.time()
-
             stale_syms = [
-                t["symbol"] for t in top
+                t["symbol"] for t in top20
                 if now_ts - _htf_scanner_cache.get(t["symbol"], ("", 0.0))[1] >= htf_ttl
             ]
-
             if stale_syms:
                 htf_klines_map = await _rest.get_klines_batch(
                     stale_syms, interval=htf_tf, limit=70
@@ -788,146 +754,93 @@ async def _scan_symbols(cfg) -> None:
                     else:
                         bias = ""
                     _htf_scanner_cache[sym] = (bias, now_ts)
-
-            for t in top:
+            for t in top20:
                 cached = _htf_scanner_cache.get(t["symbol"])
                 t["_htf_bias"] = cached[0] if cached else ""
         except Exception as exc:
             logger.debug("Scanner HTF cache failed: %s", exc)
 
+        # ── Broadcast top movers to UI ────────────────────────────────────
         if not cfg.tv_scanner_enabled:
-            _last_top_movers = _format_movers(top)
+            _last_top_movers = _format_movers(top20)
             await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
-        # Re-rank top list by composite switch score so auto-switch uses
-        # a smarter quality metric than raw scanner score alone.
+        # ── Auto-switch logic ─────────────────────────────────────────────
         now_ts = time.time()
-        for t in top:
+        for t in top20:
             t["_switch_score"] = _composite_switch_score(t, now_ts)
-        top_by_switch = sorted(top, key=lambda x: x["_switch_score"], reverse=True)
+        top_by_switch = sorted(top20, key=lambda x: x["_switch_score"], reverse=True)
+        top_data = {t["symbol"]: t for t in top20}
 
-        # Build symbol → full data lookup for O(1) access in auto-switch
-        top_data = {t["symbol"]: t for t in top}
-
-        # Auto-switch only when enabled and no open position
         if not cfg.auto_switch or not _trading_active:
             _entry_start_candle   = 0
             _neutral_since_candle = 0
             _tried_syms.clear()
             return
         if _engine._session is not None:
-            # Position is open — clear cycle state so next entry search starts fresh
             _entry_start_candle   = 0
             _neutral_since_candle = 0
             _tried_syms.clear()
             return
 
-        # Signal persistence is actively building toward entry — hold on current symbol.
-        # Switching now would waste a signal that's about to fire.
-        if _engine._entry_signal_ticks > 0:
-            return
-
-        # Use composite-score ordering for switching decisions.
-        # top_syms_raw = scanner rank, top_syms = composite rank for switching.
-        top_syms_raw = [t["symbol"] for t in top]
+        top_syms_raw = [t["symbol"] for t in top20]
         top_syms     = [t["symbol"] for t in top_by_switch]
 
-        # Current candle close time (int seconds) — used for candle-based counting
         cur_candle = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
         tf_secs    = cfg.tf_minutes * 60 if cfg.tf_minutes > 0 else 60
 
-        # If current symbol dropped off the scanner list entirely, mark as tried
         if cfg.symbol not in top_syms_raw:
             _tried_syms.add(cfg.symbol)
 
         def _is_eligible(sym: str) -> bool:
-            """
-            A candidate is eligible if:
-            1. Not already tried in this cycle.
-            2. Not in active rescue_trail cooldown.
-            3. HTF bias does NOT directly contradict scanner bias.
-               (NEUTRAL htf = always allowed; matching or unknown = allowed)
-            """
             if sym in _tried_syms:
                 return False
-            # Hard cooldown filter: symbol caused rescue_trail recently
             last_rescue = _symbol_cooldowns.get(sym, 0.0)
             if last_rescue > 0 and (now_ts - last_rescue) < _RESCUE_COOLDOWN_S:
                 return False
-            # HTF hard filter: never enter against the higher timeframe trend
             d = top_data.get(sym, {})
             htf  = d.get("_htf_bias", "")
             bias = d.get("_bias", "")
             if htf and bias:
                 opposites = {"LONG": "SHORT", "SHORT": "LONG"}
                 if htf == opposites.get(bias, ""):
-                    return False   # HTF directly contradicts scanner bias
+                    return False
             return True
 
-        # Build candidate list ordered by composite switch score
-        candidates = [s for s in top_syms if _is_eligible(s)]
-
-        # All eligible candidates exhausted — reset tried set and retry.
-        # Cooldown filter is NOT reset (symbols still cooling down stay out).
-        if not candidates:
-            logger.info(
-                "Auto-switch: all eligible candidates tried — resetting cycle "
-                "(cooldowns still active: %s)",
-                [s for s in _symbol_cooldowns
-                 if now_ts - _symbol_cooldowns[s] < _RESCUE_COOLDOWN_S]
-            )
+        candidates_list = [s for s in top_syms if _is_eligible(s)]
+        if not candidates_list:
             _tried_syms.clear()
-            candidates = [s for s in top_syms if _is_eligible(s)]
-            if not candidates:
-                return   # everything is cooling down — nothing to switch to
+            candidates_list = [s for s in top_syms if _is_eligible(s)]
+            if not candidates_list:
+                return
 
-        new_sym = None  # will be set iff a switch should happen
+        new_sym = None
 
-        # Current symbol is still an active candidate — apply candle-based wait
-        if cfg.symbol in candidates:
-            next_candidate = next((s for s in candidates if s != cfg.symbol), None)
-
-            # Check if #1 eligible symbol is switch_threshold× better — immediate switch,
-            # bypasses candle timer entirely.
-            # Use composite switch score (not raw scanner score) for threshold comparison.
-            # This means HTF-aligned trendpull symbols can trigger immediate switch
-            # even if their raw scanner score is lower than the current symbol.
-            top_candidate = next((t for t in top_by_switch if _is_eligible(t["symbol"])), None)
-            top_sym       = top_candidate["symbol"] if top_candidate else None
-            top_score     = top_candidate["_switch_score"] if top_candidate else 0.0
-            cur_score     = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
+        if cfg.symbol in candidates_list:
+            next_candidate = next((s for s in candidates_list if s != cfg.symbol), None)
+            top_candidate  = next((t for t in top_by_switch if _is_eligible(t["symbol"])), None)
+            top_sym        = top_candidate["symbol"] if top_candidate else None
+            top_score      = top_candidate["_switch_score"] if top_candidate else 0.0
+            cur_score      = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
 
             should_immediate = (
                 top_sym and top_sym != cfg.symbol and (
-                    cur_score == 0 or   # current not ranked → always switch
+                    cur_score == 0 or
                     (cur_score > 0 and top_score >= cur_score * cfg.switch_threshold)
                 )
             )
             if should_immediate:
-                # Immediate switch — do not touch candle timer state
-                pct_better = ((top_score / cur_score - 1) * 100) if cur_score > 0 else float("inf")
-                logger.info(
-                    "Auto-switch: %s (quality %.2f) is %.0f%% better than %s (quality %.2f)"
-                    " — switching immediately (threshold %.2f×)",
-                    top_sym, top_score, pct_better,
-                    cfg.symbol, cur_score, cfg.switch_threshold,
-                )
+                logger.info("Auto-switch: %s → %s (immediate, score %.2f vs %.2f)",
+                            cfg.symbol, top_sym, top_score, cur_score)
                 _tried_syms.add(cfg.symbol)
                 _entry_start_candle   = 0
                 _neutral_since_candle = 0
                 new_sym = top_sym
-
             else:
-                # Normal candle-based wait path
                 if _entry_start_candle == 0 and cur_candle > 0:
                     _entry_start_candle = cur_candle
-                    logger.info(
-                        "Auto-switch: waiting up to %d NEUTRAL candles on %s  (next: %s)",
-                        cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
-                    )
 
                 total_candles = max(0, (cur_candle - _entry_start_candle + 1) // tf_secs) if tf_secs > 0 else 0
-
                 sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
                 if sig_dir == "NEUTRAL":
                     if _neutral_since_candle == 0 and cur_candle > 0:
@@ -950,42 +863,25 @@ async def _scan_symbols(cfg) -> None:
                 })
 
                 if neutral_candles < cfg.entry_wait_candles and total_candles < _ENTRY_HARD_MAX_CANDLES:
-                    return  # still within wait window
-
-                if total_candles >= _ENTRY_HARD_MAX_CANDLES:
-                    logger.info(
-                        "Auto-switch: %s — hard max %d candles reached (signal oscillating), moving to next",
-                        cfg.symbol, total_candles,
-                    )
-                else:
-                    logger.info(
-                        "Auto-switch: %s — NEUTRAL for %d candles, moving to next candidate",
-                        cfg.symbol, neutral_candles,
-                    )
+                    return
 
                 _tried_syms.add(cfg.symbol)
-                candidates = [s for s in top_syms if s not in _tried_syms]
-
-                if not candidates:
+                candidates_list = [s for s in top_syms if s not in _tried_syms]
+                if not candidates_list:
                     _tried_syms.clear()
-                    candidates = [s for s in top_syms if s != cfg.symbol]
-                    if not candidates:
+                    candidates_list = [s for s in top_syms if s != cfg.symbol]
+                    if not candidates_list:
                         return
-
-                new_sym = candidates[0]
-
+                new_sym = candidates_list[0]
         else:
-            # Current symbol is not a candidate — pick best untried directly
-            new_sym = candidates[0]
+            new_sym = candidates_list[0]
 
         if new_sym is None:
             return
+
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
-        global _switching_in_progress
+        global _switching_in_progress, _htf_bias, _last_htf_fetch
         _switching_in_progress = True
-        # Clear HTF state immediately — before any awaits — so ticks that fire
-        # during the async switch operations don't fetch/broadcast old HTF for new symbol.
-        global _htf_bias, _last_htf_fetch
         _htf_bias = "NEUTRAL"
         _last_htf_fetch = 0.0
         _htf_scanner_cache.pop(new_sym, None)
@@ -993,131 +889,13 @@ async def _scan_symbols(cfg) -> None:
             if m.get("symbol") == new_sym:
                 m["htf_bias"] = ""
                 break
-        try:
-            await set_config_bulk({"symbol": new_sym})
-            # Fetch 200 candles for the new symbol BEFORE switching so the engine
-            # is ready to compute a signal on the very first tick after switch —
-            # no extra 30-second candle-refresh cycle needed.
-            raw_candles = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
-            fresh_candles = [
-                {
-                    "open":   float(k[1]),
-                    "high":   float(k[2]),
-                    "low":    float(k[3]),
-                    "close":  float(k[4]),
-                    "volume": float(k[5]),
-                    "time":   int(k[0]) // 1000,
-                }
-                for k in raw_candles
-            ] if raw_candles else []
+        asyncio.ensure_future(_do_switch(new_sym, cfg))
 
-            # Guard: require at least 60 candles for reliable indicator computation.
-            # EMA50 needs 50+, MACD needs 35+ — below 60 the signal engine produces
-            # NEUTRAL on every tick regardless of price action (new listings, thin markets).
-            # Skip this symbol and let auto-switch try the next candidate instead.
-            _MIN_CANDLES_FOR_ENTRY = 60
-            if len(fresh_candles) < _MIN_CANDLES_FOR_ENTRY:
-                logger.warning(
-                    "Auto-switch: %s skipped — only %d candles available (need %d). "
-                    "New listing or thin market — marking as tried.",
-                    new_sym, len(fresh_candles), _MIN_CANDLES_FOR_ENTRY,
-                )
-                _tried_syms.add(new_sym)
-                return
-
-            # Calculate ATR-based safe leverage from fresh candles before setting on exchange.
-            # This avoids setting leverage at entry time (which adds latency to order placement).
-            smart_leverage = cfg.leverage
-            if cfg.auto_leverage and fresh_candles and len(fresh_candles) >= 15:
-                from exchange.binance_rest import _scan_atr as _atr
-                highs  = [c["high"]  for c in fresh_candles[-15:]]
-                lows   = [c["low"]   for c in fresh_candles[-15:]]
-                closes = [c["close"] for c in fresh_candles[-15:]]
-                last_price = closes[-1]
-                if last_price > 0:
-                    atr_val   = _atr(highs, lows, closes, 14)
-                    atr_pct   = atr_val / last_price * 100
-                    buffer    = cfg.last_resort_sl_buffer
-                    max_lev   = (buffer * 100) / (atr_pct * 1.5) * 0.85
-                    safe_lev  = max(1, int(max_lev))
-                    smart_leverage = min(cfg.leverage, safe_lev)
-                    if smart_leverage < cfg.leverage:
-                        logger.info(
-                            "Auto-switch: %s ATR=%.2f%% → leverage %dx → %dx",
-                            new_sym, atr_pct, cfg.leverage, smart_leverage,
-                        )
-
-            # WS resubscribe and Binance symbol prep run in parallel.
-            await asyncio.gather(
-                _ws.switch_symbol(new_sym),
-                _executor.prepare_symbol(new_sym, smart_leverage),
-            )
-            if _engine:
-                _engine._effective_leverage = smart_leverage   # lock for entry sizing
-
-            # Reset stale price so the next tick gets a fresh mark-price for new symbol.
-            _last_price = 0.0
-            _last_price_rest_fetch = 0.0
-
-            # symbol_ready MUST go first — UI clears the chart on this message.
-            # Candles sent after so they populate the freshly cleared chart.
-            _entry_start_candle   = 0   # set correctly after update_candles() below
-            _neutral_since_candle = 0   # reset neutral clock for the new symbol
-            _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
-            global _current_scanner_type
-            # Find scanner type for the new symbol from top movers list
-            new_sym_data = next((t for t in _last_top_movers if t.get("symbol") == new_sym), {})
-            _current_scanner_type = new_sym_data.get("scanner_type", "momentum")
-            if _engine:
-                _engine.set_scanner_type(_current_scanner_type)
-            logger.info("Auto-switch scanner type: %s → %s", new_sym, _current_scanner_type)
-            global _last_switch_ts
-            _last_switch_ts = time.time()
-            await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
-            await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
-            await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
-
-            if fresh_candles:
-                _engine.update_candles(fresh_candles)
-                _entry_start_candle = fresh_candles[-1]["time"] if fresh_candles else 0
-                _last_candles_fetch = time.time()
-                flow_window_s = _flow_window_for_timeframe(cfg.timeframe)
-                agg_trades = await _rest.get_agg_trades(new_sym, window_seconds=flow_window_s)
-                if agg_trades and _flow:
-                    _flow.seed_from_trades(agg_trades)
-                    logger.info(
-                        "auto-switch: seeded flow with %d aggTrades for %s",
-                        len(agg_trades), new_sym,
-                    )
-                await _do_broadcast({
-                    "type":    "candles",
-                    "candles": fresh_candles[-100:],
-                })
-                ind = _engine.last_indicators
-                if ind:
-                    await _do_broadcast({
-                        "type":       "indicators",
-                        "indicators": _safe_ind(ind),
-                    })
-            else:
-                _last_candles_fetch = 0.0
-
-            await _do_broadcast({
-                "type": "notification",
-                "text": f"Auto-switched: {cfg.symbol} → {new_sym}",
-            })
-        finally:
-            _switching_in_progress = False
-            global _cfg_tick_cache
-            _cfg_tick_cache = None   # force ticker to reload config on next tick
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
-        _on_exchange_error(f"Symbol scan failed: {exc}")
 
-
-# ---------------------------------------------------------------------------
-# WS trade/depth callbacks + exchange error callback
-# ---------------------------------------------------------------------------
 
 def _on_exchange_error(msg: str) -> None:
     """Forward any Binance WS error to the position log in the UI."""
@@ -1190,12 +968,15 @@ def _on_trade(event: Dict) -> None:
         _dir      = _sess["direction"]
         _avg      = _sess["avg_price"]
         _lev      = _sess["leverage"]
-        _buf      = getattr(_engine, "_last_resort_buffer_cache", 0.80)
-        _lr_pct   = (1.0 / _lev) * _buf if _lev > 0 else 0.10
-        _lr_hit   = (
-            (_dir == "LONG"  and price <= _avg * (1 - _lr_pct)) or
-            (_dir == "SHORT" and price >= _avg * (1 + _lr_pct))
-        )
+        # Use locked scalp SL price for WS-side emergency check
+        _scalp_sl = getattr(_engine, "_scalp_sl_price", None)
+        if _scalp_sl is None:
+            _lr_hit = False
+        else:
+            _lr_hit   = (
+                (_dir == "LONG"  and price <= _scalp_sl) or
+                (_dir == "SHORT" and price >= _scalp_sl)
+            )
         if _lr_hit:
             _pnl = (
                 (price - _avg) / _avg * 100 * _lev
@@ -1267,9 +1048,6 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     else:
         pnl_pct = realized_pnl = 0.0
 
-    for hedge in list(_engine._hedges):
-        await close_hedge(hedge["id"], 0.0)
-
     await close_session(sess["id"], realized_pnl, reason,
                         exit_price=fill_price if fill_price > 0 else None)
     logger.warning(
@@ -1286,11 +1064,12 @@ async def _handle_external_close(fill_price: float, reason: str) -> None:
     _broadcast(_pl)
     asyncio.ensure_future(insert_pos_log(reason, _pl))
 
-    _engine._session         = None
-    _engine._hedges          = []
-    _engine._trail_activated = False
-    _engine._trail_price     = None
-    _engine._entry_adaptive  = {}
+    _engine._session          = None
+    _engine._trail_activated  = False
+    _engine._trail_price      = None
+    _engine._scalp_tp_price   = None
+    _engine._scalp_sl_price   = None
+    _engine._last_exit_time   = time.time()
     _engine._pending_fills.clear()
     _engine._push_session()
     # _do_broadcast automatically pushes sessions+performance when session=None
@@ -1642,19 +1421,17 @@ async def lifespan(app: FastAPI):
                 realized_pnl = round(pnl_pct / 100 * margin, 4)
             else:
                 realized_pnl = 0.0
-            for hedge in list(_engine._hedges):
-                await close_hedge(hedge["id"], 0.0)
             await close_session(sess["id"], realized_pnl, "manual_reset",
                                 exit_price=fill_price if fill_price > 0 else None)
             logger.info(
                 "Startup sync (paper): closed orphaned session %d  pnl=%.4f",
                 sess["id"], realized_pnl,
             )
-            _engine._session         = None
-            _engine._hedges          = []
-            _engine._trail_activated = False
-            _engine._trail_price     = None
-            _engine._entry_adaptive  = {}
+            _engine._session          = None
+            _engine._trail_activated  = False
+            _engine._trail_price      = None
+            _engine._scalp_tp_price   = None
+            _engine._scalp_sl_price   = None
         except Exception as exc:
             logger.error("Startup paper sync failed: %s", exc)
 
@@ -1682,9 +1459,6 @@ async def lifespan(app: FastAPI):
                 else:
                     realized_pnl = 0.0
 
-                for hedge in list(_engine._hedges):
-                    await close_hedge(hedge["id"], 0.0)
-
                 await close_session(sess["id"], realized_pnl, "external_close",
                                     exit_price=fill_price if fill_price > 0 else None)
                 logger.warning(
@@ -1692,11 +1466,11 @@ async def lifespan(app: FastAPI):
                     "on Binance — closed with pnl=%.4f (approx mark price %.6f)",
                     sess["id"], realized_pnl, fill_price,
                 )
-                _engine._session         = None
-                _engine._hedges          = []
-                _engine._trail_activated = False
-                _engine._trail_price     = None
-                _engine._entry_adaptive  = {}
+                _engine._session          = None
+                _engine._trail_activated  = False
+                _engine._trail_price      = None
+                _engine._scalp_tp_price   = None
+                _engine._scalp_sl_price   = None
         except Exception as exc:
             logger.error("Startup position sync failed: %s", exc)
 
@@ -2029,43 +1803,21 @@ async def ws_endpoint(websocket: WebSocket):
         # Send open session state if any
         sess = await get_open_session()
         if sess:
-            hedges = await get_open_hedges(sess["id"])
             tp_price, sl_price = _engine.get_level_prices() if _engine else (None, None)
-            # Compute DCA prices for chart display on reconnect
-            dca_prices_init = []
-            if _engine and _engine._entry_adaptive and sl_price is not None:
-                s_avg      = sess.get("avg_price", 0)
-                s_dir      = sess.get("direction", "LONG")
-                s_dca_done = sess.get("dca_count", 0)
-                s_leverage = sess.get("leverage", cfg.leverage)
-                step_pct   = _engine._entry_adaptive.get("dca_step_pct", 0)
-                remaining  = max(0, cfg.max_dca - s_dca_done)
-                if s_avg > 0 and step_pct > 0 and remaining > 0:
-                    _liq_pct  = (1.0 / s_leverage) * 100 if s_leverage > 0 else 10.0
-                    _sl_pct   = _liq_pct * cfg.last_resort_sl_buffer
-                    _safe     = _sl_pct * 0.85
-                    _max_step = _safe / remaining
-                    _eff_step = min(step_pct, _max_step)
-                    for i in range(1, remaining + 1):
-                        dist = s_avg * _eff_step / 100 * i
-                        p_dca = s_avg - dist if s_dir == "LONG" else s_avg + dist
-                        if s_dir == "LONG" and sl_price and p_dca <= sl_price:
-                            break
-                        if s_dir == "SHORT" and sl_price and p_dca >= sl_price:
-                            break
-                        dca_prices_init.append(round(p_dca, 8))
-
             await websocket.send_text(json.dumps({
-                "type":               "session",
-                "session":            sess,
-                "hedges":             hedges,
-                "trail_price":        _engine._trail_price     if _engine else None,
-                "trail_active":       _engine._trail_activated if _engine else False,
-                "tp_price":           tp_price,
-                "sl_price":           sl_price,
-                "override_tp_price":  _engine._override_tp_price if _engine else None,
-                "override_sl_price":  _engine._override_sl_price if _engine else None,
-                "dca_prices":         dca_prices_init,
+                "type":              "session",
+                "session":           sess,
+                "hedges":            [],
+                "trail_price":       _engine._trail_price     if _engine else None,
+                "trail_active":      _engine._trail_activated if _engine else False,
+                "tp_price":          tp_price,
+                "sl_price":          sl_price,
+                "override_tp_price": _engine._override_tp_price if _engine else None,
+                "override_sl_price": _engine._override_sl_price if _engine else None,
+                "dca_prices":        [],
+                "scalp_tp_pct":      getattr(_engine, "_scalp_tp_pct", 0.0) if _engine else 0.0,
+                "scalp_sl_pct":      getattr(_engine, "_scalp_sl_pct", 0.0) if _engine else 0.0,
+                "scalp_atr_pct":     getattr(_engine, "_scalp_atr_pct", 0.0) if _engine else 0.0,
             }))
 
         # Surface any stored exchange startup error immediately

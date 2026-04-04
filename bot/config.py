@@ -72,6 +72,18 @@ class BotConfig:
     scanner_trendpull: bool
     scanner_breakdown: bool
 
+    # Scalping parameters
+    sl_pct_min:        float
+    sl_pct_max:        float
+    tp_pct_min:        float
+    tp_pct_max:        float
+    min_rr_ratio:      float
+    max_hold_candles:  int
+    entry_cooldown_s:  int
+    min_body_ratio:    float
+    min_vol_ratio:     float
+    min_flow_score:    float
+
     # Exchange secrets (env-only, never in DB)
     api_key: str
     api_secret: str
@@ -165,6 +177,16 @@ async def load_config() -> BotConfig:
         scanner_breakout=_b("scanner_breakout",   True),
         scanner_trendpull=_b("scanner_trendpull", True),
         scanner_breakdown=_b("scanner_breakdown", True),
+        sl_pct_min=_f("sl_pct_min", 0.20),
+        sl_pct_max=_f("sl_pct_max", 0.60),
+        tp_pct_min=_f("tp_pct_min", 0.40),
+        tp_pct_max=_f("tp_pct_max", 1.20),
+        min_rr_ratio=_f("min_rr_ratio", 2.0),
+        max_hold_candles=_i("max_hold_candles", 8),
+        entry_cooldown_s=_i("entry_cooldown_s", 60),
+        min_body_ratio=_f("min_body_ratio", 0.45),
+        min_vol_ratio=_f("min_vol_ratio", 1.30),
+        min_flow_score=_f("min_flow_score", 0.15),
         api_key=api_key,
         api_secret=api_secret,
     )
