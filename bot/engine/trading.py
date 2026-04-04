@@ -673,8 +673,10 @@ class TradingEngine:
             "composite":      0.0,
             "filters_passed": session in ("london", "ny"),
             "reason":         (
-                f"{session_display} | Asian H={self._asian_high:.4g} "
-                f"L={self._asian_low:.4g} | Trades left: {trades_left}"
+                f"{session_display} | "
+                f"Asian H={'–' if self._asian_high == 0.0 else f'{self._asian_high:.2f}'} "
+                f"L={'–' if self._asian_low >= 999_999_999.0 else f'{self._asian_low:.2f}'} "
+                f"| Trades left: {trades_left}"
             ),
         }
         self._broadcast({"type": "signal", "data": self.last_signal})
@@ -768,12 +770,12 @@ class TradingEngine:
                 first = self._key_levels[0]
                 gates["KEY LEVEL"] = (False,
                     f"no level within {cfg.session_proximity_pts:.0f}pts | nearest: "
-                    f"{first['type']}@{first['price']:.4g} ({first['dist']:.1f}pts)")
+                    f"{first['type']}@{first['price']:.2f} ({first['dist']:.1f}pts)")
             else:
                 gates["KEY LEVEL"] = (False, "no levels computed")
         else:
             gates["KEY LEVEL"] = (True,
-                f"{nearby_level['type']} @ {nearby_level['price']:.4g} "
+                f"{nearby_level['type']} @ {nearby_level['price']:.2f} "
                 f"({nearby_level['dist']:.1f}pts away)")
 
         # ── Gate 4: Candle Pattern ────────────────────────────────────────
@@ -800,7 +802,7 @@ class TradingEngine:
                 gates["R:R"] = (False, f"{rr:.2f} < {cfg.session_min_rr:.1f} minimum")
             else:
                 gates["R:R"] = (True,
-                    f"{rr:.2f}:1  SL={levels['sl_pts']:.1f}pts  TP→{levels['tp_price']:.4g}")
+                    f"{rr:.2f}:1  SL={levels['sl_pts']:.1f}pts  TP→{levels['tp_price']:.2f}")
         else:
             gates["R:R"] = (False, "waiting for pattern to compute R:R")
 
