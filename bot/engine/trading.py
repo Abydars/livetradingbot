@@ -228,11 +228,11 @@ class TradingEngine:
     ) -> Dict:
         """
         Compute SL and TP for an SMC trade.
-        SL = sweep_wick ± smc_sl_buffer_pts.
+        SL = sweep_wick ± (entry_price × smc_sl_buffer_pct / 100).
         TP = nearest equal-high/low liquidity pool, minimum smc_min_rr × SL distance.
-        Returns rr_ratio=0.0 if SL > smc_max_sl_pts (trade rejected).
+        Returns rr_ratio=0.0 if SL > smc_max_sl_pct% of entry (trade rejected).
         """
-        buf = cfg.smc_sl_buffer_pts
+        buf = entry_price * cfg.smc_sl_buffer_pct / 100
         if bias == "LONG":
             sl_price = sweep_wick - buf
             sl_pts   = entry_price - sl_price
@@ -240,7 +240,8 @@ class TradingEngine:
             sl_price = sweep_wick + buf
             sl_pts   = sl_price - entry_price
 
-        if sl_pts > cfg.smc_max_sl_pts or sl_pts <= 0:
+        max_sl = entry_price * cfg.smc_max_sl_pct / 100
+        if sl_pts > max_sl or sl_pts <= 0:
             return {"sl_price": sl_price, "tp_price": 0.0,
                     "sl_pts": sl_pts, "tp_pts": 0.0, "rr_ratio": 0.0}
 
@@ -587,15 +588,17 @@ class TradingEngine:
             )
             sl_pts   = levels["sl_pts"]
             rr_ratio = levels["rr_ratio"]
-            if rr_ratio <= 0 or sl_pts > cfg.smc_max_sl_pts:
+            sl_pct   = sl_pts / price * 100 if price > 0 else 0.0
+            max_sl_pct = cfg.smc_max_sl_pct
+            if rr_ratio <= 0 or sl_pct > max_sl_pct:
                 gates["SL / R:R"] = (False,
-                    f"SL {sl_pts:.1f}pts > max {cfg.smc_max_sl_pts:.0f}pts")
+                    f"SL {sl_pct:.2f}% > max {max_sl_pct:.1f}%")
             elif rr_ratio < cfg.smc_min_rr:
                 gates["SL / R:R"] = (False,
                     f"R:R {rr_ratio:.2f} < {cfg.smc_min_rr:.1f} minimum")
             else:
                 gates["SL / R:R"] = (True,
-                    f"SL={sl_pts:.1f}pts  R:R={rr_ratio:.2f}:1")
+                    f"SL={sl_pct:.2f}%  R:R={rr_ratio:.2f}:1")
         else:
             gates["SL / R:R"] = (False, "waiting for trigger")
 

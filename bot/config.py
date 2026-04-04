@@ -95,8 +95,8 @@ class BotConfig:
     opposite_entry:         bool
 
     # SMC strategy parameters
-    smc_sl_buffer_pts:   float
-    smc_max_sl_pts:      float
+    smc_sl_buffer_pct:   float   # SL buffer as % of entry price (e.g. 0.05 = 0.05%)
+    smc_max_sl_pct:      float   # Max allowable SL as % of entry (e.g. 2.0 = 2%)
     smc_min_rr:          float
     smc_ob_lookback:     int
     smc_fvg_min_gap_pct: float
@@ -213,8 +213,8 @@ async def load_config() -> BotConfig:
         breakout_vol_pace_min=_f("breakout_vol_pace_min", 2.0),
         breakout_flow_min=_f("breakout_flow_min", 0.25),
         opposite_entry=_b("opposite_entry", False),
-        smc_sl_buffer_pts=_f("smc_sl_buffer_pts", 3.0),
-        smc_max_sl_pts=_f("smc_max_sl_pts", 15.0),
+        smc_sl_buffer_pct=_f("smc_sl_buffer_pct", 0.05),
+        smc_max_sl_pct=_f("smc_max_sl_pct", 2.0),
         smc_min_rr=_f("smc_min_rr", 2.0),
         smc_ob_lookback=_i("smc_ob_lookback", 30),
         smc_fvg_min_gap_pct=_f("smc_fvg_min_gap_pct", 0.05),

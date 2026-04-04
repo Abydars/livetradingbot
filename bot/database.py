@@ -145,8 +145,8 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "breakout_flow_min":     "0.25",
     "opposite_entry":        "0",
     # SMC strategy parameters
-    "smc_sl_buffer_pts":    "3.0",
-    "smc_max_sl_pts":       "15.0",
+    "smc_sl_buffer_pct":    "0.05",
+    "smc_max_sl_pct":       "2.0",
     "smc_min_rr":           "2.0",
     "smc_ob_lookback":      "30",
     "smc_fvg_min_gap_pct":  "0.05",
