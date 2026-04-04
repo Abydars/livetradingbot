@@ -1269,6 +1269,7 @@
         <div class="gate-row" id="gate-RSI_ZONE">        <span class="gate-icon">–</span><span class="gate-name">RSI ZONE</span>        <span class="gate-val"></span></div>
         <div class="gate-row" id="gate-ATR_RANGE">       <span class="gate-icon">–</span><span class="gate-name">ATR RANGE</span>       <span class="gate-val"></span></div>
         <div class="gate-row" id="gate-RR_RATIO">        <span class="gate-icon">–</span><span class="gate-name">R:R RATIO</span>       <span class="gate-val"></span></div>
+        <div class="gate-row" id="gate-ORDER_BLOCK">    <span class="gate-icon">–</span><span class="gate-name">ORDER BLOCK</span>     <span class="gate-val"></span></div>
       </div>
     </section>
 
@@ -1745,6 +1746,7 @@ function dispatch(msg) {
       window._curScalpSlPct     = msg.scalp_sl_pct     ?? 0;
       window._curScalpAtrPct    = msg.scalp_atr_pct    ?? 0;
       window._curElapsedCandles = msg.elapsed_candles  ?? 0;
+      window._breakeven_armed   = msg.breakeven_armed  ?? false;
       window._curMaxCandles     = window._cfgMaxHoldCandles ?? 8;
       // Sync manual overrides from engine (keeps other tabs in sync too)
       if (msg.override_tp_price !== undefined) _overrideTpPrice = msg.override_tp_price;
@@ -2305,6 +2307,7 @@ function updateSignalPanel(sig) {
     'RSI ZONE':         'RSI_ZONE',
     'ATR RANGE':        'ATR_RANGE',
     'R:R RATIO':        'RR_RATIO',
+    'ORDER BLOCK':      'ORDER_BLOCK',
   };
   for (const [name, id] of Object.entries(gateIds)) {
     const row = document.getElementById('gate-' + id);
@@ -2367,11 +2370,12 @@ function updatePositionPanel() {
     </span>
   </div>` : '';
 
+  const beArmed = window._breakeven_armed ?? false;
   const slRow = slPrice != null ? `<div class="pr">
-    <span class="prk" style="color:var(--red)">SL</span>
+    <span class="prk" style="color:var(--red)">SL${beArmed ? ' 🔒' : ''}</span>
     <span class="level-row">
       <button class="btn-adj" onclick="adjustLevel('sl',-1)">▼</button>
-      <span style="color:var(--red)">${fmtPrice(slPrice)}</span>
+      <span style="color:${beArmed ? 'var(--green)' : 'var(--red)'}">${fmtPrice(slPrice)}</span>
       <span style="font-size:9px;opacity:.7">(-${scalp_sl_pct.toFixed(2)}%)</span>
       <button class="btn-adj" onclick="adjustLevel('sl',+1)">▲</button>
     </span>

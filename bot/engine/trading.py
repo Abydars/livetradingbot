@@ -97,6 +97,9 @@ class TradingEngine:
         self._trail_activated: bool = False
         self._trail_price: Optional[float] = None
 
+        # Breakeven stop: armed when price reaches 50% of TP distance → SL → entry
+        self._breakeven_armed: bool = False
+
         # Leverage locked at switch time — set by main.py after prepare_symbol().
         self._effective_leverage: int = 1
 
@@ -112,6 +115,7 @@ class TradingEngine:
         self._last_stop_time    = None
         self._trail_activated   = False
         self._trail_price       = None
+        self._breakeven_armed   = False
         self._flow.reset()
         self.candles            = []
         self.last_indicators    = {}
@@ -153,6 +157,7 @@ class TradingEngine:
             "scalp_sl_pct":      self._scalp_sl_pct,
             "scalp_atr_pct":     self._scalp_atr_pct,
             "elapsed_candles":   elapsed_candles,
+            "breakeven_armed":   self._breakeven_armed,
         })
 
     def _pos_log(self, event: str, **kw) -> None:
@@ -221,6 +226,48 @@ class TradingEngine:
         }
 
     @staticmethod
+    def _find_order_block(candles: List[Dict], direction: str) -> Dict:
+        """
+        Identify the most recent SMC order block in the given direction.
+
+        LONG OB : last bullish candle that is immediately followed by 2+ bearish
+                  candles (bearish displacement away from the zone).
+        SHORT OB: last bearish candle that is immediately followed by 2+ bullish
+                  candles (bullish displacement away from the zone).
+
+        Only considers closed candles (excludes candles[-1]).
+        Returns dict: {found, ob_high, ob_low}
+        """
+        closed = candles[:-1]   # exclude the forming candle
+        if len(closed) < 5:
+            return {"found": False, "ob_high": 0.0, "ob_low": 0.0}
+
+        # Search from newest to oldest (skip last 2 candles needed for displacement)
+        for i in range(len(closed) - 3, 0, -1):
+            c = closed[i]
+            if direction == "LONG":
+                if c["close"] <= c["open"]:   # must be a bullish candle
+                    continue
+                # Need 2 consecutive bearish candles after it
+                n_bear = sum(
+                    1 for j in range(i + 1, min(i + 4, len(closed)))
+                    if closed[j]["close"] < closed[j]["open"]
+                )
+                if n_bear >= 2:
+                    return {"found": True, "ob_high": c["high"], "ob_low": c["low"]}
+            else:  # SHORT
+                if c["close"] >= c["open"]:   # must be a bearish candle
+                    continue
+                n_bull = sum(
+                    1 for j in range(i + 1, min(i + 4, len(closed)))
+                    if closed[j]["close"] > closed[j]["open"]
+                )
+                if n_bull >= 2:
+                    return {"found": True, "ob_high": c["high"], "ob_low": c["low"]}
+
+        return {"found": False, "ob_high": 0.0, "ob_low": 0.0}
+
+    @staticmethod
     def _estimate_fees(qty: float, price: float, taker_fee_pct: float) -> float:
         """
         Estimate taker fee for the EXIT leg of a position.
@@ -263,6 +310,7 @@ class TradingEngine:
             # Restore optional partial-TP trail
             self._trail_activated = bool(sess.get("trail_active", 0))
             self._trail_price     = sess.get("trail_price") or None
+            self._breakeven_armed = bool(sess.get("breakeven_armed", 0))
 
             logger.info(
                 "TradingEngine: restored session id=%d dir=%s tp=%.6f sl=%.6f "
@@ -651,6 +699,9 @@ class TradingEngine:
         vol_last   = c["volume"]
         closes     = [c2["close"] for c2 in self.candles]
 
+        # Order block detection (used for Gate 8 + optional SL tightening)
+        ob = self._find_order_block(self.candles, direction)
+
         # ── Pre-filter reasons (block entry but don't alter gate display) ─
         pre_block_reason = ""
         elapsed_since_exit = time.time() - self._last_exit_time
@@ -679,6 +730,30 @@ class TradingEngine:
             gates["CANDLE STRUCTURE"] = (False, f"lower wick {lower_wick/full_range:.0%} > 35%")
         else:
             gates["CANDLE STRUCTURE"] = (True, f"body {body_ratio:.0%}")
+
+        # Confluence override: if Gate 1 failed due to candle direction/wick,
+        # allow entry when EMA stack + strong flow + HTF all agree.
+        if not gates["CANDLE STRUCTURE"][0]:
+            _g1_ema9  = ind.get("ema9")
+            _g1_ema21 = ind.get("ema21")
+            _g1_ema50 = ind.get("ema50")
+            _g1_flow  = self._flow.summarize().get("score", 0.0)
+            _g1_ema_ok = (
+                _g1_ema9 and _g1_ema21 and _g1_ema50 and (
+                    (direction == "LONG"  and _g1_ema9 > _g1_ema21 > _g1_ema50) or
+                    (direction == "SHORT" and _g1_ema9 < _g1_ema21 < _g1_ema50)
+                )
+            )
+            _g1_flow_ok = (
+                (direction == "LONG"  and _g1_flow >= 0.30) or
+                (direction == "SHORT" and _g1_flow <= -0.30)
+            )
+            _g1_htf_ok = htf_bias in ("NEUTRAL", direction)
+            if _g1_ema_ok and _g1_flow_ok and _g1_htf_ok:
+                gates["CANDLE STRUCTURE"] = (
+                    True,
+                    f"confluence override — body {body_ratio:.0%} (flow {_g1_flow:+.2f})",
+                )
 
         # Gate 2 — Volume
         vol_window = [c2["volume"] for c2 in self.candles[-22:-2]]
@@ -750,6 +825,15 @@ class TradingEngine:
         else:
             gates["R:R RATIO"] = (True, f"{rr_ratio:.2f}:1")
 
+        # Gate 8 — Order Block (informational, never blocks entry)
+        in_ob_zone = ob["found"] and ob["ob_low"] <= price <= ob["ob_high"]
+        if in_ob_zone:
+            gates["ORDER BLOCK"] = (True, f"in OB {ob['ob_low']:g}–{ob['ob_high']:g}")
+        elif ob["found"]:
+            gates["ORDER BLOCK"] = (True, f"OB nearby {ob['ob_low']:g}–{ob['ob_high']:g}")
+        else:
+            gates["ORDER BLOCK"] = (True, "no OB detected")
+
         # ── Broadcast full gate status ────────────────────────────────────
         all_passed = all(v[0] for v in gates.values())
         failed_gate = next((k for k, v in gates.items() if not v[0]), None)
@@ -806,6 +890,23 @@ class TradingEngine:
 
         # Recompute scalp levels from fill_price (accurate TP/SL prices)
         levels = self._compute_scalp_levels(atr_val, fill_price, direction, fill_price, cfg)
+
+        # OB zone — tighten SL to just inside OB boundary (only if tighter than ATR SL)
+        in_ob_zone = ob["found"] and ob["ob_low"] <= fill_price <= ob["ob_high"]
+        if in_ob_zone:
+            _buf = 0.0005   # 0.05% buffer
+            if direction == "LONG":
+                ob_sl = ob["ob_low"] * (1 - _buf)
+                if ob_sl > levels["sl_price"]:   # OB SL is tighter (closer to entry)
+                    levels["sl_price"] = ob_sl
+                    logger.info("TradingEngine: OB zone SL tightened to %.6f (OB low=%.6f)",
+                                ob_sl, ob["ob_low"])
+            else:
+                ob_sl = ob["ob_high"] * (1 + _buf)
+                if ob_sl < levels["sl_price"]:   # OB SL is tighter for SHORT
+                    levels["sl_price"] = ob_sl
+                    logger.info("TradingEngine: OB zone SL tightened to %.6f (OB high=%.6f)",
+                                ob_sl, ob["ob_high"])
 
         await create_session(
             symbol=cfg.symbol,
@@ -921,6 +1022,31 @@ class TradingEngine:
                                price, self._override_sl_price)
                 await self._emergency_close(cfg, price, pnl_pct)
                 return
+
+        # ── Breakeven stop (arm when price reaches 50% of TP distance) ───
+        if not self._breakeven_armed:
+            entry    = sess["entry_price"]
+            tp_ref   = self._override_tp_price or self._scalp_tp_price
+            tp_dist  = abs(tp_ref - entry)
+            half_tp  = tp_dist * 0.50
+            be_hit   = (
+                (direction == "LONG"  and price >= entry + half_tp) or
+                (direction == "SHORT" and price <= entry - half_tp)
+            )
+            if be_hit and tp_dist > 0:
+                self._breakeven_armed  = True
+                self._scalp_sl_price   = entry   # SL moves to entry
+                await update_session(sess["id"], breakeven_armed=1,
+                                     scalp_sl_price=self._scalp_sl_price)
+                logger.info(
+                    "TradingEngine: BREAKEVEN armed — SL moved to entry %.6f  price=%.6f",
+                    entry, price,
+                )
+                self._broadcast({
+                    "type": "notification",
+                    "text": f"Breakeven armed — SL moved to entry {entry:.4f}",
+                })
+                self._push_session()
 
         # ── Exit A — Take Profit ──────────────────────────────────────────
         tp_price = self._override_tp_price or self._scalp_tp_price
@@ -1083,6 +1209,7 @@ class TradingEngine:
         self._entry_candle_time  = 0
         self._trail_activated    = False
         self._trail_price        = None
+        self._breakeven_armed    = False
         self._last_exit_time     = time.time()
         self._clear_level_overrides("position closed")
 
