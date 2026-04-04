@@ -1021,7 +1021,7 @@ class TradingEngine:
             )
             if strong_opposite:
                 self._smart_sl_ticks += 1
-                if self._smart_sl_ticks >= max(5, 5 * cfg.tf_minutes):
+                if self._smart_sl_ticks >= max(10, 5 * cfg.tf_minutes):
                     logger.info(
                         "TradingEngine: SMART SL — signal %s str=%.2f "
                         "confirmed %d ticks, price_pct=%.3f%% dca=%d/%d",
@@ -1063,7 +1063,7 @@ class TradingEngine:
                         dca_count, cfg.max_dca,
                     )
                     await self._try_rescue_dca(
-                        cfg, price, direction, avg_price, qty, dca_count, atr_val
+                        cfg, price, direction, avg_price, qty, dca_count, atr_val, ind=ind
                     )
                 else:
                     # All DCAs exhausted — exit immediately
@@ -1262,7 +1262,7 @@ class TradingEngine:
         else:
             _eff_step = p["dca_step_pct"]
 
-        if dca_count < cfg.max_dca and price_pct <= -_eff_step and not self._hedges:
+        if dca_count < cfg.max_dca and price_pct <= -_eff_step and not self._hedges and not self._rescue_mode:
             opposite = "SHORT" if direction == "LONG" else "LONG"
 
             # Gate 1: Signal must not actively disagree with main direction
@@ -1490,7 +1490,9 @@ class TradingEngine:
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
         session_leverage = self._session.get("leverage", cfg.leverage)
-        new_qty = self._executor.calc_qty(cfg.symbol, dca_margin, session_leverage, price)
+        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
+        fee_adjusted_dca_margin = dca_margin / fee_factor
+        new_qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_dca_margin, session_leverage, price)
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(
             cfg.symbol, side, new_qty, current_price=price
@@ -1570,15 +1572,41 @@ class TradingEngine:
         qty: float,
         dca_count: int,
         atr_val: float = 0.0,
+        ind: Dict = None,
     ) -> None:
         """
-        Rescue DCA — bypasses signal gates and adverse pressure check.
+        Rescue DCA — bypasses normal signal gates and adverse pressure check.
         Called when signal degrades while position is losing. Lowers avg
         price then arms a tight trailing stop to minimize the eventual loss.
         """
+        # Cooldown: same minimum gap as normal DCA to avoid rapid re-entries
+        now = time.time()
+        eff_step = self._entry_adaptive.get("dca_step_pct", 0.5) if self._entry_adaptive else 0.5
+        min_gap_s = max(eff_step * 60, 120)
+        if self._last_dca_time is not None and (now - self._last_dca_time) < min_gap_s:
+            logger.info(
+                "TradingEngine: rescue DCA cooldown — %.0fs since last DCA (need %.0fs)",
+                now - self._last_dca_time, min_gap_s,
+            )
+            return
+
+        # Require at least 1 reversal signal — rescue is permissive but not blind
+        if ind is not None:
+            reversal_count = self._count_reversal_signals(ind, direction)
+            if reversal_count < 1:
+                logger.info(
+                    "TradingEngine: rescue DCA blocked — 0 reversal signals "
+                    "(RSI/BB/MACD/Stoch all neutral)"
+                )
+                self._broadcast({"type": "notification",
+                                 "text": "Rescue DCA blocked: no reversal signal detected"})
+                return
+
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
         session_leverage = self._session.get("leverage", cfg.leverage)
-        new_qty    = self._executor.calc_qty(cfg.symbol, dca_margin, session_leverage, price)
+        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
+        fee_adjusted_dca_margin = dca_margin / fee_factor
+        new_qty    = self._executor.calc_qty(cfg.symbol, fee_adjusted_dca_margin, session_leverage, price)
         side       = "BUY" if direction == "LONG" else "SELL"
 
         order = await self._executor.place_market_order(
@@ -1624,9 +1652,9 @@ class TradingEngine:
         # minimum room to breathe before trail can trigger.
         dca_step_pct = self._entry_adaptive.get("dca_step_pct", 0.5)
         if direction == "LONG":
-            self._rescue_trail_price = fill_price * (1 - dca_step_pct / 100 * 0.5)
+            self._rescue_trail_price = fill_price * (1 - dca_step_pct / 100 * 1.0)
         else:
-            self._rescue_trail_price = fill_price * (1 + dca_step_pct / 100 * 0.5)
+            self._rescue_trail_price = fill_price * (1 + dca_step_pct / 100 * 1.0)
         self._rescue_mode = True
 
         msg = (
