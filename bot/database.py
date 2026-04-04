@@ -193,6 +193,8 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("scalp_sl_pct",         "REAL"),
         ("scalp_atr_pct",        "REAL"),
         ("scalp_entry_candle_time", "INTEGER DEFAULT 0"),
+        # Scalping: breakeven stop state
+        ("breakeven_armed",      "INTEGER DEFAULT 0"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
