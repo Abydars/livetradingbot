@@ -1333,6 +1333,9 @@ let curTrailPrice  = null;
 let curTrailActive = false;
 let curTpPrice  = null;
 let curSlPrice  = null;
+let curRescueMode       = false;
+let curRescueTrailPrice = null;
+let curMarginEnvelope   = 0;
 let configData     = {};
 
 // Manual level overrides — set by arrow buttons, cleared on position change
@@ -1402,6 +1405,7 @@ let _slLine    = null;
 let _trailLine = null;
 let _hedgeLines = [];   // one price line per open hedge
 let _dcaLines   = [];   // DCA trigger level lines on chart
+let _rescueLine = null; // rescue trail price line on chart
 
 // entry/exit markers [ {time, position, color, shape, text} ]
 let _markers = [];
@@ -1716,8 +1720,23 @@ function dispatch(msg) {
       curHedges      = msg.hedges || [];
       curTrailPrice  = msg.trail_price  ?? null;
       curTrailActive = !!msg.trail_active;
-      curTpPrice     = msg.tp_price  ?? null;
-      curSlPrice     = msg.sl_price  ?? null;
+      curTpPrice          = msg.tp_price  ?? null;
+      curSlPrice          = msg.sl_price  ?? null;
+      curRescueMode       = msg.rescue_mode        ?? false;
+      curRescueTrailPrice = msg.rescue_trail_price ?? null;
+      curMarginEnvelope   = msg.margin_envelope    ?? 0;
+      // Draw rescue trail price line
+      if (_rescueLine) { _removeLine(_rescueLine); _rescueLine = null; }
+      if (msg.rescue_mode && msg.rescue_trail_price && csSeries) {
+        _rescueLine = csSeries.createPriceLine({
+          price:            msg.rescue_trail_price,
+          color:            'rgba(245,158,11,0.70)',
+          lineWidth:        1,
+          lineStyle:        LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title:            'RESCUE',
+        });
+      }
       // Draw DCA level lines
       _dcaLines.forEach(l => _removeLine(l));
       _dcaLines = [];
@@ -2076,6 +2095,7 @@ function clearTradeLevels() {
   _hedgeLines = [];
   _dcaLines.forEach(l => _removeLine(l));
   _dcaLines = [];
+  if (_rescueLine) { _removeLine(_rescueLine); _rescueLine = null; }
 }
 
 function updateTradeLevels(session, trailPrice, trailActive, prevOpen, nowOpen) {
@@ -2364,6 +2384,50 @@ function updatePositionPanel() {
     </span>
   </div>` : '';
 
+  // SL proximity warning
+  let slProximityWarning = '';
+  if (curSlPrice && lastPrice && curSession) {
+    const avg = curSession.avg_price;
+    const lev = curSession.leverage || 1;
+    const liqPct    = (1.0 / lev) * 100;
+    const slPct     = liqPct * 0.80;
+    const cutoffPct = slPct * 0.80;
+    const pricePct  = curSession.direction === 'LONG'
+      ? (lastPrice - avg) / avg * 100
+      : (avg - lastPrice) / avg * 100;
+    if (pricePct <= -cutoffPct) {
+      slProximityWarning = `<div style="font-size:9px;color:var(--amber,#f59e0b);text-align:right;margin-top:2px">⚠ DCA blocked near SL</div>`;
+    }
+  }
+
+  // Rescue mode row
+  const rescueRow = curRescueMode
+    ? `<div class="pr">
+         <span class="prk" style="color:var(--amber,#f59e0b)">⚠ Rescue Trail</span>
+         <span class="prv" style="color:var(--amber,#f59e0b)">
+           ${curRescueTrailPrice ? fmtPrice(curRescueTrailPrice) : 'armed'}
+         </span>
+       </div>`
+    : '';
+
+  // Margin envelope progress bar
+  const envelope   = curMarginEnvelope ?? 0;
+  const marginUsed = s.margin ?? 0;
+  const envPct     = envelope > 0 ? Math.min(marginUsed / envelope * 100, 100) : 0;
+  const envColor   = envPct >= 80 ? 'var(--red)' : envPct >= 55 ? 'var(--amber,#f59e0b)' : 'var(--green)';
+  const envelopeRow = envelope > 0
+    ? `<div class="pr">
+         <span class="prk">Margin Used</span>
+         <span class="prv" style="color:${envColor}">
+           $${marginUsed.toFixed(2)} / $${envelope.toFixed(2)}
+           <span style="font-size:9px;opacity:.7">(${envPct.toFixed(0)}%)</span>
+         </span>
+       </div>
+       <div style="height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin:2px 0 4px">
+         <div style="height:100%;width:${envPct}%;background:${envColor};border-radius:2px;transition:width .3s"></div>
+       </div>`
+    : '';
+
   posEl.innerHTML = `
     ${pr('Direction',    `<span class="prv ${dir}">${s.direction}</span>`)}
     ${pr('Symbol',       s.symbol || currentSymbol)}
@@ -2372,9 +2436,11 @@ function updatePositionPanel() {
     ${pr('Avg Price',    fmtPrice(s.avg_price))}
     ${tpRow}
     ${slRow}
+    ${slProximityWarning}
+    ${rescueRow}
     ${trailRow}
     ${pr('Qty',       s.qty)}
-    ${pr('Margin',    '$' + s.margin.toFixed(2))}
+    ${envelopeRow}
     ${pr('Leverage',  s.leverage + 'x')}
     ${pr('DCA #',     s.dca_count)}
     ${pr('Hedge #',   s.hedge_count)}

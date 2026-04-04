@@ -102,6 +102,9 @@ class TradingEngine:
         self._rescue_mode:        bool          = False
         self._rescue_trail_price: Optional[float] = None   # best price seen since rescue DCA
 
+        # Margin envelope: theoretical max capital across entry + all DCAs (set at entry)
+        self._margin_envelope: float = 0.0
+
         # Adaptive risk parameters — two copies:
         #   _adaptive      : refreshed every tick (current market conditions)
         #   _entry_adaptive: locked at trade entry, updated on each DCA
@@ -178,6 +181,7 @@ class TradingEngine:
         self._prev_indicators    = {}
         self.last_signal         = {}
         self._effective_leverage = 1   # re-set by main.py after prepare_symbol()
+        self._margin_envelope    = 0.0
 
         logger.info("TradingEngine: state reset for symbol switch")
 
@@ -260,6 +264,9 @@ class TradingEngine:
             "override_sl_price":     self._override_sl_price,
             "breakeven_stop_price":  self._breakeven_stop_price,
             "dca_prices":            dca_prices,
+            "rescue_mode":           self._rescue_mode,
+            "rescue_trail_price":    self._rescue_trail_price,
+            "margin_envelope":       self._margin_envelope,
         })
 
     def _pos_log(self, event: str, **kw) -> None:
@@ -880,6 +887,10 @@ class TradingEngine:
         self._entry_adaptive = entry_adaptive  # locked for life of this trade
         self._entry_adaptive["max_dca"] = cfg.max_dca  # stored for _push_session access
         self._last_resort_buffer_cache = cfg.last_resort_sl_buffer  # needed by first _push_session
+        self._margin_envelope = sum(
+            cfg.margin_usdt * (cfg.dca_multiplier ** i)
+            for i in range(cfg.max_dca + 1)
+        )
 
         await log_signal(cfg.symbol, direction, strength, signal["components"], "entry")
 
