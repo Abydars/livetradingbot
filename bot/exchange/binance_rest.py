@@ -847,12 +847,16 @@ class BinanceRestClient:
 
         # ── Phase 2: breakout-specific scoring ──
         pool_syms  = [c["symbol"] for c in phase2_pool]
-        klines_map = await self.get_klines_batch(pool_syms, interval=timeframe, limit=25)
+        klines_map = await self.get_klines_batch(pool_syms, interval=timeframe, limit=70)
 
         for c in phase2_pool:
             sym  = c["symbol"]
             data = klines_map.get(sym)
             if not data or len(data) < 60:
+                c["_vol_surge"] = None
+                c["_momentum"]  = None
+                c["_atr_pct"]   = None
+                c["_score"]     = 0.0
                 continue
 
             highs  = [float(k[2]) for k in data]
@@ -1003,6 +1007,10 @@ class BinanceRestClient:
             sym  = c["symbol"]
             data = klines_map.get(sym)
             if not data or len(data) < 60:
+                c["_vol_surge"] = None
+                c["_momentum"]  = None
+                c["_atr_pct"]   = None
+                c["_score"]     = 0.0
                 continue
 
             highs  = [float(k[2]) for k in data]
@@ -1166,6 +1174,10 @@ class BinanceRestClient:
             sym  = c["symbol"]
             data = klines_map.get(sym)
             if not data or len(data) < 60:
+                c["_vol_surge"] = None
+                c["_momentum"]  = None
+                c["_atr_pct"]   = None
+                c["_score"]     = 0.0
                 continue
 
             highs  = [float(k[2]) for k in data]
