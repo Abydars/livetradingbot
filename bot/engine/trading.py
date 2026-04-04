@@ -807,9 +807,9 @@ class TradingEngine:
         )
         if _rsi_ideal:
             _confluence_count += 1
-        # Linear scale: 0 confluence → cfg.min_flow_score; 4/4 → 0.05; floor 0.03
+        # Linear scale: 0 confluence → cfg.min_flow_score; 4/4 → 0.05; floor 0.08
         _effective_flow_threshold = max(
-            0.03,
+            0.08,
             cfg.min_flow_score - (cfg.min_flow_score - 0.05) * (_confluence_count / 4),
         )
 
@@ -1070,13 +1070,16 @@ class TradingEngine:
                 (direction == "SHORT" and price <= entry - half_tp)
             )
             if be_hit and tp_dist > 0:
-                self._breakeven_armed  = True
-                self._scalp_sl_price   = entry   # SL moves to entry
+                self._breakeven_armed = True
+                # Small buffer so SL sits just below entry (LONG) / above entry (SHORT)
+                # to survive micro-wicks without immediately stopping out.
+                new_sl = entry * 0.9997 if direction == "LONG" else entry * 1.0003
+                self._scalp_sl_price  = new_sl
                 await update_session(sess["id"], breakeven_armed=1,
                                      scalp_sl_price=self._scalp_sl_price)
                 logger.info(
-                    "TradingEngine: BREAKEVEN armed — SL moved to entry %.6f  price=%.6f",
-                    entry, price,
+                    "TradingEngine: BREAKEVEN armed — SL moved to %.6f (entry %.6f)  price=%.6f",
+                    new_sl, entry, price,
                 )
                 self._broadcast({
                     "type": "notification",
@@ -1094,6 +1097,11 @@ class TradingEngine:
             arm_dist = tp_dist * 0.60
             if direction == "LONG":
                 arm_at = entry + arm_dist
+                logger.debug(
+                    "TradingEngine: trail ARM check LONG  entry=%.6f tp=%.6f "
+                    "tp_dist=%.6f arm_at=%.6f price=%.6f",
+                    entry, tp_price, tp_dist, arm_at, price,
+                )
                 if price >= arm_at:
                     trail_dist = tp_dist * 0.30
                     self._trail_activated = True
@@ -1104,6 +1112,11 @@ class TradingEngine:
                                 price, self._trail_price)
             else:
                 arm_at = entry - arm_dist
+                logger.debug(
+                    "TradingEngine: trail ARM check SHORT  entry=%.6f tp=%.6f "
+                    "tp_dist=%.6f arm_at=%.6f price=%.6f",
+                    entry, tp_price, tp_dist, arm_at, price,
+                )
                 if price <= arm_at:
                     trail_dist = tp_dist * 0.30
                     self._trail_activated = True
