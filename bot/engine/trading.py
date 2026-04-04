@@ -350,48 +350,20 @@ class TradingEngine:
         htf_bias: str = "NEUTRAL",
     ) -> None:
         """
-        7-gate scalping entry. All gates must pass simultaneously.
-        Logs which gate failed for entry_blocked broadcast.
+        7-gate scalping entry. All gates are evaluated and broadcast every call
+        so the UI always shows current pass/fail status.
         Entry is ONLY on a closed candle — never mid-candle.
         """
-        gates = {}   # gate_name → (passed: bool, value: str)
-
-        def _blocked(gate: str, reason: str) -> None:
-            gates[gate] = (False, reason)
-            self._broadcast({
-                "type": "entry_blocked",
-                "reason": f"Entry blocked: {gate} — {reason}",
-                "gates": gates,
-            })
-
-        # Need at least 60 candles for all indicators
+        # ── Pre-filters (silent — no gate broadcast) ──────────────────────
         if len(self.candles) < 60:
             return
-
-        # ── Gate 7 — Entry cooldown ──────────────────────────────────────────
-        elapsed_since_exit = time.time() - self._last_exit_time
-        if elapsed_since_exit < cfg.entry_cooldown_s:
-            remaining = cfg.entry_cooldown_s - elapsed_since_exit
-            _blocked("COOLDOWN", f"{remaining:.0f}s remaining after last exit")
-            return
-
-        # ── HTF filter (Gate 0) — block counter-trend entries ─────────────
-        if cfg.htf_filter and htf_bias != "NEUTRAL":
-            direction_from_signal = signal.get("direction", "NEUTRAL")
-            if direction_from_signal != "NEUTRAL" and htf_bias != direction_from_signal:
-                _blocked("HTF", f"HTF bias {htf_bias} contradicts signal {direction_from_signal}")
-                return
-
-        # ── Daily loss circuit breaker ────────────────────────────────────
-        if cfg.max_daily_loss_usdt > 0:
-            today_pnl = await get_today_pnl()
-            if today_pnl < -cfg.max_daily_loss_usdt:
-                _blocked("DAILY_LOSS", f"limit reached ({today_pnl:.2f} USDT)")
-                return
-
-        # ── Require closed candle ────────────────────────────────────────
         if len(self.candles) < 2 or atr_val <= 0:
             return
+
+        direction = signal.get("direction", "NEUTRAL")
+        if direction == "NEUTRAL":
+            return
+
         c = self.candles[-2]   # last CLOSED candle
         high_  = c["high"];  low_ = c["low"]
         open_  = c["open"];  close_ = c["close"]
@@ -399,111 +371,145 @@ class TradingEngine:
         if full_range <= 0:
             return
 
-        body        = abs(close_ - open_)
-        upper_wick  = high_ - max(open_, close_)
-        lower_wick  = min(open_, close_) - low_
-        vol_last    = c["volume"]
+        body       = abs(close_ - open_)
+        upper_wick = high_ - max(open_, close_)
+        lower_wick = min(open_, close_) - low_
+        vol_last   = c["volume"]
+        closes     = [c2["close"] for c2 in self.candles]
 
-        # ── Gate 1 — Candle structure ─────────────────────────────────────
+        # ── Pre-filter reasons (block entry but don't alter gate display) ─
+        pre_block_reason = ""
+        elapsed_since_exit = time.time() - self._last_exit_time
+        if elapsed_since_exit < cfg.entry_cooldown_s:
+            remaining = cfg.entry_cooldown_s - elapsed_since_exit
+            pre_block_reason = f"Cooldown: {remaining:.0f}s remaining"
+        elif cfg.htf_filter and htf_bias not in ("NEUTRAL", direction):
+            pre_block_reason = f"HTF filter: bias {htf_bias} ≠ signal {direction}"
+        elif cfg.max_daily_loss_usdt > 0:
+            pass  # checked async below
+
+        # ── Evaluate all 7 gates unconditionally ─────────────────────────
+        gates: Dict[str, tuple] = {}
+
+        # Gate 1 — Candle structure
         body_ratio = body / full_range
         if body_ratio < cfg.min_body_ratio:
-            _blocked("CANDLE STRUCTURE", f"body ratio {body_ratio:.2f} < {cfg.min_body_ratio:.2f}")
-            return
+            gates["CANDLE STRUCTURE"] = (False, f"body {body_ratio:.0%} < {cfg.min_body_ratio:.0%}")
+        elif direction == "LONG" and close_ <= open_:
+            gates["CANDLE STRUCTURE"] = (False, "bearish candle for LONG")
+        elif direction == "LONG" and upper_wick / full_range > 0.35:
+            gates["CANDLE STRUCTURE"] = (False, f"upper wick {upper_wick/full_range:.0%} > 35%")
+        elif direction == "SHORT" and close_ >= open_:
+            gates["CANDLE STRUCTURE"] = (False, "bullish candle for SHORT")
+        elif direction == "SHORT" and lower_wick / full_range > 0.35:
+            gates["CANDLE STRUCTURE"] = (False, f"lower wick {lower_wick/full_range:.0%} > 35%")
+        else:
+            gates["CANDLE STRUCTURE"] = (True, f"body {body_ratio:.0%}")
 
-        direction_from_candle = "LONG" if close_ > open_ else "SHORT"
-        direction = signal.get("direction", "NEUTRAL")
-        if direction == "NEUTRAL":
-            return
-
-        if direction == "LONG":
-            if close_ <= open_:
-                _blocked("CANDLE STRUCTURE", "bearish candle for LONG")
-                return
-            if upper_wick / full_range > 0.35:
-                _blocked("CANDLE STRUCTURE", f"upper wick {upper_wick/full_range:.0%} > 35%")
-                return
-        else:  # SHORT
-            if close_ >= open_:
-                _blocked("CANDLE STRUCTURE", "bullish candle for SHORT")
-                return
-            if lower_wick / full_range > 0.35:
-                _blocked("CANDLE STRUCTURE", f"lower wick {lower_wick/full_range:.0%} > 35%")
-                return
-        gates["CANDLE STRUCTURE"] = (True, f"body {body_ratio:.0%}")
-
-        # ── Gate 2 — Volume confirmation ──────────────────────────────────
+        # Gate 2 — Volume
         vol_window = [c2["volume"] for c2 in self.candles[-22:-2]]
-        if len(vol_window) < 10:
-            return
-        vol_avg = sum(vol_window) / len(vol_window)
-        vol_ratio = vol_last / vol_avg if vol_avg > 0 else 0.0
-        if vol_ratio < cfg.min_vol_ratio:
-            _blocked("VOLUME", f"vol ratio {vol_ratio:.2f}x < {cfg.min_vol_ratio:.2f}x")
-            return
-        gates["VOLUME"] = (True, f"{vol_ratio:.1f}×")
+        if len(vol_window) >= 10:
+            vol_avg   = sum(vol_window) / len(vol_window)
+            vol_ratio = vol_last / vol_avg if vol_avg > 0 else 0.0
+            if vol_ratio < cfg.min_vol_ratio:
+                gates["VOLUME"] = (False, f"{vol_ratio:.2f}× < {cfg.min_vol_ratio:.2f}×")
+            else:
+                gates["VOLUME"] = (True, f"{vol_ratio:.1f}×")
+        else:
+            gates["VOLUME"] = (False, "not enough history")
 
-        # ── Gate 3 — EMA momentum stack ───────────────────────────────────
-        closes = [c2["close"] for c2 in self.candles]
+        # Gate 3 — EMA stack
         ema9  = EMA(closes, 9)
         ema21 = EMA(closes, 21)
         ema50 = EMA(closes, 50)
         if ema9 is None or ema21 is None or ema50 is None:
-            return
-        if direction == "LONG":
-            ema_ok = ema9 > ema21 > ema50 and price > ema9
+            gates["EMA STACK"] = (False, "indicator not ready")
+        elif direction == "LONG":
+            if ema9 > ema21 > ema50 and price > ema9:
+                gates["EMA STACK"] = (True, f"e9={ema9:.2f}")
+            else:
+                gates["EMA STACK"] = (False, f"e9={ema9:.2f} e21={ema21:.2f} e50={ema50:.2f}")
         else:
-            ema_ok = ema9 < ema21 < ema50 and price < ema9
-        if not ema_ok:
-            _blocked("EMA STACK", f"ema9={ema9:.4f} ema21={ema21:.4f} ema50={ema50:.4f}")
-            return
-        gates["EMA STACK"] = (True, f"ema9={ema9:.4f}")
+            if ema9 < ema21 < ema50 and price < ema9:
+                gates["EMA STACK"] = (True, f"e9={ema9:.2f}")
+            else:
+                gates["EMA STACK"] = (False, f"e9={ema9:.2f} e21={ema21:.2f} e50={ema50:.2f}")
 
-        # ── Gate 4 — Order flow agreement ─────────────────────────────────
-        flow_data = self._flow.summarize()
+        # Gate 4 — Order flow
+        flow_data  = self._flow.summarize()
         flow_score = flow_data.get("score", 0.0)
         flow_count = flow_data.get("trade_count", 0)
         if flow_count < 10:
-            _blocked("ORDER FLOW", f"only {flow_count} trades in window (need 10)")
-            return
-        if direction == "LONG" and flow_score < cfg.min_flow_score:
-            _blocked("ORDER FLOW", f"score {flow_score:+.2f} < +{cfg.min_flow_score:.2f}")
-            return
-        if direction == "SHORT" and flow_score > -cfg.min_flow_score:
-            _blocked("ORDER FLOW", f"score {flow_score:+.2f} > -{cfg.min_flow_score:.2f}")
-            return
-        gates["ORDER FLOW"] = (True, f"{flow_score:+.2f}")
+            gates["ORDER FLOW"] = (False, f"only {flow_count} trades (need 10)")
+        elif direction == "LONG" and flow_score < cfg.min_flow_score:
+            gates["ORDER FLOW"] = (False, f"score {flow_score:+.2f} < +{cfg.min_flow_score:.2f}")
+        elif direction == "SHORT" and flow_score > -cfg.min_flow_score:
+            gates["ORDER FLOW"] = (False, f"score {flow_score:+.2f} > -{cfg.min_flow_score:.2f}")
+        else:
+            gates["ORDER FLOW"] = (True, f"{flow_score:+.2f}")
 
-        # ── Gate 5 — RSI not at extreme ───────────────────────────────────
+        # Gate 5 — RSI zone
         rsi_val = RSI(closes, 14)
         if rsi_val is None:
-            return
-        if direction == "LONG" and not (35 <= rsi_val <= 75):
-            _blocked("RSI ZONE", f"RSI {rsi_val:.1f} outside 35–75 for LONG")
-            return
-        if direction == "SHORT" and not (25 <= rsi_val <= 65):
-            _blocked("RSI ZONE", f"RSI {rsi_val:.1f} outside 25–65 for SHORT")
-            return
-        gates["RSI ZONE"] = (True, f"{rsi_val:.1f}")
+            gates["RSI ZONE"] = (False, "indicator not ready")
+        elif direction == "LONG" and not (35 <= rsi_val <= 75):
+            gates["RSI ZONE"] = (False, f"RSI {rsi_val:.1f} outside 35–75")
+        elif direction == "SHORT" and not (25 <= rsi_val <= 65):
+            gates["RSI ZONE"] = (False, f"RSI {rsi_val:.1f} outside 25–65")
+        else:
+            gates["RSI ZONE"] = (True, f"{rsi_val:.1f}")
 
-        # ── Gate 6 — ATR-based volatility range ───────────────────────────
+        # Gate 6 — ATR range
         atr_pct = (atr_val / price * 100) if price > 0 else 0.0
         if atr_pct < 0.15:
-            _blocked("ATR RANGE", f"ATR {atr_pct:.3f}% < 0.15% (not enough range)")
-            return
-        if atr_pct > 3.0:
-            _blocked("ATR RANGE", f"ATR {atr_pct:.3f}% > 3.0% (too chaotic)")
-            return
-        gates["ATR RANGE"] = (True, f"{atr_pct:.2f}%")
+            gates["ATR RANGE"] = (False, f"{atr_pct:.3f}% < 0.15%")
+        elif atr_pct > 3.0:
+            gates["ATR RANGE"] = (False, f"{atr_pct:.3f}% > 3.0%")
+        else:
+            gates["ATR RANGE"] = (True, f"{atr_pct:.2f}%")
 
-        # ── Gate 0 / R:R check — compute scalp levels ────────────────────
-        levels = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
+        # Gate 7 — R:R ratio
+        levels   = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
         rr_ratio = levels["rr_ratio"]
         if rr_ratio < cfg.min_rr_ratio:
-            _blocked("R:R RATIO", f"{rr_ratio:.2f} < {cfg.min_rr_ratio:.2f} minimum")
-            await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
-                             signal.get("components", {}), "skip")
+            gates["R:R RATIO"] = (False, f"{rr_ratio:.2f} < {cfg.min_rr_ratio:.2f}")
+        else:
+            gates["R:R RATIO"] = (True, f"{rr_ratio:.2f}:1")
+
+        # ── Broadcast full gate status ────────────────────────────────────
+        all_passed = all(v[0] for v in gates.values())
+        failed_gate = next((k for k, v in gates.items() if not v[0]), None)
+
+        if pre_block_reason:
+            broadcast_reason = pre_block_reason
+            all_passed = False
+        elif failed_gate:
+            broadcast_reason = f"Entry blocked: {failed_gate} — {gates[failed_gate][1]}"
+        else:
+            broadcast_reason = f"All gates passed — entering {direction}"
+
+        self._broadcast({
+            "type":   "entry_blocked",
+            "reason": broadcast_reason,
+            "gates":  gates,
+        })
+
+        if not all_passed:
+            if failed_gate == "R:R RATIO":
+                await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
+                                 signal.get("components", {}), "skip")
             return
-        gates["R:R RATIO"] = (True, f"{rr_ratio:.2f}:1")
+
+        # ── Daily loss async check (only when all 7 gates pass) ───────────
+        if cfg.max_daily_loss_usdt > 0:
+            today_pnl = await get_today_pnl()
+            if today_pnl < -cfg.max_daily_loss_usdt:
+                self._broadcast({
+                    "type":   "entry_blocked",
+                    "reason": f"Daily loss limit reached ({today_pnl:.2f} USDT)",
+                    "gates":  gates,
+                })
+                return
 
         # ── All gates passed — place order ────────────────────────────────
         effective_leverage = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
