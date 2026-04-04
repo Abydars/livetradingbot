@@ -436,14 +436,14 @@ class TradingEngine:
             gates["EMA STACK"] = (False, "indicator not ready")
         elif direction == "LONG":
             if ema9 > ema21 > ema50 and price > ema9:
-                gates["EMA STACK"] = (True, f"e9={ema9:.2f}")
+                gates["EMA STACK"] = (True, f"e9={ema9:g}")
             else:
-                gates["EMA STACK"] = (False, f"e9={ema9:.2f} e21={ema21:.2f} e50={ema50:.2f}")
+                gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
         else:
             if ema9 < ema21 < ema50 and price < ema9:
-                gates["EMA STACK"] = (True, f"e9={ema9:.2f}")
+                gates["EMA STACK"] = (True, f"e9={ema9:g}")
             else:
-                gates["EMA STACK"] = (False, f"e9={ema9:.2f} e21={ema21:.2f} e50={ema50:.2f}")
+                gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
 
         # Gate 4 — Order flow
         flow_data  = self._flow.summarize()
