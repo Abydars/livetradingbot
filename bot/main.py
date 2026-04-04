@@ -95,14 +95,10 @@ _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
 _last_htf_fetch:  float = 0.0         # last time HTF was fetched
 _htf_scanner_cache: dict = {}         # {symbol: (bias, fetched_ts)} — per-symbol HTF cache for scanner
 _current_scanner_type: str = "momentum"   # scanner type that found active symbol
-_entry_start_candle:   int = 0        # candle close time when we switched to current candidate (0 = not waiting)
-_neutral_since_candle: int = 0        # candle close time when signal went NEUTRAL (0 = directional)
-_ENTRY_HARD_MAX_CANDLES = 6           # hard max candles on one symbol regardless of signal direction
-
-# Cooldown tracking: {symbol: timestamp_of_rescue_trail_exit}
-# Auto-switch skips symbols whose cooldown has not expired.
-_symbol_cooldowns: dict = {}
-_RESCUE_COOLDOWN_S = 20 * 60          # 20 minutes cooldown after rescue_trail exit
+# How many scan cycles the current symbol has been the active symbol without an entry.
+# Used to force a switch after _STALE_SCAN_CYCLES to avoid getting stuck.
+_stale_scan_cycles: int = 0
+_STALE_SCAN_CYCLES  = 10             # switch after N scan cycles on current symbol with no entry
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _symbol_blacklist: set = {            # never trade these symbols
     "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT",
@@ -149,18 +145,6 @@ async def _do_broadcast(msg: Dict) -> None:
             sessions     = await get_sessions(200)
             # Record cooldown if the most recent session exited via rescue_trail.
             # This prevents auto-switch from immediately re-trying the same symbol
-            # that just caused a loss.
-            if sessions:
-                last = sessions[0]   # most recent (get_sessions orders DESC)
-                if last.get("exit_reason") in ("rescue_trail", "rescue_adverse"):
-                    sym = last.get("symbol", "")
-                    if sym:
-                        _symbol_cooldowns[sym] = time.time()
-                        logger.info(
-                            "Auto-switch: cooldown started for %s (rescue_trail exit) — "
-                            "skipping for %.0f minutes",
-                            sym, _RESCUE_COOLDOWN_S / 60,
-                        )
             hedge_trades = await get_all_closed_hedges(200)
             perf         = await get_performance()
             hist_msg = json.dumps({"type": "sessions", "sessions": sessions,
@@ -446,14 +430,13 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
             _engine.reset_for_switch()
 
         # Update config and reset state immediately
-        global _entry_start_candle, _neutral_since_candle, _tried_syms
+        global _tried_syms, _stale_scan_cycles
         await set_config_bulk({"symbol": new_sym})
-        _last_candles_fetch   = 0.0
-        _htf_bias             = "NEUTRAL"
-        _last_htf_fetch       = 0.0
-        _last_switch_ts       = time.time()
-        _entry_start_candle   = 0
-        _neutral_since_candle = 0
+        _last_candles_fetch = 0.0
+        _htf_bias           = "NEUTRAL"
+        _last_htf_fetch     = 0.0
+        _last_switch_ts     = time.time()
+        _stale_scan_cycles  = 0
         _tried_syms.discard(new_sym)   # new symbol is active — remove from tried
 
         # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
@@ -653,29 +636,21 @@ async def _scanner_loop() -> None:
 
 
 def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
-    """Rank a scanner candidate for auto-switch quality."""
+    """Rank a scanner candidate for scalping suitability."""
     base = sym_data.get("_score", 0.0)
 
-    # HTF alignment bonus
+    # HTF alignment bonus — prefer symbols where trend agrees with momentum
     htf_bias     = sym_data.get("_htf_bias", "")
     scanner_bias = sym_data.get("_bias", "")
     if htf_bias and scanner_bias and htf_bias == scanner_bias:
         base *= 1.20
 
-    # Large-cap volume bonus
+    # Large-cap liquidity bonus — tighter spreads, better fills for scalping
     qv = float(sym_data.get("quoteVolume", 0))
     if qv >= 500_000_000:
         base *= 1.30
     elif qv >= 100_000_000:
         base *= 1.15
-
-    # Rescue trail penalty
-    last_rescue = _symbol_cooldowns.get(sym_data.get("symbol", ""), 0.0)
-    if last_rescue > 0:
-        elapsed = now_ts - last_rescue
-        if elapsed < _RESCUE_COOLDOWN_S:
-            remaining_frac = 1 - (elapsed / _RESCUE_COOLDOWN_S)
-            base *= (1 - 0.30 * remaining_frac)
 
     return base
 
@@ -693,7 +668,7 @@ async def _scan_symbols(cfg) -> None:
       get_top_movers() REST call. The final order-flow gate is checked
       live in _try_entry() on every tick.
     """
-    global _neutral_since_candle, _tried_syms, _entry_start_candle, _htf_scanner_cache
+    global _stale_scan_cycles, _tried_syms, _htf_scanner_cache
     global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
     global _last_switch_ts, _last_symbol_scan
     import math
@@ -788,38 +763,32 @@ async def _scan_symbols(cfg) -> None:
         top_data = {t["symbol"]: t for t in top20}
 
         if not cfg.auto_switch or not _trading_active:
-            _entry_start_candle   = 0
-            _neutral_since_candle = 0
+            _stale_scan_cycles = 0
             _tried_syms.clear()
             return
         if _engine._session is not None:
-            _entry_start_candle   = 0
-            _neutral_since_candle = 0
+            # Position open — reset stale counter and tried set for next entry cycle
+            _stale_scan_cycles = 0
             _tried_syms.clear()
             return
 
         top_syms_raw = [t["symbol"] for t in top20]
         top_syms     = [t["symbol"] for t in top_by_switch]
 
-        cur_candle = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
-        tf_secs    = cfg.tf_minutes * 60 if cfg.tf_minutes > 0 else 60
-
+        # Drop current symbol from top20 → switch immediately
         if cfg.symbol not in top_syms_raw:
             _tried_syms.add(cfg.symbol)
 
         def _is_eligible(sym: str) -> bool:
+            """Eligible if not already tried and HTF doesn't contradict momentum."""
             if sym in _tried_syms:
-                return False
-            last_rescue = _symbol_cooldowns.get(sym, 0.0)
-            if last_rescue > 0 and (now_ts - last_rescue) < _RESCUE_COOLDOWN_S:
                 return False
             d = top_data.get(sym, {})
             htf  = d.get("_htf_bias", "")
             bias = d.get("_bias", "")
-            if htf and bias:
-                opposites = {"LONG": "SHORT", "SHORT": "LONG"}
-                if htf == opposites.get(bias, ""):
-                    return False
+            # Skip symbols where HTF trend contradicts 24h momentum direction
+            if htf and bias and htf != bias:
+                return False
             return True
 
         candidates_list = [s for s in top_syms if _is_eligible(s)]
@@ -832,79 +801,55 @@ async def _scan_symbols(cfg) -> None:
         new_sym = None
 
         if cfg.symbol in candidates_list:
-            next_candidate = next((s for s in candidates_list if s != cfg.symbol), None)
-            top_candidate  = next((t for t in top_by_switch if _is_eligible(t["symbol"])), None)
-            top_sym        = top_candidate["symbol"] if top_candidate else None
-            top_score      = top_candidate["_switch_score"] if top_candidate else 0.0
-            cur_score      = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
+            # Current symbol still in top 20 — compare scores
+            top_candidate = next((t for t in top_by_switch if _is_eligible(t["symbol"])), None)
+            top_sym   = top_candidate["symbol"] if top_candidate else None
+            top_score = top_candidate["_switch_score"] if top_candidate else 0.0
+            cur_score = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
 
-            should_immediate = (
-                top_sym and top_sym != cfg.symbol and (
-                    cur_score == 0 or
-                    (cur_score > 0 and top_score >= cur_score * cfg.switch_threshold)
-                )
+            # Switch immediately if a clearly better symbol exists
+            should_switch = (
+                top_sym and top_sym != cfg.symbol and
+                (cur_score == 0 or top_score >= cur_score * cfg.switch_threshold)
             )
-            if should_immediate:
-                logger.info("Auto-switch: %s → %s (immediate, score %.2f vs %.2f)",
-                            cfg.symbol, top_sym, top_score, cur_score)
+
+            if should_switch:
+                logger.info("Auto-switch: %s → %s (score %.2f → %.2f)",
+                            cfg.symbol, top_sym, cur_score, top_score)
                 _tried_syms.add(cfg.symbol)
-                _entry_start_candle   = 0
-                _neutral_since_candle = 0
+                _stale_scan_cycles = 0
                 new_sym = top_sym
             else:
-                if _entry_start_candle == 0 and cur_candle > 0:
-                    _entry_start_candle = cur_candle
-
-                total_candles = max(0, (cur_candle - _entry_start_candle + 1) // tf_secs) if tf_secs > 0 else 0
-                sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
-                if sig_dir == "NEUTRAL":
-                    if _neutral_since_candle == 0 and cur_candle > 0:
-                        _neutral_since_candle = cur_candle
-                    neutral_candles = max(0, (cur_candle - _neutral_since_candle + 1) // tf_secs) if tf_secs > 0 else 0
-                else:
-                    _neutral_since_candle = 0
-                    neutral_candles       = 0
-
-                await _do_broadcast({
-                    "type":      "entry_wait",
-                    "waiting":   True,
-                    "elapsed":   neutral_candles,
-                    "timeout":   cfg.entry_wait_candles,
-                    "symbol":    cfg.symbol,
-                    "candidate": next_candidate or "",
-                    "tried":     len(_tried_syms),
-                    "total":     len(top_syms),
-                    "signal":    sig_dir,
-                })
-
-                if neutral_candles < cfg.entry_wait_candles and total_candles < _ENTRY_HARD_MAX_CANDLES:
+                # Stay on current symbol — 7-gate logic decides when to enter.
+                # After _STALE_SCAN_CYCLES with no entry, force a rotation.
+                _stale_scan_cycles += 1
+                if _stale_scan_cycles < _STALE_SCAN_CYCLES:
                     return
-
+                logger.info("Auto-switch: %s stale after %d scan cycles — rotating",
+                            cfg.symbol, _stale_scan_cycles)
                 _tried_syms.add(cfg.symbol)
-                candidates_list = [s for s in top_syms if s not in _tried_syms]
+                _stale_scan_cycles = 0
+                candidates_list = [s for s in top_syms if _is_eligible(s)]
                 if not candidates_list:
                     _tried_syms.clear()
                     candidates_list = [s for s in top_syms if s != cfg.symbol]
-                    if not candidates_list:
-                        return
-                new_sym = candidates_list[0]
+                if candidates_list:
+                    new_sym = candidates_list[0]
         else:
+            # Current symbol fell out of top 20 — switch immediately
+            _stale_scan_cycles = 0
             new_sym = candidates_list[0]
 
         if new_sym is None:
             return
 
-        logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
+        logger.info("Auto-switch: → %s  (tried: %s)", new_sym, sorted(_tried_syms))
         global _htf_bias, _last_htf_fetch
         _htf_scanner_cache.pop(new_sym, None)
         for m in _last_top_movers:
             if m.get("symbol") == new_sym:
                 m["htf_bias"] = ""
                 break
-        # Do NOT set _switching_in_progress here — _do_switch manages it
-        # via its own try/finally. Setting it before ensure_future causes
-        # _do_switch's early guard to fire and return without the finally,
-        # leaving _switching_in_progress=True permanently.
         asyncio.ensure_future(_do_switch(new_sym, cfg))
 
     except asyncio.CancelledError:
@@ -1621,7 +1566,7 @@ async def tv_signal(request: Request):
     if direction not in ("LONG", "SHORT"):
         return {"ok": False, "error": f"invalid direction: {direction}"}
 
-    global _tv_alert_cooldown, _entry_start_candle, _neutral_since_candle, _tried_syms, \
+    global _tv_alert_cooldown, _stale_scan_cycles, _tried_syms, \
            _current_scanner_type, _last_top_movers, _last_candles_fetch, _htf_bias, \
            _last_htf_fetch, _last_switch_ts
 
@@ -1649,8 +1594,7 @@ async def tv_signal(request: Request):
     )
 
     # Reset auto-switch cycle and switch to TV-suggested symbol
-    _entry_start_candle   = 0
-    _neutral_since_candle = 0
+    _stale_scan_cycles = 0
     _tried_syms.clear()
     _current_scanner_type = scanner
     if _engine:
@@ -2098,9 +2042,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             cfg2 = await load_config()
             await _executor.prepare_symbol(new_sym, cfg2.leverage)
             # Reset auto-switch cycle — manual override starts fresh on chosen symbol
-            global _entry_start_candle, _neutral_since_candle, _tried_syms, _htf_bias, _last_htf_fetch, _current_scanner_type
-            _entry_start_candle   = 0
-            _neutral_since_candle = 0
+            global _stale_scan_cycles, _tried_syms, _htf_bias, _last_htf_fetch, _current_scanner_type
+            _stale_scan_cycles = 0
             _tried_syms.clear()
             _htf_bias        = "NEUTRAL"
             _last_htf_fetch  = 0.0
