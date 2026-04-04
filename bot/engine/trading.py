@@ -40,6 +40,42 @@ def _ts() -> int:
     return int(time.time())
 
 
+def _find_liquidity_pool(
+    candles_1m: List[Dict],
+    bias: str,
+    entry_price: float,
+    sl_pts: float,
+    cfg,
+) -> float:
+    """
+    Find nearest equal highs (LONG) or equal lows (SHORT) in last 50 1M candles.
+    Equal = two highs/lows within 0.05% of each other.
+    Only looks beyond entry in trade direction.
+    Returns pool price, or entry ± 2×sl_pts if none found.
+    """
+    tolerance_pct = 0.0005
+    lookback = candles_1m[-50:] if len(candles_1m) >= 50 else candles_1m
+
+    if bias == "LONG":
+        highs = sorted(c["high"] for c in lookback if c["high"] > entry_price)
+        for i in range(len(highs) - 1):
+            h1, h2 = highs[i], highs[i + 1]
+            if h2 > 0 and abs(h1 - h2) / h2 <= tolerance_pct:
+                pool = (h1 + h2) / 2
+                if (pool - entry_price) >= sl_pts * cfg.smc_min_rr:
+                    return pool
+        return entry_price + sl_pts * cfg.smc_min_rr
+    else:
+        lows = sorted((c["low"] for c in lookback if c["low"] < entry_price), reverse=True)
+        for i in range(len(lows) - 1):
+            l1, l2 = lows[i], lows[i + 1]
+            if l2 > 0 and abs(l1 - l2) / l2 <= tolerance_pct:
+                pool = (l1 + l2) / 2
+                if (entry_price - pool) >= sl_pts * cfg.smc_min_rr:
+                    return pool
+        return entry_price - sl_pts * cfg.smc_min_rr
+
+
 class TradingEngine:
     """
     Encapsulates all trading state.  Call tick() periodically.
@@ -183,89 +219,49 @@ class TradingEngine:
         self._broadcast({"type": "level_overrides_cleared"})
 
     @staticmethod
-    def _compute_scalp_levels(
-        atr: float,
-        price: float,
-        direction: str,
+    def _compute_smc_levels(
+        bias: str,
         entry_price: float,
+        sweep_wick: float,
+        candles_1m: List[Dict],
         cfg,
-    ) -> Dict[str, float]:
+    ) -> Dict:
         """
-        Compute ATR-based scalping TP and SL percentages and prices.
-
-        Returns dict with:
-          atr_pct, tp_pct, sl_pct, rr_ratio,
-          tp_price, sl_price
-        All clamped to configured min/max bounds.
-        R:R is verified — returns rr_ratio < cfg.min_rr_ratio if rejected.
+        Compute SL and TP for an SMC trade.
+        SL = sweep_wick ± smc_sl_buffer_pts.
+        TP = nearest equal-high/low liquidity pool, minimum smc_min_rr × SL distance.
+        Returns rr_ratio=0.0 if SL > smc_max_sl_pts (trade rejected).
         """
-        atr_pct = (atr / price * 100) if price > 0 else 1.0
-
-        raw_tp = atr_pct * 2.5
-        raw_sl = atr_pct * 1.0
-
-        tp_pct = max(cfg.tp_pct_min, min(cfg.tp_pct_max, raw_tp))
-        sl_pct = max(cfg.sl_pct_min, min(cfg.sl_pct_max, raw_sl))
-
-        rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 0.0
-
-        if direction == "LONG":
-            tp_price = entry_price * (1 + tp_pct / 100)
-            sl_price = entry_price * (1 - sl_pct / 100)
+        buf = cfg.smc_sl_buffer_pts
+        if bias == "LONG":
+            sl_price = sweep_wick - buf
+            sl_pts   = entry_price - sl_price
         else:
-            tp_price = entry_price * (1 - tp_pct / 100)
-            sl_price = entry_price * (1 + sl_pct / 100)
+            sl_price = sweep_wick + buf
+            sl_pts   = sl_price - entry_price
+
+        if sl_pts > cfg.smc_max_sl_pts or sl_pts <= 0:
+            return {"sl_price": sl_price, "tp_price": 0.0,
+                    "sl_pts": sl_pts, "tp_pts": 0.0, "rr_ratio": 0.0}
+
+        tp_price = _find_liquidity_pool(candles_1m, bias, entry_price, sl_pts, cfg)
+        tp_pts   = abs(tp_price - entry_price)
+        rr_ratio = tp_pts / sl_pts if sl_pts > 0 else 0.0
+
+        if rr_ratio < cfg.smc_min_rr:
+            tp_price = (entry_price + sl_pts * cfg.smc_min_rr
+                        if bias == "LONG"
+                        else entry_price - sl_pts * cfg.smc_min_rr)
+            tp_pts   = abs(tp_price - entry_price)
+            rr_ratio = cfg.smc_min_rr
 
         return {
-            "atr_pct":  atr_pct,
-            "tp_pct":   tp_pct,
-            "sl_pct":   sl_pct,
-            "rr_ratio": rr_ratio,
-            "tp_price": tp_price,
             "sl_price": sl_price,
+            "tp_price": tp_price,
+            "sl_pts":   sl_pts,
+            "tp_pts":   tp_pts,
+            "rr_ratio": rr_ratio,
         }
-
-    @staticmethod
-    def _find_order_block(candles: List[Dict], direction: str) -> Dict:
-        """
-        Identify the most recent SMC order block in the given direction.
-
-        LONG OB : last bullish candle that is immediately followed by 2+ bearish
-                  candles (bearish displacement away from the zone).
-        SHORT OB: last bearish candle that is immediately followed by 2+ bullish
-                  candles (bullish displacement away from the zone).
-
-        Only considers closed candles (excludes candles[-1]).
-        Returns dict: {found, ob_high, ob_low}
-        """
-        closed = candles[:-1]   # exclude the forming candle
-        if len(closed) < 5:
-            return {"found": False, "ob_high": 0.0, "ob_low": 0.0}
-
-        # Search from newest to oldest (skip last 2 candles needed for displacement)
-        for i in range(len(closed) - 3, 0, -1):
-            c = closed[i]
-            if direction == "LONG":
-                if c["close"] <= c["open"]:   # must be a bullish candle
-                    continue
-                # Need 2 consecutive bearish candles after it
-                n_bear = sum(
-                    1 for j in range(i + 1, min(i + 4, len(closed)))
-                    if closed[j]["close"] < closed[j]["open"]
-                )
-                if n_bear >= 2:
-                    return {"found": True, "ob_high": c["high"], "ob_low": c["low"]}
-            else:  # SHORT
-                if c["close"] >= c["open"]:   # must be a bearish candle
-                    continue
-                n_bull = sum(
-                    1 for j in range(i + 1, min(i + 4, len(closed)))
-                    if closed[j]["close"] > closed[j]["open"]
-                )
-                if n_bull >= 2:
-                    return {"found": True, "ob_high": c["high"], "ob_low": c["low"]}
-
-        return {"found": False, "ob_high": 0.0, "ob_low": 0.0}
 
     @staticmethod
     def _estimate_fees(qty: float, price: float, taker_fee_pct: float) -> float:
@@ -340,570 +336,283 @@ class TradingEngine:
     # Main tick — called every N seconds by the scheduler
     # ------------------------------------------------------------------
 
-    async def tick(self, cfg: BotConfig, price: float, allow_entry: bool = True, entry_block_reason: str = "", flow_warmup: bool = False, htf_bias: str = "NEUTRAL") -> None:
-        ind          = self.last_indicators
-        flow_summary = self._flow.summarize()
-
-        # Build a lightweight signal dict for gate broadcast / HTF checks.
-        # Direction is derived from EMA stack in Gate 3 of _try_entry,
-        # so here we only compute a simple composite for the UI signal broadcast.
-        ema9  = ind.get("ema9")
-        ema21 = ind.get("ema21")
-        ema50 = ind.get("ema50")
-        if ema9 and ema21 and ema50:
-            if ema9 > ema21 > ema50 and price > ema21:
-                sig_dir = "LONG"
-            elif ema9 < ema21 < ema50 and price < ema21:
-                sig_dir = "SHORT"
-            else:
-                sig_dir = "NEUTRAL"
-        else:
-            sig_dir = "NEUTRAL"
-
-        signal = {
-            "direction": sig_dir,
-            "strength": 0.5,
-            "components": {"flow": flow_summary.get("score", 0.0)},
-            "composite": flow_summary.get("score", 0.0),
-            "filters_passed": True,
-            "reason": "",
-        }
-        self.last_signal = signal
-
-        self._broadcast({"type": "signal", "data": {
-            **signal,
-            "flow_warmup": flow_warmup,
-        }})
-
-        atr_val = ind.get("atr") or 0.0
-
-        if self._session is None:
-            if allow_entry:
-                entered = await self._try_early_entry(cfg, price, ind, atr_val, htf_bias=htf_bias)
-                if not entered:
-                    await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
-            else:
-                self._broadcast({"type": "entry_blocked", "reason": entry_block_reason or "Trading paused — press Start to enable entries", "gates": {}})
-        else:
-            await self._manage_position(cfg, price, signal, ind, atr_val)
-
     # ------------------------------------------------------------------
-    # Early entry — compression + breakout detection
+    # SMC strategy — static detection methods
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _detect_compression(candles: List[Dict], cfg) -> Dict:
+    def _get_15m_bias(candles_15m: List[Dict]) -> str:
         """
-        Analyse the last N closed candles for price compression (coiling).
-        Excludes the currently forming candle (candles[-1]).
+        15M bias: EMA 50 only.
+        Price above EMA50 → LONG, below → SHORT.
+        Within 0.10% of EMA50 → NEUTRAL (ambiguous, skip).
         """
-        n = cfg.compression_bars
-        window = candles[-n - 1:-1]   # last N closed candles, not the forming one
-        if len(window) < n:
-            return {"compressed": False}
+        if len(candles_15m) < 50:
+            return "NEUTRAL"
+        closes = [c["close"] for c in candles_15m]
+        ema50  = EMA(closes, 50)
+        if ema50 is None:
+            return "NEUTRAL"
+        price    = closes[-1]
+        diff_pct = abs(price - ema50) / ema50 * 100
+        if diff_pct < 0.10:
+            return "NEUTRAL"
+        return "LONG" if price > ema50 else "SHORT"
 
-        ratios = []
-        for c in window:
-            rng = c["high"] - c["low"]
-            if rng > 0:
-                ratios.append(abs(c["close"] - c["open"]) / rng)
+    @staticmethod
+    def _find_5m_zones(
+        candles_5m: List[Dict],
+        bias: str,
+        cfg,
+    ) -> List[Dict]:
+        """
+        Find Order Blocks and Fair Value Gaps on 5M in the bias direction.
+        Returns up to 3 zones, most recent first.
+        Each zone: {type, high, low, index}
+        """
+        if len(candles_5m) < 5 or bias == "NEUTRAL":
+            return []
 
-        if not ratios:
-            return {"compressed": False}
+        zones    = []
+        lookback = min(cfg.smc_ob_lookback, len(candles_5m) - 3)
 
-        avg_body_ratio = sum(ratios) / len(ratios)
-        range_high     = max(c["high"] for c in window)
-        range_low      = min(c["low"]  for c in window)
-        atr_pct        = (range_high - range_low) / range_low * 100 if range_low > 0 else 999.0
+        # Average body for displacement check
+        bodies   = [abs(candles_5m[i]["close"] - candles_5m[i]["open"])
+                    for i in range(-lookback, -1)]
+        avg_body = sum(bodies) / len(bodies) if bodies else 0.0
 
-        compressed = (
-            avg_body_ratio <= cfg.compression_body_max and
-            atr_pct        <= cfg.compression_atr_max
-        )
-        return {
-            "compressed":     compressed,
-            "avg_body_ratio": avg_body_ratio,
-            "atr_pct":        atr_pct,
-            "range_high":     range_high,
-            "range_low":      range_low,
-        }
+        # ── Order Blocks ────────────────────────────────────────────────
+        for i in range(-lookback, -2):
+            c    = candles_5m[i]
+            body = abs(c["close"] - c["open"])
+            if body == 0:
+                continue
+            next_c = candles_5m[i + 1]
+            disp   = abs(next_c["close"] - next_c["open"])
+            if avg_body > 0 and disp < avg_body * cfg.smc_ob_strength_mult:
+                continue
+            if bias == "LONG":
+                if c["close"] < c["open"] and next_c["close"] > next_c["open"]:
+                    zones.append({"type": "OB", "high": c["open"],
+                                  "low": c["low"], "index": i})
+            else:
+                if c["close"] > c["open"] and next_c["close"] < next_c["open"]:
+                    zones.append({"type": "OB", "high": c["high"],
+                                  "low": c["open"], "index": i})
 
-    async def _try_early_entry(
+        # ── Fair Value Gaps ──────────────────────────────────────────────
+        min_gap = candles_5m[-1]["close"] * (cfg.smc_fvg_min_gap_pct / 100)
+        for i in range(-lookback, -2):
+            c1 = candles_5m[i]
+            c3 = candles_5m[i + 2]
+            if bias == "LONG":
+                gap = c3["low"] - c1["high"]
+                if gap >= min_gap:
+                    zones.append({"type": "FVG", "high": c3["low"],
+                                  "low": c1["high"], "index": i})
+            else:
+                gap = c1["low"] - c3["high"]
+                if gap >= min_gap:
+                    zones.append({"type": "FVG", "high": c1["low"],
+                                  "low": c3["high"], "index": i})
+
+        # Most recent first (highest negative index = closest to -1)
+        zones.sort(key=lambda z: z["index"], reverse=True)
+        return zones[:3]
+
+    @staticmethod
+    def _check_1m_trigger(
+        candles_1m: List[Dict],
+        zone: Dict,
+        bias: str,
+    ) -> Dict:
+        """
+        Check the last CLOSED 1M candle (candles_1m[-2]) for:
+          1. Liquidity sweep (wick penetrated zone boundary)
+          2. Rejection close (closed back inside/through zone)
+          3. Candle strength (close position in top/bottom 40% of range)
+        Returns {triggered, sweep_wick, reason}.
+        """
+        if len(candles_1m) < 3:
+            return {"triggered": False, "sweep_wick": 0.0,
+                    "reason": "not enough 1M candles"}
+        c    = candles_1m[-2]
+        rng  = c["high"] - c["low"]
+        if rng <= 0:
+            return {"triggered": False, "sweep_wick": 0.0,
+                    "reason": "zero-range candle"}
+
+        zh = zone["high"]
+        zl = zone["low"]
+
+        if bias == "LONG":
+            if c["low"] >= zl:
+                return {"triggered": False, "sweep_wick": c["low"],
+                        "reason": f"no sweep — low {c['low']:.6g} >= zone_low {zl:.6g}"}
+            if c["close"] <= zl:
+                return {"triggered": False, "sweep_wick": c["low"],
+                        "reason": f"no rejection — close {c['close']:.6g} <= zone_low {zl:.6g}"}
+            close_pos = (c["close"] - c["low"]) / rng
+            if close_pos < 0.60:
+                return {"triggered": False, "sweep_wick": c["low"],
+                        "reason": f"weak candle — close at {close_pos:.0%} of range (need top 40%)"}
+            return {"triggered": True, "sweep_wick": c["low"],
+                    "reason": "LONG trigger confirmed"}
+        else:
+            if c["high"] <= zh:
+                return {"triggered": False, "sweep_wick": c["high"],
+                        "reason": f"no sweep — high {c['high']:.6g} <= zone_high {zh:.6g}"}
+            if c["close"] >= zh:
+                return {"triggered": False, "sweep_wick": c["high"],
+                        "reason": f"no rejection — close {c['close']:.6g} >= zone_high {zh:.6g}"}
+            close_pos = (c["close"] - c["low"]) / rng
+            if close_pos > 0.40:
+                return {"triggered": False, "sweep_wick": c["high"],
+                        "reason": f"weak candle — close at {close_pos:.0%} of range (need bottom 40%)"}
+            return {"triggered": True, "sweep_wick": c["high"],
+                    "reason": "SHORT trigger confirmed"}
+
+    # ------------------------------------------------------------------
+    # Main tick
+    # ------------------------------------------------------------------
+
+    async def tick(
         self,
         cfg: BotConfig,
         price: float,
-        ind: Dict,
-        atr_val: float,
-        htf_bias: str = "NEUTRAL",
-    ) -> bool:
-        """
-        Pre-breakout early entry on the forming candle.
-        Returns True if an entry was placed, False otherwise (never raises).
-        """
-        try:
-            if not cfg.early_entry_enabled:
-                return False
-            if self._session is not None or self._closing:
-                return False
-            if len(self.candles) < 60 or atr_val <= 0:
-                return False
-            if time.time() - self._last_exit_time < cfg.entry_cooldown_s:
-                return False
+        candles_5m: List[Dict],
+        candles_15m: List[Dict],
+        allow_entry: bool = True,
+        htf_bias: str = "NEUTRAL",   # kept for UI display compat
+    ) -> None:
+        """Main tick — SMC 3-timeframe: 15M bias | 5M zone | 1M trigger."""
+        bias_15m = self._get_15m_bias(candles_15m)
+        zones_5m = (self._find_5m_zones(candles_5m, bias_15m, cfg)
+                    if bias_15m != "NEUTRAL" else [])
 
-            # ── Phase 1 — Compression on closed candles ───────────────────
-            comp = self._detect_compression(self.candles, cfg)
-            if not comp["compressed"]:
-                return False
+        self.last_signal = {
+            "direction":      bias_15m,
+            "strength":       0.5,
+            "composite":      0.0,
+            "filters_passed": len(zones_5m) > 0,
+            "reason":         f"15M {bias_15m} | {len(zones_5m)} zone(s) on 5M",
+        }
+        self._broadcast({"type": "signal", "data": self.last_signal})
 
-            # ── Phase 2 — Forming candle breakout check ───────────────────
-            forming    = self.candles[-1]
-            f_open     = forming["open"]
-            f_close    = forming["close"]
-            f_high     = forming["high"]
-            f_low      = forming["low"]
-            f_volume   = forming["volume"]
-            full_range = f_high - f_low
-            if full_range <= 0:
-                return False
-
-            body       = abs(f_close - f_open)
-            body_ratio = body / full_range
-
-            if f_close > f_open:
-                direction = "LONG"
-            elif f_close < f_open:
-                direction = "SHORT"
+        if self._session is None:
+            if allow_entry:
+                await self._try_entry(cfg, price, bias_15m, zones_5m,
+                                      candles_5m, candles_15m)
             else:
-                return False
-
-            if body_ratio < cfg.breakout_body_min:
-                return False
-
-            # Price must have broken out of the compression range
-            if direction == "LONG"  and f_high <= comp["range_high"]:
-                return False
-            if direction == "SHORT" and f_low  >= comp["range_low"]:
-                return False
-
-            # ── HTF filter ────────────────────────────────────────────────
-            if cfg.htf_filter and htf_bias not in ("NEUTRAL", direction):
-                return False
-
-            # ── Phase 3 — Volume pace ─────────────────────────────────────
-            if len(self.candles) >= 2:
-                tf_secs = max(60, self.candles[-1]["time"] - self.candles[-2]["time"])
-                # Handle millisecond timestamps
-                if self.candles[-1]["time"] > 1e10:
-                    tf_secs = max(60, (self.candles[-1]["time"] - self.candles[-2]["time"]) // 1000)
-            else:
-                tf_secs = 60
-
-            candle_open_ts = self.candles[-1]["time"]
-            if candle_open_ts > 1e10:
-                candle_open_ts = candle_open_ts / 1000
-            elapsed_secs = max(1, time.time() - candle_open_ts)
-            elapsed_pct  = max(0.05, min(elapsed_secs / tf_secs, 1.0))
-
-            projected_volume = f_volume / elapsed_pct
-            vol_window = [c["volume"] for c in self.candles[-22:-2]]
-            if len(vol_window) < 5:
-                return False
-            vol_avg  = sum(vol_window) / len(vol_window)
-            vol_pace = projected_volume / vol_avg if vol_avg > 0 else 0.0
-
-            if vol_pace < cfg.breakout_vol_pace_min:
-                return False
-
-            # ── Phase 4 — Order flow ──────────────────────────────────────
-            flow_data  = self._flow.summarize()
-            flow_score = flow_data.get("score", 0.0)
-            flow_count = flow_data.get("trade_count", 0)
-            if flow_count < 10:
-                return False
-            if direction == "LONG"  and flow_score < cfg.breakout_flow_min:
-                return False
-            if direction == "SHORT" and flow_score > -cfg.breakout_flow_min:
-                return False
-
-            # ── Phase 5 — EMA stack ───────────────────────────────────────
-            closes = [c["close"] for c in self.candles]
-            ema9   = EMA(closes, 9)
-            ema21  = EMA(closes, 21)
-            ema50  = EMA(closes, 50)
-            if None in (ema9, ema21, ema50):
-                return False
-            if direction == "LONG"  and not (ema9 > ema21 > ema50):
-                return False
-            if direction == "SHORT" and not (ema9 < ema21 < ema50):
-                return False
-
-            # ── Phase 6 — RSI zone ────────────────────────────────────────
-            rsi_val = RSI(closes, 14)
-            if rsi_val is None:
-                return False
-            if direction == "LONG"  and not (35 <= rsi_val <= 75):
-                return False
-            if direction == "SHORT" and not (25 <= rsi_val <= 65):
-                return False
-
-            # ── Phase 7 — R:R ─────────────────────────────────────────────
-            levels   = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
-            rr_ratio = levels["rr_ratio"]
-            if rr_ratio < cfg.min_rr_ratio:
-                return False
-
-            # ── Daily loss check (async) ───────────────────────────────────
-            if cfg.max_daily_loss_usdt > 0:
-                today_pnl = await get_today_pnl()
-                if today_pnl < -cfg.max_daily_loss_usdt:
-                    return False
-
-            # ── All phases passed — place entry ───────────────────────────
-            effective_leverage  = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
-            fee_factor          = 1.0 + (cfg.taker_fee_pct / 100)
-            fee_adjusted_margin = cfg.margin_usdt / fee_factor
-            qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
-            if qty <= 0:
-                return False
-
-            # Opposite entry: gates evaluated in signal direction; order flipped
-            entry_direction = direction
-            if cfg.opposite_entry:
-                entry_direction = "SHORT" if direction == "LONG" else "LONG"
-
-            side  = "BUY" if entry_direction == "LONG" else "SELL"
-            order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
-            fill_price = float(order.get("avgPrice") or price)
-
-            order_id = int(order.get("orderId", 0))
-            if order_id:
-                self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
-
-            levels = self._compute_scalp_levels(atr_val, fill_price, entry_direction, fill_price, cfg)
-
-            await create_session(
-                symbol=cfg.symbol,
-                direction=entry_direction,
-                entry_price=fill_price,
-                qty=qty,
-                margin=cfg.margin_usdt,
-                leverage=effective_leverage,
-                entry_reason=(
-                    f"early_scalp|{entry_direction}|comp={comp['avg_body_ratio']:.2f}"
-                    + ("|opposite" if cfg.opposite_entry else "")
-                ),
-                signal_strength=0.8,
-                signal_price=price,
-            )
-            self._session         = await get_open_session()
-            self._trail_activated = False
-            self._trail_price     = None
-
-            self._scalp_tp_price    = levels["tp_price"]
-            self._scalp_sl_price    = levels["sl_price"]
-            self._scalp_tp_pct      = levels["tp_pct"]
-            self._scalp_sl_pct      = levels["sl_pct"]
-            self._scalp_atr_pct     = levels["atr_pct"]
-            self._entry_candle_time = self.candles[-1]["time"]
-
-            await update_session(
-                self._session["id"],
-                scalp_tp_price=self._scalp_tp_price,
-                scalp_sl_price=self._scalp_sl_price,
-                scalp_tp_pct=self._scalp_tp_pct,
-                scalp_sl_pct=self._scalp_sl_pct,
-                scalp_atr_pct=self._scalp_atr_pct,
-                scalp_entry_candle_time=self._entry_candle_time,
-            )
-
-            msg = (
-                f"{_mode_prefix(cfg.trading_mode)}"
-                f"⚡ EARLY ENTRY {entry_direction} @ {fill_price:.4f}  "
-                + (f"[signal={direction}→FLIPPED]  " if cfg.opposite_entry else "")
-                + f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
-                f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
-                f"R:R={rr_ratio:.2f}  vol_pace={vol_pace:.1f}×  flow={flow_score:+.2f}"
-            )
-            logger.info("TradingEngine: %s", msg)
-            self._broadcast({
-                "type": "entry_blocked",
-                "reason": "Early entry fired",
-                "gates": {
-                    "COMPRESSION": (True, f"body {comp['avg_body_ratio']:.0%} atr {comp['atr_pct']:.2f}%"),
-                },
-            })
-            self._broadcast({"type": "notification", "text": msg})
-            self._pos_log(
-                "open", direction=entry_direction, price=fill_price, qty=qty,
-                symbol=cfg.symbol, mode=cfg.trading_mode,
-                tp=self._scalp_tp_price, sl=self._scalp_sl_price,
-                rr=rr_ratio, entry_type="early",
-            )
-            self._push_session()
-
-            await notify(cfg.discord_webhook, "TRADE_OPEN", {
-                "symbol":       cfg.symbol,
-                "direction":    entry_direction,
-                "price":        fill_price,
-                "margin":       cfg.margin_usdt,
-                "tp_price":     self._scalp_tp_price,
-                "sl_price":     self._scalp_sl_price,
-                "rr_ratio":     rr_ratio,
-                "trading_mode": cfg.trading_mode,
-                "entry_type":   "early_breakout",
-            })
-            return True
-
-        except Exception:
-            logger.exception("TradingEngine: _try_early_entry failed — skipping")
-            return False
+                self._broadcast({
+                    "type":   "entry_blocked",
+                    "reason": "Trading paused — press Start to enable entries",
+                    "gates":  {},
+                })
+        else:
+            await self._manage_position(cfg, price)
 
     # ------------------------------------------------------------------
-    # Entry
+    # SMC entry
     # ------------------------------------------------------------------
 
     async def _try_entry(
         self,
         cfg: BotConfig,
         price: float,
-        signal: Dict,
-        ind: Dict,
-        atr_val: float,
-        flow_warmup: bool = False,
-        htf_bias: str = "NEUTRAL",
+        bias_15m: str,
+        zones_5m: List[Dict],
+        candles_5m: List[Dict],
+        candles_15m: List[Dict],
     ) -> None:
         """
-        7-gate scalping entry. All gates are evaluated and broadcast every call
-        so the UI always shows current pass/fail status.
-        Entry is ONLY on a closed candle — never mid-candle.
+        SMC 3-timeframe entry.
+        Gate 1: 15M bias (EMA50)
+        Gate 2: 5M zone (OB or FVG) exists in bias direction
+        Gate 3: 1M trigger (sweep + rejection + strength) on last closed candle
+        Gate 4: SL within max_sl_pts and R:R >= smc_min_rr
         """
-        def _waiting(reason: str) -> None:
-            self._broadcast({"type": "entry_blocked", "reason": reason, "gates": {}})
+        def _block(reason: str, gates: dict = {}) -> None:
+            self._broadcast({"type": "entry_blocked", "reason": reason,
+                             "gates": gates})
 
-        # ── Pre-filters (broadcast reason, gates stay —) ──────────────────
-        n = len(self.candles)
-        if n < 60:
-            _waiting(f"Warming up: {n}/60 candles loaded")
-            return
-        if atr_val <= 0:
-            _waiting("Waiting for ATR to initialise")
-            return
+        candles_1m = self.candles
 
-        direction = signal.get("direction", "NEUTRAL")
-        if direction == "NEUTRAL":
-            _waiting("No directional signal (EMA stack flat)")
+        if len(candles_1m) < 10:
+            _block(f"Warming up: {len(candles_1m)}/10 candles")
+            return
+        cooldown_left = cfg.entry_cooldown_s - (time.time() - self._last_exit_time)
+        if cooldown_left > 0:
+            _block(f"Cooldown: {cooldown_left:.0f}s remaining")
             return
 
-        c = self.candles[-2]   # last CLOSED candle
-        high_  = c["high"];  low_ = c["low"]
-        open_  = c["open"];  close_ = c["close"]
-        full_range = high_ - low_
-        if full_range <= 0:
-            _waiting("Zero-range candle — skipping")
-            return
-
-        body       = abs(close_ - open_)
-        upper_wick = high_ - max(open_, close_)
-        lower_wick = min(open_, close_) - low_
-        vol_last   = c["volume"]
-        closes     = [c2["close"] for c2 in self.candles]
-
-        # Order block detection (used for Gate 8 + optional SL tightening)
-        ob = self._find_order_block(self.candles, direction)
-
-        # ── Pre-filter reasons (block entry but don't alter gate display) ─
-        pre_block_reason = ""
-        elapsed_since_exit = time.time() - self._last_exit_time
-        if elapsed_since_exit < cfg.entry_cooldown_s:
-            remaining = cfg.entry_cooldown_s - elapsed_since_exit
-            pre_block_reason = f"Cooldown: {remaining:.0f}s remaining"
-        elif cfg.htf_filter and htf_bias not in ("NEUTRAL", direction):
-            pre_block_reason = f"HTF filter: bias {htf_bias} ≠ signal {direction}"
-        elif cfg.max_daily_loss_usdt > 0:
-            pass  # checked async below
-
-        # ── Evaluate all 7 gates unconditionally ─────────────────────────
+        # ── Gate 1: 15M Bias ─────────────────────────────────────────────
         gates: Dict[str, tuple] = {}
-
-        # Gate 1 — Candle structure
-        body_ratio = body / full_range
-        if body_ratio < cfg.min_body_ratio:
-            gates["CANDLE STRUCTURE"] = (False, f"body {body_ratio:.0%} < {cfg.min_body_ratio:.0%}")
-        elif direction == "LONG" and close_ <= open_:
-            gates["CANDLE STRUCTURE"] = (False, "bearish candle for LONG")
-        elif direction == "LONG" and upper_wick / full_range > 0.35:
-            gates["CANDLE STRUCTURE"] = (False, f"upper wick {upper_wick/full_range:.0%} > 35%")
-        elif direction == "SHORT" and close_ >= open_:
-            gates["CANDLE STRUCTURE"] = (False, "bullish candle for SHORT")
-        elif direction == "SHORT" and lower_wick / full_range > 0.35:
-            gates["CANDLE STRUCTURE"] = (False, f"lower wick {lower_wick/full_range:.0%} > 35%")
+        if bias_15m == "NEUTRAL":
+            gates["15M BIAS"] = (False, "price too close to EMA50 — wait")
         else:
-            gates["CANDLE STRUCTURE"] = (True, f"body {body_ratio:.0%}")
+            if len(candles_15m) >= 50:
+                e50 = EMA([c["close"] for c in candles_15m], 50)
+                gates["15M BIAS"] = (True, f"{bias_15m} | EMA50={e50:.6g}")
+            else:
+                gates["15M BIAS"] = (True, bias_15m)
 
-        # Confluence override: if Gate 1 failed due to candle direction/wick,
-        # allow entry when EMA stack + strong flow + HTF all agree.
-        if not gates["CANDLE STRUCTURE"][0]:
-            _g1_ema9  = ind.get("ema9")
-            _g1_ema21 = ind.get("ema21")
-            _g1_ema50 = ind.get("ema50")
-            _g1_flow  = self._flow.summarize().get("score", 0.0)
-            _g1_ema_ok = (
-                _g1_ema9 and _g1_ema21 and _g1_ema50 and (
-                    (direction == "LONG"  and _g1_ema9 > _g1_ema21 > _g1_ema50) or
-                    (direction == "SHORT" and _g1_ema9 < _g1_ema21 < _g1_ema50)
-                )
+        # ── Gate 2: 5M Zone ───────────────────────────────────────────────
+        if not zones_5m:
+            gates["5M ZONE"] = (False,
+                                f"no OB/FVG found in {bias_15m} direction")
+        else:
+            z = zones_5m[0]
+            gates["5M ZONE"] = (True,
+                                f"{z['type']} {z['low']:.6g}–{z['high']:.6g}")
+
+        # ── Gate 3: 1M Trigger ────────────────────────────────────────────
+        trigger     = {"triggered": False, "sweep_wick": 0.0,
+                       "reason": "no zone to check"}
+        active_zone = None
+        if zones_5m:
+            for zone in zones_5m:
+                t = self._check_1m_trigger(candles_1m, zone, bias_15m)
+                trigger = t
+                if t["triggered"]:
+                    active_zone = zone
+                    break
+        gates["1M TRIGGER"] = (trigger["triggered"], trigger["reason"])
+
+        # ── Gate 4: SL size and R:R ───────────────────────────────────────
+        levels = None
+        if trigger["triggered"] and active_zone:
+            levels = self._compute_smc_levels(
+                bias_15m, price, trigger["sweep_wick"], candles_1m, cfg
             )
-            _g1_flow_ok = (
-                (direction == "LONG"  and _g1_flow >= 0.30) or
-                (direction == "SHORT" and _g1_flow <= -0.30)
-            )
-            _g1_htf_ok = htf_bias in ("NEUTRAL", direction)
-            if _g1_ema_ok and _g1_flow_ok and _g1_htf_ok:
-                gates["CANDLE STRUCTURE"] = (
-                    True,
-                    f"confluence override — body {body_ratio:.0%} (flow {_g1_flow:+.2f})",
-                )
-
-        # Gate 2 — Volume
-        vol_window = [c2["volume"] for c2 in self.candles[-22:-2]]
-        if len(vol_window) >= 10:
-            vol_avg   = sum(vol_window) / len(vol_window)
-            vol_ratio = vol_last / vol_avg if vol_avg > 0 else 0.0
-            if vol_ratio < cfg.min_vol_ratio:
-                gates["VOLUME"] = (False, f"{vol_ratio:.2f}× < {cfg.min_vol_ratio:.2f}×")
+            sl_pts   = levels["sl_pts"]
+            rr_ratio = levels["rr_ratio"]
+            if rr_ratio <= 0 or sl_pts > cfg.smc_max_sl_pts:
+                gates["SL / R:R"] = (False,
+                    f"SL {sl_pts:.1f}pts > max {cfg.smc_max_sl_pts:.0f}pts")
+            elif rr_ratio < cfg.smc_min_rr:
+                gates["SL / R:R"] = (False,
+                    f"R:R {rr_ratio:.2f} < {cfg.smc_min_rr:.1f} minimum")
             else:
-                gates["VOLUME"] = (True, f"{vol_ratio:.1f}×")
+                gates["SL / R:R"] = (True,
+                    f"SL={sl_pts:.1f}pts  R:R={rr_ratio:.2f}:1")
         else:
-            gates["VOLUME"] = (False, "not enough history")
+            gates["SL / R:R"] = (False, "waiting for trigger")
 
-        # Gate 3 — EMA stack
-        ema9  = EMA(closes, 9)
-        ema21 = EMA(closes, 21)
-        ema50 = EMA(closes, 50)
-        if ema9 is None or ema21 is None or ema50 is None:
-            gates["EMA STACK"] = (False, "indicator not ready")
-        elif direction == "LONG":
-            if ema9 > ema21 > ema50 and price > ema21:
-                gates["EMA STACK"] = (True, f"e9={ema9:g}")
-            else:
-                gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
-        else:
-            if ema9 < ema21 < ema50 and price < ema21:
-                gates["EMA STACK"] = (True, f"e9={ema9:g}")
-            else:
-                gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
-
-        # RSI computed here so confluence check in Gate 4 can reference it
-        rsi_val = RSI(closes, 14)
-
-        # Gate 4 — Order flow (confluence-scaled threshold)
-        flow_data  = self._flow.summarize()
-        flow_score = flow_data.get("score", 0.0)
-        flow_count = flow_data.get("trade_count", 0)
-
-        # Count how many strong-confluence signals are present.
-        # More confluence → lower flow bar (catch moves at the start, not late).
-        _confluence_count = 0
-        if gates.get("CANDLE STRUCTURE", (False,))[0]:
-            _confluence_count += 1
-        if gates.get("EMA STACK", (False,))[0]:
-            _confluence_count += 1
-        if htf_bias == direction:
-            _confluence_count += 1
-        _rsi_ideal = (
-            (direction == "LONG"  and rsi_val is not None and 45 <= rsi_val <= 65) or
-            (direction == "SHORT" and rsi_val is not None and 35 <= rsi_val <= 55)
+        # ── Broadcast gate status ─────────────────────────────────────────
+        all_passed   = all(v[0] for v in gates.values())
+        failed_gate  = next((k for k, v in gates.items() if not v[0]), None)
+        broadcast_reason = (
+            f"All gates passed — entering {bias_15m}"
+            if all_passed
+            else f"Entry blocked: {failed_gate} — {gates[failed_gate][1]}"
         )
-        if _rsi_ideal:
-            _confluence_count += 1
-        # Linear scale: 0 confluence → cfg.min_flow_score; 4/4 → 0.05; floor 0.08
-        _effective_flow_threshold = max(
-            0.08,
-            cfg.min_flow_score - (cfg.min_flow_score - 0.05) * (_confluence_count / 4),
-        )
-
-        if flow_count < 10:
-            gates["ORDER FLOW"] = (False, f"only {flow_count} trades (need 10)")
-        elif direction == "LONG" and flow_score < _effective_flow_threshold:
-            gates["ORDER FLOW"] = (
-                False,
-                f"score {flow_score:+.2f} < +{_effective_flow_threshold:.2f}"
-                + (f" (reduced from {cfg.min_flow_score:.2f})" if _confluence_count >= 3 else ""),
-            )
-        elif direction == "SHORT" and flow_score > -_effective_flow_threshold:
-            gates["ORDER FLOW"] = (
-                False,
-                f"score {flow_score:+.2f} > -{_effective_flow_threshold:.2f}"
-                + (f" (reduced from {cfg.min_flow_score:.2f})" if _confluence_count >= 3 else ""),
-            )
-        else:
-            gates["ORDER FLOW"] = (
-                True,
-                f"{flow_score:+.2f}"
-                + (f" (thr {_effective_flow_threshold:.2f})" if _confluence_count >= 3 else ""),
-            )
-
-        # Gate 5 — RSI zone
-        if rsi_val is None:
-            gates["RSI ZONE"] = (False, "indicator not ready")
-        elif direction == "LONG" and not (35 <= rsi_val <= 75):
-            gates["RSI ZONE"] = (False, f"RSI {rsi_val:.1f} outside 35–75")
-        elif direction == "SHORT" and not (25 <= rsi_val <= 65):
-            gates["RSI ZONE"] = (False, f"RSI {rsi_val:.1f} outside 25–65")
-        else:
-            gates["RSI ZONE"] = (True, f"{rsi_val:.1f}")
-
-        # Gate 6 — ATR range
-        atr_pct = (atr_val / price * 100) if price > 0 else 0.0
-        if atr_pct < 0.15:
-            gates["ATR RANGE"] = (False, f"{atr_pct:.3f}% < 0.15%")
-        elif atr_pct > 3.0:
-            gates["ATR RANGE"] = (False, f"{atr_pct:.3f}% > 3.0%")
-        else:
-            gates["ATR RANGE"] = (True, f"{atr_pct:.2f}%")
-
-        # Gate 7 — R:R ratio
-        levels   = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
-        rr_ratio = levels["rr_ratio"]
-        if rr_ratio < cfg.min_rr_ratio:
-            gates["R:R RATIO"] = (False, f"{rr_ratio:.2f} < {cfg.min_rr_ratio:.2f}")
-        else:
-            gates["R:R RATIO"] = (True, f"{rr_ratio:.2f}:1")
-
-        # Gate 8 — Order Block (informational, never blocks entry)
-        in_ob_zone = ob["found"] and ob["ob_low"] <= price <= ob["ob_high"]
-        if in_ob_zone:
-            gates["ORDER BLOCK"] = (True, f"in OB {ob['ob_low']:g}–{ob['ob_high']:g}")
-        elif ob["found"]:
-            gates["ORDER BLOCK"] = (True, f"OB nearby {ob['ob_low']:g}–{ob['ob_high']:g}")
-        else:
-            gates["ORDER BLOCK"] = (True, "no OB detected")
-
-        # ── Broadcast full gate status ────────────────────────────────────
-        all_passed = all(v[0] for v in gates.values())
-        failed_gate = next((k for k, v in gates.items() if not v[0]), None)
-
-        if pre_block_reason:
-            broadcast_reason = pre_block_reason
-            all_passed = False
-        elif failed_gate:
-            broadcast_reason = f"Entry blocked: {failed_gate} — {gates[failed_gate][1]}"
-        else:
-            broadcast_reason = f"All gates passed — entering {direction}"
-
-        self._broadcast({
-            "type":   "entry_blocked",
-            "reason": broadcast_reason,
-            "gates":  gates,
-        })
-
+        self._broadcast({"type": "entry_blocked", "reason": broadcast_reason,
+                         "gates": gates})
         if not all_passed:
-            if failed_gate == "R:R RATIO":
-                await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
-                                 signal.get("components", {}), "skip")
             return
 
-        # ── Daily loss async check (only when all 7 gates pass) ───────────
+        # ── Daily loss check ──────────────────────────────────────────────
         if cfg.max_daily_loss_usdt > 0:
             today_pnl = await get_today_pnl()
             if today_pnl < -cfg.max_daily_loss_usdt:
@@ -914,118 +623,97 @@ class TradingEngine:
                 })
                 return
 
-        # ── All gates passed — place order ────────────────────────────────
-        effective_leverage = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
-
-        # Fixed margin sizing — no strength scaling
-        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
+        # ── Place order ───────────────────────────────────────────────────
+        effective_leverage  = (self._effective_leverage
+                               if self._effective_leverage > 0 else cfg.leverage)
+        fee_factor          = 1.0 + (cfg.taker_fee_pct / 100)
         fee_adjusted_margin = cfg.margin_usdt / fee_factor
-        qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
+        qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin,
+                                      effective_leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
-        # Opposite entry: gates evaluated in signal direction; order flipped
-        entry_direction = direction
+        entry_direction = bias_15m
         if cfg.opposite_entry:
-            entry_direction = "SHORT" if direction == "LONG" else "LONG"
+            entry_direction = "SHORT" if bias_15m == "LONG" else "LONG"
 
-        side = "BUY" if entry_direction == "LONG" else "SELL"
-        order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
+        side  = "BUY" if entry_direction == "LONG" else "SELL"
+        order = await self._executor.place_market_order(
+            cfg.symbol, side, qty, current_price=price
+        )
         fill_price = float(order.get("avgPrice") or price)
-
-        order_id = int(order.get("orderId", 0))
+        order_id   = int(order.get("orderId", 0))
         if order_id:
-            self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
+            self._pending_fills[order_id] = {
+                "type": "entry", "prior_qty": 0.0, "prior_avg": 0.0
+            }
 
-        # Recompute scalp levels from fill_price using actual trade direction
-        levels = self._compute_scalp_levels(atr_val, fill_price, entry_direction, fill_price, cfg)
-
-        # OB zone — tighten SL to just inside OB boundary (only if tighter than ATR SL)
-        in_ob_zone = ob["found"] and ob["ob_low"] <= fill_price <= ob["ob_high"]
-        if in_ob_zone:
-            _buf = 0.0005   # 0.05% buffer
-            if entry_direction == "LONG":
-                ob_sl = ob["ob_low"] * (1 - _buf)
-                if ob_sl > levels["sl_price"]:
-                    levels["sl_price"] = ob_sl
-                    logger.info("TradingEngine: OB zone SL tightened to %.6f (OB low=%.6f)",
-                                ob_sl, ob["ob_low"])
-            else:
-                ob_sl = ob["ob_high"] * (1 + _buf)
-                if ob_sl < levels["sl_price"]:
-                    levels["sl_price"] = ob_sl
-                    logger.info("TradingEngine: OB zone SL tightened to %.6f (OB high=%.6f)",
-                                ob_sl, ob["ob_high"])
+        # Recompute levels from fill price using actual entry direction
+        levels = self._compute_smc_levels(
+            entry_direction, fill_price, trigger["sweep_wick"], candles_1m, cfg
+        )
 
         await create_session(
-            symbol=cfg.symbol,
-            direction=entry_direction,
-            entry_price=fill_price,
-            qty=qty,
-            margin=cfg.margin_usdt,
+            symbol=cfg.symbol, direction=entry_direction,
+            entry_price=fill_price, qty=qty, margin=cfg.margin_usdt,
             leverage=effective_leverage,
             entry_reason=(
-                f"scalp|{entry_direction}"
+                f"smc|{entry_direction}|{active_zone['type']}"
                 + ("|opposite" if cfg.opposite_entry else "")
             ),
-            signal_strength=signal.get("strength", 0.0),
-            signal_price=price,
+            signal_strength=0.8, signal_price=price,
         )
-        self._session = await get_open_session()
+        self._session         = await get_open_session()
         self._trail_activated = False
         self._trail_price     = None
+        self._breakeven_armed = False
 
-        # Lock scalp levels
         self._scalp_tp_price    = levels["tp_price"]
         self._scalp_sl_price    = levels["sl_price"]
-        self._scalp_tp_pct      = levels["tp_pct"]
-        self._scalp_sl_pct      = levels["sl_pct"]
-        self._scalp_atr_pct     = levels["atr_pct"]
-
-        # Track candle time for time-based exit
+        self._scalp_tp_pct      = (abs(levels["tp_price"] - fill_price)
+                                   / fill_price * 100 if fill_price else 0.0)
+        self._scalp_sl_pct      = (abs(levels["sl_price"] - fill_price)
+                                   / fill_price * 100 if fill_price else 0.0)
+        self._scalp_atr_pct     = 0.0
         self._entry_candle_time = self.candles[-1]["time"] if self.candles else 0
 
-        # Persist locked levels to DB for restart recovery
         await update_session(
             self._session["id"],
             scalp_tp_price=self._scalp_tp_price,
             scalp_sl_price=self._scalp_sl_price,
             scalp_tp_pct=self._scalp_tp_pct,
             scalp_sl_pct=self._scalp_sl_pct,
-            scalp_atr_pct=self._scalp_atr_pct,
+            scalp_atr_pct=0.0,
             scalp_entry_candle_time=self._entry_candle_time,
+            smc_zone_type=active_zone["type"],
+            smc_zone_high=active_zone["high"],
+            smc_zone_low=active_zone["low"],
+            smc_sweep_low=trigger["sweep_wick"],
         )
 
-        await log_signal(cfg.symbol, direction, signal.get("strength", 0.0),
-                         signal.get("components", {}), "entry")
-
+        rr = levels["rr_ratio"]
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
-            f"SCALP {entry_direction} @ {fill_price:.4f}  "
-            + (f"[signal={direction}→FLIPPED]  " if cfg.opposite_entry else "")
-            + f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
-            f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
-            f"R:R={rr_ratio:.2f}  ATR={atr_pct:.2f}%"
+            f"SMC {entry_direction} @ {fill_price:.6g}  "
+            + (f"[signal={bias_15m}→FLIPPED]  " if cfg.opposite_entry else "")
+            + f"TP={self._scalp_tp_price:.6g} (+{self._scalp_tp_pct:.2f}%)  "
+            f"SL={self._scalp_sl_price:.6g} (-{self._scalp_sl_pct:.2f}%)  "
+            f"R:R={rr:.2f}  Zone={active_zone['type']}"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("open", direction=entry_direction, price=fill_price, qty=qty,
-                      symbol=cfg.symbol, mode=cfg.trading_mode,
-                      tp=self._scalp_tp_price, sl=self._scalp_sl_price, rr=rr_ratio)
+        self._pos_log("open", direction=entry_direction, price=fill_price,
+                      qty=qty, symbol=cfg.symbol, mode=cfg.trading_mode,
+                      tp=self._scalp_tp_price, sl=self._scalp_sl_price, rr=rr)
         self._push_session()
-
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
-            "symbol":    cfg.symbol,
-            "direction": entry_direction,
-            "price":     fill_price,
-            "margin":    cfg.margin_usdt,
-            "tp_price":  self._scalp_tp_price,
-            "sl_price":  self._scalp_sl_price,
-            "rr_ratio":  rr_ratio,
-            "trading_mode": cfg.trading_mode,
+            "symbol": cfg.symbol, "direction": entry_direction,
+            "price": fill_price, "margin": cfg.margin_usdt,
+            "tp_price": self._scalp_tp_price, "sl_price": self._scalp_sl_price,
+            "rr_ratio": rr, "trading_mode": cfg.trading_mode,
+            "zone_type": active_zone["type"],
         })
-
     # ------------------------------------------------------------------
     # Position management — 3 exits: TP / SL / time
     # ------------------------------------------------------------------
@@ -1034,9 +722,6 @@ class TradingEngine:
         self,
         cfg: BotConfig,
         price: float,
-        signal: Dict,
-        ind: Dict,
-        atr_val: float,
     ) -> None:
         sess      = self._session
         direction = sess["direction"]
@@ -1051,19 +736,10 @@ class TradingEngine:
 
         # ── Recover locked levels on restart if missing ───────────────────
         if self._scalp_tp_price is None or self._scalp_sl_price is None:
-            if atr_val > 0:
-                levels = self._compute_scalp_levels(atr_val, avg_price, direction, avg_price, cfg)
-                self._scalp_tp_price = levels["tp_price"]
-                self._scalp_sl_price = levels["sl_price"]
-                self._scalp_tp_pct   = levels["tp_pct"]
-                self._scalp_sl_pct   = levels["sl_pct"]
-                self._scalp_atr_pct  = levels["atr_pct"]
-                logger.warning(
-                    "TradingEngine: scalp levels missing — re-derived from ATR "
-                    "tp=%.4f sl=%.4f", self._scalp_tp_price, self._scalp_sl_price,
-                )
-            else:
-                return  # ATR not ready yet
+            logger.warning(
+                "TradingEngine: scalp levels missing — cannot manage position, waiting for levels"
+            )
+            return
 
         # ── Manual UI override SL ─────────────────────────────────────────
         if self._override_sl_price is not None:

@@ -114,6 +114,12 @@ _last_external_fill_price: float = 0.0   # fill price captured from ORDER_TRADE_
 _POSITION_CHECK_S = 60.0              # check Binance position every N seconds
 _CANDLE_REFRESH_S = 300.0  # REST candle integrity sync every 5 min
                             # Real-time updates come from WS kline stream
+_candles_5m:  list = []    # 5M candles for SMC zone detection
+_candles_15m: list = []    # 15M candles for SMC bias
+_last_5m_fetch:  float = 0.0
+_last_15m_fetch: float = 0.0
+_5M_REFRESH_S  = 60.0   # re-sync 5M candles every 60s
+_15M_REFRESH_S = 300.0  # re-sync 15M candles every 5 min
 _PRICE_REST_FALLBACK_S = 10.0  # only poll REST price if WS hasn't delivered in N seconds
 _CLIENT_WARN_INTERVAL = 60.0  # re-broadcast "client unavailable" at most once per minute
 
@@ -230,6 +236,7 @@ async def _sync_position_rest(cfg) -> None:
 
 async def _ticker_loop() -> None:
     global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch, _tv_batch_timer, _cfg_tick_cache
+    global _candles_5m, _candles_15m, _last_5m_fetch, _last_15m_fetch
     cfg = await load_config()
 
     _cfg_tick_ts: float = 0.0
@@ -286,6 +293,32 @@ async def _ticker_loop() -> None:
                     })
                 except Exception as exc:
                     logger.warning("Candle REST sync failed: %s", exc)
+
+            # 5M candles — for SMC zone detection
+            if now - _last_5m_fetch >= _5M_REFRESH_S:
+                try:
+                    raw5 = await _rest.get_klines(cfg.symbol, interval="5m", limit=60)
+                    _candles_5m = [
+                        {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                         "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
+                        for k in raw5
+                    ]
+                    _last_5m_fetch = now
+                except Exception as exc:
+                    logger.debug("5M candle fetch failed: %s", exc)
+
+            # 15M candles — for SMC bias
+            if now - _last_15m_fetch >= _15M_REFRESH_S:
+                try:
+                    raw15 = await _rest.get_klines(cfg.symbol, interval="15m", limit=60)
+                    _candles_15m = [
+                        {"open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                         "close": float(k[4]), "volume": float(k[5]), "time": int(k[0])//1000}
+                        for k in raw15
+                    ]
+                    _last_15m_fetch = now
+                except Exception as exc:
+                    logger.debug("15M candle fetch failed: %s", exc)
 
             # Broadcast price tick
             await _do_broadcast({
@@ -360,7 +393,8 @@ async def _ticker_loop() -> None:
                     _entry_block = "Switching symbol — please wait…"
             else:
                 _entry_block = ""
-            await _engine.tick(cfg, price, allow_entry=_allow_entry, entry_block_reason=_entry_block, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
+            await _engine.tick(cfg, price, candles_5m=_candles_5m, candles_15m=_candles_15m,
+                               allow_entry=_allow_entry, htf_bias=_htf_bias)
 
             # Detect trade close → signal scanner to run immediately
             cur_session_open = _engine._session is not None
@@ -422,6 +456,7 @@ def _format_movers(top: list) -> list:
 async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
     """Switch active symbol — reused by auto-switch and TvWatcher."""
     global _last_candles_fetch, _htf_bias, _last_htf_fetch, _last_switch_ts, _switching_in_progress
+    global _candles_5m, _candles_15m, _last_5m_fetch, _last_15m_fetch
 
     if _switching_in_progress:
         logger.debug("_do_switch: already switching, skipping %s", new_sym)
@@ -445,6 +480,10 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
         _last_switch_ts     = time.time()
         _stale_scan_cycles  = 0
         _tried_syms.discard(new_sym)   # new symbol is active — remove from tried
+        _candles_5m         = []
+        _candles_15m        = []
+        _last_5m_fetch      = 0.0
+        _last_15m_fetch     = 0.0
 
         # Broadcast symbol_ready FIRST — UI clears chart and shows new symbol instantly
         # Also broadcast HTF NEUTRAL immediately so old symbol's HTF badge clears right away.
@@ -2004,6 +2043,7 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
 
     elif mtype == "set_config":
         global _last_candles_fetch, _binance_client, _executor, _ws, _flow
+        global _candles_5m, _candles_15m, _last_5m_fetch, _last_15m_fetch
         updates = {k: str(v) for k, v in msg.get("config", {}).items()}
 
         # Block symbol/timeframe changes while a position is open
@@ -2096,6 +2136,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             _ws.set_interval(cfg2.timeframe)
             await _ws.start()
             _last_candles_fetch = 0.0
+            _last_5m_fetch      = 0.0
+            _last_15m_fetch     = 0.0
 
             await _do_broadcast({"type": "mode_changed", "trading_mode": new_mode})
 
@@ -2104,6 +2146,10 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
             new_sym = updates["symbol"]
             await _ws.switch_symbol(new_sym)
             _last_candles_fetch = 0.0
+            _last_5m_fetch      = 0.0
+            _last_15m_fetch     = 0.0
+            _candles_5m         = []
+            _candles_15m        = []
             cfg2 = await load_config()
             await _executor.prepare_symbol(new_sym, cfg2.leverage)
             # Reset auto-switch cycle — manual override starts fresh on chosen symbol
@@ -2125,6 +2171,8 @@ async def _handle_ws_message(ws: WebSocket, raw: str, cfg) -> None:
         # Reset candle fetch and re-create flow analyser if timeframe changed
         if "timeframe" in updates:
             _last_candles_fetch = 0.0
+            _last_5m_fetch      = 0.0
+            _last_15m_fetch     = 0.0
         if "htf_timeframe" in updates:
             _htf_bias = "NEUTRAL"
             _last_htf_fetch = 0.0
