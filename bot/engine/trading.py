@@ -165,6 +165,15 @@ class TradingEngine:
         self._trail_activated      = False
         self._trail_price          = None
 
+        # Candles and indicators — old symbol's data must not leak into new symbol.
+        # Cleared here so any tick() that fires before update_candles() computes
+        # a clean NEUTRAL signal, and update_candles() sets _prev_indicators={}
+        # (not old symbol's last_indicators) on the first call for the new symbol.
+        self.candles          = []
+        self.last_indicators  = {}
+        self._prev_indicators = {}
+        self.last_signal      = {}
+
         logger.info("TradingEngine: state reset for symbol switch")
 
     # ------------------------------------------------------------------
