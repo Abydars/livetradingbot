@@ -684,8 +684,8 @@ class BinanceRestClient:
             atr_pct = (atr / price * 100) if price > 0 else 0.0
 
             # Gate: skip symbols that are too quiet or too chaotic to trade
-            if atr_pct < 0.3:
-                continue   # not enough volatility for reliable signals
+            if atr_pct < 0.20:
+                continue   # minimum volatility for scalping TP to be reachable
             atr_penalty = 0.60 if atr_pct > 5.0 else 1.0   # chaotic = penalty
 
             # ── Volume surge: last-3-candle avg vs 10-candle baseline ──

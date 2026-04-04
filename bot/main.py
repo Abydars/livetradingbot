@@ -642,83 +642,61 @@ def _composite_switch_score(sym_data: dict, now_ts: float) -> float:
     """Rank a scanner candidate for scalping suitability."""
     base = sym_data.get("_score", 0.0)
 
-    # HTF alignment bonus — prefer symbols where trend agrees with momentum
+    # HTF alignment bonus — HTF and momentum agree
     htf_bias     = sym_data.get("_htf_bias", "")
     scanner_bias = sym_data.get("_bias", "")
     if htf_bias and scanner_bias and htf_bias == scanner_bias:
-        base *= 1.20
+        base *= 1.25
 
-    # Large-cap liquidity bonus — tighter spreads, better fills for scalping
+    # Volume surge bonus — recent candles more active (current momentum)
+    vol_surge = sym_data.get("_vol_surge", 1.0)
+    if vol_surge >= 2.0:
+        base *= 1.20
+    elif vol_surge >= 1.5:
+        base *= 1.10
+
+    # ATR range bonus — enough volatility for scalping TP to be hit
+    atr_pct = sym_data.get("_atr_pct", 0.0)
+    if atr_pct and 0.4 <= atr_pct <= 2.0:   # sweet spot for scalping
+        base *= 1.15
+
+    # Large-cap liquidity bonus — tighter spreads, better fills
     qv = float(sym_data.get("quoteVolume", 0))
     if qv >= 500_000_000:
-        base *= 1.30
+        base *= 1.20
     elif qv >= 100_000_000:
-        base *= 1.15
+        base *= 1.10
 
     return base
 
 
 async def _scan_symbols(cfg) -> None:
     """
-    Two-phase fast scalping scanner.
-
-    Phase 1 — 24h ticker filter (single REST call, all symbols):
-      Filter USDT perps with meaningful move + adequate liquidity.
-      Keep top 20 by combined score.
-
-    Phase 2 — Pre-entry gate check for auto-switch candidates:
-      For top 20 symbols, check basic EMA/ATR gates using the existing
-      get_top_movers() REST call. The final order-flow gate is checked
-      live in _try_entry() on every tick.
+    Kline-based scalping scanner — delegates to get_top_movers() for
+    real-time vol_surge + momentum + EMA scoring instead of lagging 24h data.
     """
     global _stale_scan_cycles, _tried_syms, _htf_scanner_cache
     global _last_top_movers, _last_candles_fetch, _last_price, _last_price_rest_fetch
     global _last_switch_ts, _last_symbol_scan
-    import math
 
     try:
         _last_symbol_scan = time.time()
 
-        # ── Phase 1 — 24h ticker filter ──────────────────────────────────
-        tickers = await _rest._fetch_24h_tickers()
-        # Build the valid USDT perp set from already-loaded symbol_info.
-        # Perpetual USDT-M symbols never contain "_"; delivery contracts do
-        # (e.g. BTCUSDT_231229).  This avoids an extra REST call.
-        valid_perps = {
-            s for s, info in _rest.symbol_info.items()
-            if s.endswith("USDT") and "_" not in s and info.status == "TRADING"
-        }
-        candidates = []
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if sym not in valid_perps:
-                continue
-            pcp   = float(t.get("priceChangePercent", 0))
-            qvol  = float(t.get("quoteVolume", 0))
-            if abs(pcp) < 0.5 or qvol < 30_000_000:
-                continue
-            if sym in _symbol_blacklist:
-                continue
-            high_  = float(t.get("highPrice", 0))
-            low_   = float(t.get("lowPrice", 1))
-            last_  = float(t.get("lastPrice", 0))
-            rng    = high_ - low_
-            range_pos = (last_ - low_) / rng if rng > 0 else 0.5
-            score  = abs(pcp) * math.log10(max(qvol, 1)) * (0.5 + range_pos * 0.5)
-            candidates.append({
-                "symbol":             sym,
-                "_score":             score,
-                "_bias":              "LONG" if pcp > 0 else "SHORT",
-                "priceChangePercent": pcp,
-                "quoteVolume":        qvol,
-                "lastPrice":          last_,
-            })
+        # ── Phase 1+2 — kline deep scan via get_top_movers() ─────────────
+        # get_top_movers() runs its own 2-phase filter:
+        #   Phase 1: 24h ticker pre-filter (fast, no extra calls)
+        #   Phase 2: kline deep score — vol_surge, momentum, EMA, RSI, MACD
+        # This scores symbols on CURRENT momentum, not 24h lagging moves.
+        top_raw = await _rest.get_top_movers(
+            n=30,
+            min_quote_volume=50_000_000,   # 50M USDT daily — adequate liquidity
+            timeframe=cfg.timeframe,
+        )
 
-        # Keep top 20 by score
-        candidates.sort(key=lambda x: x["_score"], reverse=True)
-        top20 = candidates[:20]
-        if not top20:
+        if not top_raw:
             return
+
+        top20 = top_raw[:20]
 
         # ── Per-symbol HTF bias (cached) ──────────────────────────────────
         try:
@@ -787,15 +765,29 @@ async def _scan_symbols(cfg) -> None:
             _tried_syms.add(cfg.symbol)
 
         def _is_eligible(sym: str) -> bool:
-            """Eligible if not already tried and HTF doesn't contradict momentum."""
+            """Eligible if not already tried, HTF agrees, and kline quality gates pass."""
             if sym in _tried_syms:
                 return False
             d = top_data.get(sym, {})
+
+            # HTF must not contradict momentum direction
             htf  = d.get("_htf_bias", "")
             bias = d.get("_bias", "")
-            # Skip symbols where HTF trend contradicts 24h momentum direction
             if htf and bias and htf != bias:
                 return False
+
+            # Minimum quality gates from kline deep score
+            vol_surge = d.get("_vol_surge", 1.0) or 1.0
+            atr_pct   = d.get("_atr_pct",   0.0) or 0.0
+            score     = d.get("_score",      0.0) or 0.0
+
+            if vol_surge < 1.1:    # recent candles barely more active than baseline
+                return False
+            if atr_pct < 0.20:     # too quiet — not enough room for TP
+                return False
+            if score < 0.10:       # low overall quality
+                return False
+
             return True
 
         candidates_list = [s for s in top_syms if _is_eligible(s)]
