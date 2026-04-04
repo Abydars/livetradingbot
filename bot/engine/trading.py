@@ -566,7 +566,12 @@ class TradingEngine:
             if qty <= 0:
                 return False
 
-            side  = "BUY" if direction == "LONG" else "SELL"
+            # Opposite entry: gates evaluated in signal direction; order flipped
+            entry_direction = direction
+            if cfg.opposite_entry:
+                entry_direction = "SHORT" if direction == "LONG" else "LONG"
+
+            side  = "BUY" if entry_direction == "LONG" else "SELL"
             order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
             fill_price = float(order.get("avgPrice") or price)
 
@@ -574,16 +579,19 @@ class TradingEngine:
             if order_id:
                 self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
 
-            levels = self._compute_scalp_levels(atr_val, fill_price, direction, fill_price, cfg)
+            levels = self._compute_scalp_levels(atr_val, fill_price, entry_direction, fill_price, cfg)
 
             await create_session(
                 symbol=cfg.symbol,
-                direction=direction,
+                direction=entry_direction,
                 entry_price=fill_price,
                 qty=qty,
                 margin=cfg.margin_usdt,
                 leverage=effective_leverage,
-                entry_reason=f"early_scalp|{direction}|comp={comp['avg_body_ratio']:.2f}",
+                entry_reason=(
+                    f"early_scalp|{entry_direction}|comp={comp['avg_body_ratio']:.2f}"
+                    + ("|opposite" if cfg.opposite_entry else "")
+                ),
                 signal_strength=0.8,
                 signal_price=price,
             )
@@ -610,8 +618,9 @@ class TradingEngine:
 
             msg = (
                 f"{_mode_prefix(cfg.trading_mode)}"
-                f"⚡ EARLY ENTRY {direction} @ {fill_price:.4f}  "
-                f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
+                f"⚡ EARLY ENTRY {entry_direction} @ {fill_price:.4f}  "
+                + (f"[signal={direction}→FLIPPED]  " if cfg.opposite_entry else "")
+                + f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
                 f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
                 f"R:R={rr_ratio:.2f}  vol_pace={vol_pace:.1f}×  flow={flow_score:+.2f}"
             )
@@ -625,7 +634,7 @@ class TradingEngine:
             })
             self._broadcast({"type": "notification", "text": msg})
             self._pos_log(
-                "open", direction=direction, price=fill_price, qty=qty,
+                "open", direction=entry_direction, price=fill_price, qty=qty,
                 symbol=cfg.symbol, mode=cfg.trading_mode,
                 tp=self._scalp_tp_price, sl=self._scalp_sl_price,
                 rr=rr_ratio, entry_type="early",
@@ -634,7 +643,7 @@ class TradingEngine:
 
             await notify(cfg.discord_webhook, "TRADE_OPEN", {
                 "symbol":       cfg.symbol,
-                "direction":    direction,
+                "direction":    entry_direction,
                 "price":        fill_price,
                 "margin":       cfg.margin_usdt,
                 "tp_price":     self._scalp_tp_price,
@@ -916,7 +925,12 @@ class TradingEngine:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
 
-        side = "BUY" if direction == "LONG" else "SELL"
+        # Opposite entry: gates evaluated in signal direction; order flipped
+        entry_direction = direction
+        if cfg.opposite_entry:
+            entry_direction = "SHORT" if direction == "LONG" else "LONG"
+
+        side = "BUY" if entry_direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
         fill_price = float(order.get("avgPrice") or price)
 
@@ -924,34 +938,37 @@ class TradingEngine:
         if order_id:
             self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
 
-        # Recompute scalp levels from fill_price (accurate TP/SL prices)
-        levels = self._compute_scalp_levels(atr_val, fill_price, direction, fill_price, cfg)
+        # Recompute scalp levels from fill_price using actual trade direction
+        levels = self._compute_scalp_levels(atr_val, fill_price, entry_direction, fill_price, cfg)
 
         # OB zone — tighten SL to just inside OB boundary (only if tighter than ATR SL)
         in_ob_zone = ob["found"] and ob["ob_low"] <= fill_price <= ob["ob_high"]
         if in_ob_zone:
             _buf = 0.0005   # 0.05% buffer
-            if direction == "LONG":
+            if entry_direction == "LONG":
                 ob_sl = ob["ob_low"] * (1 - _buf)
-                if ob_sl > levels["sl_price"]:   # OB SL is tighter (closer to entry)
+                if ob_sl > levels["sl_price"]:
                     levels["sl_price"] = ob_sl
                     logger.info("TradingEngine: OB zone SL tightened to %.6f (OB low=%.6f)",
                                 ob_sl, ob["ob_low"])
             else:
                 ob_sl = ob["ob_high"] * (1 + _buf)
-                if ob_sl < levels["sl_price"]:   # OB SL is tighter for SHORT
+                if ob_sl < levels["sl_price"]:
                     levels["sl_price"] = ob_sl
                     logger.info("TradingEngine: OB zone SL tightened to %.6f (OB high=%.6f)",
                                 ob_sl, ob["ob_high"])
 
         await create_session(
             symbol=cfg.symbol,
-            direction=direction,
+            direction=entry_direction,
             entry_price=fill_price,
             qty=qty,
             margin=cfg.margin_usdt,
             leverage=effective_leverage,
-            entry_reason=f"scalp|{direction}",
+            entry_reason=(
+                f"scalp|{entry_direction}"
+                + ("|opposite" if cfg.opposite_entry else "")
+            ),
             signal_strength=signal.get("strength", 0.0),
             signal_price=price,
         )
@@ -985,21 +1002,22 @@ class TradingEngine:
 
         msg = (
             f"{_mode_prefix(cfg.trading_mode)}"
-            f"SCALP {direction} @ {fill_price:.4f}  "
-            f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
+            f"SCALP {entry_direction} @ {fill_price:.4f}  "
+            + (f"[signal={direction}→FLIPPED]  " if cfg.opposite_entry else "")
+            + f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
             f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
             f"R:R={rr_ratio:.2f}  ATR={atr_pct:.2f}%"
         )
         logger.info("TradingEngine: %s", msg)
         self._broadcast({"type": "notification", "text": msg})
-        self._pos_log("open", direction=direction, price=fill_price, qty=qty,
+        self._pos_log("open", direction=entry_direction, price=fill_price, qty=qty,
                       symbol=cfg.symbol, mode=cfg.trading_mode,
                       tp=self._scalp_tp_price, sl=self._scalp_sl_price, rr=rr_ratio)
         self._push_session()
 
         await notify(cfg.discord_webhook, "TRADE_OPEN", {
             "symbol":    cfg.symbol,
-            "direction": direction,
+            "direction": entry_direction,
             "price":     fill_price,
             "margin":    cfg.margin_usdt,
             "tp_price":  self._scalp_tp_price,

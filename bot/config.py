@@ -92,6 +92,7 @@ class BotConfig:
     breakout_body_min:      float
     breakout_vol_pace_min:  float
     breakout_flow_min:      float
+    opposite_entry:         bool
 
     # Exchange secrets (env-only, never in DB)
     api_key: str
@@ -203,6 +204,7 @@ async def load_config() -> BotConfig:
         breakout_body_min=_f("breakout_body_min", 0.50),
         breakout_vol_pace_min=_f("breakout_vol_pace_min", 2.0),
         breakout_flow_min=_f("breakout_flow_min", 0.25),
+        opposite_entry=_b("opposite_entry", False),
         api_key=api_key,
         api_secret=api_secret,
     )

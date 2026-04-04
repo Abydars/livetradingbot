@@ -143,6 +143,7 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "breakout_body_min":     "0.50",
     "breakout_vol_pace_min": "2.0",
     "breakout_flow_min":     "0.25",
+    "opposite_entry":        "0",
 }
 
 
