@@ -88,6 +88,7 @@ _tv_batch_timer: float = 0.0           # timestamp when batch window started
 _TV_BATCH_WINDOW_S = 15.0              # collect alerts for 15s before switching
 _tv_monitor_weak_cycles: int = 0       # consecutive monitor cycles with no bot_ready symbol
 _switching_in_progress: bool = False   # guard against concurrent symbol switches
+_cfg_tick_cache: object = None         # ticker config cache — invalidated on switch
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
 _htf_bias:        str   = "NEUTRAL"   # current HTF EMA trend bias
@@ -237,10 +238,9 @@ async def _sync_position_rest(cfg) -> None:
 
 
 async def _ticker_loop() -> None:
-    global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch, _tv_batch_timer
+    global _last_price, _last_candles_fetch, _last_price_rest_fetch, _prev_session_open, _last_client_warn, _last_position_check, _htf_bias, _last_htf_fetch, _tv_batch_timer, _cfg_tick_cache
     cfg = await load_config()
 
-    _cfg_tick_cache: BotConfig | None = None
     _cfg_tick_ts: float = 0.0
     _CFG_CACHE_TTL = 5.0   # reload config every 5s not every tick
 
@@ -317,7 +317,8 @@ async def _ticker_loop() -> None:
 
                 # HTF EMA bias — refresh once per TTL; cheap (1 REST call, 70 candles)
                 htf_tf, htf_ttl = (cfg.htf_timeframe, 15 * 60) if cfg.htf_timeframe else _htf_for_timeframe(cfg.timeframe)
-                if now - _last_htf_fetch >= htf_ttl:
+                if (not _switching_in_progress              # guard 1: no fetch during switch
+                        and now - _last_htf_fetch >= htf_ttl):
                     try:
                         htf_raw = await _rest.get_klines(cfg.symbol, interval=htf_tf, limit=70)
                         if htf_raw and len(htf_raw) >= 50:
@@ -325,14 +326,16 @@ async def _ticker_loop() -> None:
                             htf_closes = [float(k[4]) for k in htf_raw]
                             htf_ema21 = _ema(htf_closes, 21)
                             htf_ema50 = _ema(htf_closes, 50)
-                            if htf_ema21 > htf_ema50 and htf_closes[-1] > htf_ema21:
-                                _htf_bias = "LONG"
-                            elif htf_ema21 < htf_ema50 and htf_closes[-1] < htf_ema21:
-                                _htf_bias = "SHORT"
-                            else:
-                                _htf_bias = "NEUTRAL"
-                            _last_htf_fetch = now
-                            _broadcast({"type": "htf_bias", "bias": _htf_bias, "timeframe": htf_tf})
+                            # guard 2: abort if a switch fired during the await
+                            if not _switching_in_progress:
+                                if htf_ema21 > htf_ema50 and htf_closes[-1] > htf_ema21:
+                                    _htf_bias = "LONG"
+                                elif htf_ema21 < htf_ema50 and htf_closes[-1] < htf_ema21:
+                                    _htf_bias = "SHORT"
+                                else:
+                                    _htf_bias = "NEUTRAL"
+                                _last_htf_fetch = now
+                                _broadcast({"type": "htf_bias", "bias": _htf_bias, "timeframe": htf_tf})
                     except Exception as exc:
                         logger.debug("HTF fetch failed: %s", exc)
 
@@ -486,6 +489,8 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
                 _tv_watcher.invalidate(new_sym)
     finally:
         _switching_in_progress = False
+        global _cfg_tick_cache
+        _cfg_tick_cache = None   # force ticker to reload config on next tick
 
 
 async def _tv_monitor_loop() -> None:
@@ -1103,6 +1108,8 @@ async def _scan_symbols(cfg) -> None:
             })
         finally:
             _switching_in_progress = False
+            global _cfg_tick_cache
+            _cfg_tick_cache = None   # force ticker to reload config on next tick
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
         _on_exchange_error(f"Symbol scan failed: {exc}")
