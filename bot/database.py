@@ -144,6 +144,13 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "breakout_vol_pace_min": "2.0",
     "breakout_flow_min":     "0.25",
     "opposite_entry":        "0",
+    # SMC strategy parameters
+    "smc_sl_buffer_pts":    "3.0",
+    "smc_max_sl_pts":       "15.0",
+    "smc_min_rr":           "2.0",
+    "smc_ob_lookback":      "30",
+    "smc_fvg_min_gap_pct":  "0.05",
+    "smc_ob_strength_mult": "1.5",
 }
 
 
@@ -195,6 +202,11 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         ("scalp_entry_candle_time", "INTEGER DEFAULT 0"),
         # Scalping: breakeven stop state
         ("breakeven_armed",      "INTEGER DEFAULT 0"),
+        # SMC: zone info for position tracking
+        ("smc_zone_type",        "TEXT"),
+        ("smc_zone_high",        "REAL"),
+        ("smc_zone_low",         "REAL"),
+        ("smc_sweep_low",        "REAL"),
     ]:
         try:
             await db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {defn}")
