@@ -849,9 +849,6 @@
         max-height: 340px;
       }
 
-      #tabs-wrap { height: auto; flex-shrink: 0; }
-      .tbl-scroll { overflow-y: visible; flex: none; }
-
       #right-col {
         width: 100%;
         flex-shrink: 0;
@@ -865,6 +862,15 @@
 
       #card-hedge,
       #card-ob { grid-column: 1 / -1; }
+    }
+
+    /* ── tablet layout (768–1024px) — tabs-wrap and tbl-scroll same as mobile ── */
+    @media (max-width: 1024px) {
+      #tabs-wrap { height: auto; flex-shrink: 0; }
+      .tbl-scroll { overflow-y: visible; flex: none; }
+    }
+
+    @media (max-width: 767px) {
 
       #header {
         height: auto;
@@ -1037,32 +1043,32 @@
       }
 
       /* ── Right drawer: signal / position panel ── */
+      /* On mobile right-col is inline, not a drawer */
       #right-col {
-        position: fixed !important;
-        top: 0; right: 0;
-        height: 100%;
-        width: 85vw;
-        max-width: 320px;
+        position: static !important;
+        transform: none !important;
+        width: 100% !important;
+        height: auto !important;
+        overflow-y: visible !important;
         display: flex !important;
         flex-direction: column !important;
         grid-template-columns: unset !important;
-        background: var(--bg1);
-        border-left: 1px solid var(--border) !important;
-        border-top: none !important;
-        box-shadow: -4px 0 24px rgba(0,0,0,.45);
-        overflow-y: auto;
-        transform: translateX(105%);
-        transition: transform .25s cubic-bezier(.4,0,.2,1);
-        z-index: 201;
+        border-left: none !important;
+        border-top: 1px solid var(--border);
+        box-shadow: none !important;
+        background: none;
       }
-      #right-col.drawer-open { transform: translateX(0); }
 
-      /* Cards stack vertically inside the right drawer */
+      /* Hide drawer controls that are no longer needed */
+      #btn-drawer-panel  { display: none !important; }
+      #right-drawer-close { display: none !important; }
+
+      /* Cards stack vertically inside right-col */
       #right-col .rcard { flex-shrink: 0; width: 100%; box-sizing: border-box; }
       #card-hedge,
       #card-ob { grid-column: auto !important; }
 
-      /* Remove nested scroll — drawer itself scrolls */
+      /* Remove nested scroll */
       #right-col #pos-log-list { max-height: none; overflow-y: visible; }
     }
 
@@ -1072,15 +1078,21 @@
       padding: 6px 8px;
     }
 
-    /* Safety: hide anchor on mobile (cards are moved out of it) */
-    @media (max-width: 767px) {
+    /* Safety: hide anchor on mobile/tablet (cards are moved out of it) */
+    @media (max-width: 1024px) {
       #pos-cards-anchor { display: none; }
     }
 
-    /* Position tab is mobile-only — hide button and pane on desktop */
-    @media (min-width: 768px) {
+    /* Position tab is mobile/tablet only — hide on desktop */
+    @media (min-width: 1025px) {
       [data-tab="position"],
       #tab-position { display: none !important; }
+    }
+
+    /* Signal panel compact on mobile */
+    @media (max-width: 767px) {
+      #card-signal { order: -1; }
+      #sig-bars { display: none; }
     }
   </style>
 </head>
@@ -3089,7 +3101,7 @@ function updatePaperBadge() { /* superseded by updateModeDisplay */ }
 // Move position cards into the mobile tab pane or back to the desktop anchor
 function repositionPositionCards() {
   const cards  = ['card-pos', 'card-hedge', 'card-pos-log'];
-  const isMob  = window.innerWidth <= 767;
+  const isMob  = window.innerWidth <= 1024;
   const target = isMob
     ? document.getElementById('tab-position')
     : document.getElementById('pos-cards-anchor');
@@ -3098,19 +3110,19 @@ function repositionPositionCards() {
 
   cards.forEach(id => {
     const el = document.getElementById(id);
-    if (el && el.parentElement !== target) {
-      target.appendChild(el);
-    }
+    if (el && el.parentElement !== target) target.appendChild(el);
   });
 
-  // On mobile, auto-switch to position tab when a position is open
-  if (isMob && curSession?.status === 'open') {
-    document.querySelectorAll('.tbtn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tpane').forEach(p => p.classList.remove('active'));
-    const posBtn = document.querySelector('[data-tab="position"]');
+  // On mobile/tablet, activate POSITION tab by default
+  if (isMob) {
+    const posBtn  = document.querySelector('[data-tab="position"]');
     const posPane = document.getElementById('tab-position');
-    if (posBtn)  posBtn.classList.add('active');
-    if (posPane) posPane.classList.add('active');
+    if (posBtn && posPane && !posBtn.classList.contains('active')) {
+      document.querySelectorAll('.tbtn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tpane').forEach(p => p.classList.remove('active'));
+      posBtn.classList.add('active');
+      posPane.classList.add('active');
+    }
   }
 }
 window.addEventListener('resize', repositionPositionCards);
