@@ -98,7 +98,10 @@ _current_scanner_type: str = "momentum"   # scanner type that found active symbo
 # How many scan cycles the current symbol has been the active symbol without an entry.
 # Used to force a switch after _STALE_SCAN_CYCLES to avoid getting stuck.
 _stale_scan_cycles: int = 0
-_STALE_SCAN_CYCLES  = 10             # switch after N scan cycles on current symbol with no entry
+# Force a rotation after this many scan cycles on the same symbol with no entry.
+# With scan_interval_s=10 → 30 cycles = 300s = 5 minutes per symbol.
+# Gives enough time for a proper candle setup while still rotating regularly.
+_STALE_SCAN_CYCLES  = 30
 _tried_syms: set   = set()            # symbols already tried in current cycle (since last trade)
 _symbol_blacklist: set = {            # never trade these symbols
     "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT",
@@ -757,6 +760,10 @@ async def _scan_symbols(cfg) -> None:
 
         # ── Auto-switch logic ─────────────────────────────────────────────
         now_ts = time.time()
+        # Minimum 60s between switches — prevents thrashing when multiple symbols
+        # score similarly and the current one just switched in.
+        if now_ts - _last_switch_ts < 60:
+            return
         for t in top20:
             t["_switch_score"] = _composite_switch_score(t, now_ts)
         top_by_switch = sorted(top20, key=lambda x: x["_switch_score"], reverse=True)
