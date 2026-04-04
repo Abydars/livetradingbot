@@ -130,7 +130,7 @@ class SignalEngine:
 
         # Apply entry filters
         direction, filters_passed, reason = self._apply_filters(
-            raw_dir, composite, ind
+            raw_dir, composite, ind, scanner_type
         )
         if not filters_passed:
             strength = 0.0
@@ -332,6 +332,7 @@ class SignalEngine:
         raw_dir: str,
         composite: float,
         ind: Dict,
+        scanner_type: str = "momentum",
     ) -> tuple:
         """Returns (direction, filters_passed, reason)."""
         if raw_dir == "NEUTRAL":
@@ -341,20 +342,28 @@ class SignalEngine:
         ema21: Optional[float]   = ind.get("ema21")
         ema50: Optional[float]   = ind.get("ema50")
 
+        # Scanner-specific thresholds — breakout symbols are expected to have
+        # elevated RSI/StochRSI; blocking them defeats the purpose of a breakout scanner.
+        is_breakout = scanner_type == "breakout"
+        rsi_ob   = 90.0 if is_breakout else _RSI_OB    # 75.0
+        rsi_os   = 10.0 if is_breakout else _RSI_OS    # 25.0
+        stoch_ob = 95   if is_breakout else 85
+        stoch_os = 5    if is_breakout else 15
+
         # RSI extreme blocks
-        if raw_dir == "LONG" and rsi_val is not None and rsi_val > _RSI_OB:
-            return "NEUTRAL", False, f"RSI {rsi_val:.1f} > {_RSI_OB} (extreme overbought)"
-        if raw_dir == "SHORT" and rsi_val is not None and rsi_val < _RSI_OS:
-            return "NEUTRAL", False, f"RSI {rsi_val:.1f} < {_RSI_OS} (extreme oversold)"
+        if raw_dir == "LONG" and rsi_val is not None and rsi_val > rsi_ob:
+            return "NEUTRAL", False, f"RSI {rsi_val:.1f} > {rsi_ob} (extreme overbought)"
+        if raw_dir == "SHORT" and rsi_val is not None and rsi_val < rsi_os:
+            return "NEUTRAL", False, f"RSI {rsi_val:.1f} < {rsi_os} (extreme oversold)"
 
         # StochRSI extreme blocks — catches pump wicks that RSI misses.
         # RSI lags; StochRSI reacts faster to price spikes.
         sr = ind.get("stoch_rsi") or {}
         stoch_k = sr.get("k")
-        if raw_dir == "LONG" and stoch_k is not None and stoch_k > 85:
-            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} > 85 (extreme overbought — pump wick risk)"
-        if raw_dir == "SHORT" and stoch_k is not None and stoch_k < 15:
-            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} < 15 (extreme oversold — dump wick risk)"
+        if raw_dir == "LONG" and stoch_k is not None and stoch_k > stoch_ob:
+            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} > {stoch_ob} (extreme overbought — pump wick risk)"
+        if raw_dir == "SHORT" and stoch_k is not None and stoch_k < stoch_os:
+            return "NEUTRAL", False, f"StochRSI K {stoch_k:.0f} < {stoch_os} (extreme oversold — dump wick risk)"
 
         # Counter-trend filter — allow if RSI is at extreme (mean-reversion mode)
         if ema21 is not None and ema50 is not None:
