@@ -43,6 +43,32 @@ class OrderFlowAnalyzer:
         """Clear all accumulated trade data — called on symbol switch."""
         self._trades.clear()
 
+    def seed_from_trades(self, trades: list) -> None:
+        """
+        Pre-populate the flow window from historical aggTrades fetched via REST.
+        Each trade dict must have:
+          { "price": float, "qty": float, "buyer_maker": bool, "time": int (ms) }
+        Only trades within the current window are kept — older ones are discarded.
+        This replaces on_trade() for historical backfill; existing live trades
+        (if any) are preserved so this is safe to call at any time.
+        """
+        cutoff = time.time() - self._window
+        for t in trades:
+            ts = t["time"] / 1000.0   # ms → seconds
+            if ts < cutoff:
+                continue               # too old, outside the rolling window
+            notional = t["price"] * t["qty"]
+            if t["buyer_maker"]:
+                self._trades.append((ts, 0.0, notional))   # taker sell
+            else:
+                self._trades.append((ts, notional, 0.0))   # taker buy
+
+        # Sort by timestamp so the deque is in chronological order
+        sorted_trades = sorted(self._trades, key=lambda x: x[0])
+        self._trades.clear()
+        self._trades.extend(sorted_trades)
+        self._prune()
+
     # ------------------------------------------------------------------
     # Feed methods (called by WS callbacks)
     # ------------------------------------------------------------------

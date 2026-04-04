@@ -278,6 +278,33 @@ class BinanceRestClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_agg_trades(self, symbol: str, window_seconds: int = 60) -> list:
+        """
+        Fetch recent aggTrades for symbol going back window_seconds from now.
+        Uses /fapi/v1/aggTrades with startTime filter.
+        Returns list of dicts: {price, qty, buyer_maker, time}
+        Returns empty list on any error.
+        """
+        try:
+            start_ms = int((time.time() - window_seconds) * 1000)
+            params = {"symbol": symbol, "startTime": start_ms, "limit": 1000}
+            await self._market_limiter.acquire()
+            resp = await self._client.get("/fapi/v1/aggTrades", params=params)
+            resp.raise_for_status()
+            raw = resp.json()
+            return [
+                {
+                    "price":       float(t["p"]),
+                    "qty":         float(t["q"]),
+                    "buyer_maker": bool(t["m"]),
+                    "time":        int(t["T"]),
+                }
+                for t in (raw or [])
+            ]
+        except Exception as exc:
+            logger.warning("get_agg_trades failed for %s: %s", symbol, exc)
+            return []
+
     async def get_klines(
         self,
         symbol: str,
