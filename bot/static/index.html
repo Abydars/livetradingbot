@@ -1089,11 +1089,6 @@
       #tab-position { display: none !important; }
     }
 
-    /* Signal panel compact on mobile */
-    @media (max-width: 767px) {
-      #card-signal { order: -1; }
-      #sig-bars { display: none; }
-    }
   </style>
 </head>
 <body>
@@ -3100,7 +3095,7 @@ function updatePaperBadge() { /* superseded by updateModeDisplay */ }
 
 // Move position cards into the mobile tab pane or back to the desktop anchor
 function repositionPositionCards() {
-  const cards  = ['card-pos', 'card-hedge', 'card-pos-log'];
+  const cards  = ['card-signal', 'card-pos', 'card-hedge', 'card-ob', 'card-pos-log'];
   const isMob  = window.innerWidth <= 1024;
   const target = isMob
     ? document.getElementById('tab-position')
