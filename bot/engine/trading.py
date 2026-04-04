@@ -354,14 +354,21 @@ class TradingEngine:
         so the UI always shows current pass/fail status.
         Entry is ONLY on a closed candle — never mid-candle.
         """
-        # ── Pre-filters (silent — no gate broadcast) ──────────────────────
-        if len(self.candles) < 60:
+        def _waiting(reason: str) -> None:
+            self._broadcast({"type": "entry_blocked", "reason": reason, "gates": {}})
+
+        # ── Pre-filters (broadcast reason, gates stay —) ──────────────────
+        n = len(self.candles)
+        if n < 60:
+            _waiting(f"Warming up: {n}/60 candles loaded")
             return
-        if len(self.candles) < 2 or atr_val <= 0:
+        if atr_val <= 0:
+            _waiting("Waiting for ATR to initialise")
             return
 
         direction = signal.get("direction", "NEUTRAL")
         if direction == "NEUTRAL":
+            _waiting("No directional signal (EMA stack flat)")
             return
 
         c = self.candles[-2]   # last CLOSED candle
@@ -369,6 +376,7 @@ class TradingEngine:
         open_  = c["open"];  close_ = c["close"]
         full_range = high_ - low_
         if full_range <= 0:
+            _waiting("Zero-range candle — skipping")
             return
 
         body       = abs(close_ - open_)
