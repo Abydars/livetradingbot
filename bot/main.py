@@ -790,8 +790,9 @@ async def _scan_symbols(cfg) -> None:
         except Exception as exc:
             logger.debug("Scanner HTF cache failed: %s", exc)
 
-        _last_top_movers = _format_movers(top)
-        await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+        if not cfg.tv_scanner_enabled:
+            _last_top_movers = _format_movers(top)
+            await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
 
         # Re-rank top list by composite switch score so auto-switch uses
         # a smarter quality metric than raw scanner score alone.
@@ -875,6 +876,8 @@ async def _scan_symbols(cfg) -> None:
             if not candidates:
                 return   # everything is cooling down — nothing to switch to
 
+        new_sym = None  # will be set iff a switch should happen
+
         # Current symbol is still an active candidate — apply candle-based wait
         if cfg.symbol in candidates:
             next_candidate = next((s for s in candidates if s != cfg.symbol), None)
@@ -889,14 +892,19 @@ async def _scan_symbols(cfg) -> None:
             top_score     = top_candidate["_switch_score"] if top_candidate else 0.0
             cur_score     = top_data.get(cfg.symbol, {}).get("_switch_score", 0.0)
 
-            if (top_sym and top_sym != cfg.symbol
-                    and cur_score > 0
-                    and top_score >= cur_score * cfg.switch_threshold):
+            should_immediate = (
+                top_sym and top_sym != cfg.symbol and (
+                    cur_score == 0 or   # current not ranked → always switch
+                    (cur_score > 0 and top_score >= cur_score * cfg.switch_threshold)
+                )
+            )
+            if should_immediate:
                 # Immediate switch — do not touch candle timer state
+                pct_better = ((top_score / cur_score - 1) * 100) if cur_score > 0 else float("inf")
                 logger.info(
                     "Auto-switch: %s (quality %.2f) is %.0f%% better than %s (quality %.2f)"
                     " — switching immediately (threshold %.2f×)",
-                    top_sym, top_score, (top_score / cur_score - 1) * 100,
+                    top_sym, top_score, pct_better,
                     cfg.symbol, cur_score, cfg.switch_threshold,
                 )
                 _tried_syms.add(cfg.symbol)
@@ -913,13 +921,13 @@ async def _scan_symbols(cfg) -> None:
                         cfg.entry_wait_candles, cfg.symbol, next_candidate or "—",
                     )
 
-                total_candles = max(0, (cur_candle - _entry_start_candle) // tf_secs) if tf_secs > 0 else 0
+                total_candles = max(0, (cur_candle - _entry_start_candle + 1) // tf_secs) if tf_secs > 0 else 0
 
                 sig_dir = (_engine.last_signal or {}).get("direction", "NEUTRAL")
                 if sig_dir == "NEUTRAL":
                     if _neutral_since_candle == 0 and cur_candle > 0:
                         _neutral_since_candle = cur_candle
-                    neutral_candles = max(0, (cur_candle - _neutral_since_candle) // tf_secs) if tf_secs > 0 else 0
+                    neutral_candles = max(0, (cur_candle - _neutral_since_candle + 1) // tf_secs) if tf_secs > 0 else 0
                 else:
                     _neutral_since_candle = 0
                     neutral_candles       = 0
@@ -965,6 +973,8 @@ async def _scan_symbols(cfg) -> None:
             # Current symbol is not a candidate — pick best untried directly
             new_sym = candidates[0]
 
+        if new_sym is None:
+            return
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
         global _switching_in_progress
         _switching_in_progress = True
