@@ -516,8 +516,8 @@ class BinanceRestClient:
             "BinanceRestClient: loaded info for %d symbols", len(self.symbol_info)
         )
 
-    def _round_qty(self, symbol: str, qty: float) -> float:
-        """Round qty to exchange step size and enforce min_qty."""
+    def _round_qty(self, symbol: str, qty: float, price: float = 0.0) -> float:
+        """Round qty to exchange step size and enforce min_qty and min_notional."""
         info = self.symbol_info.get(symbol)
         if info is None:
             # exchangeInfo not loaded yet; derive precision from the qty magnitude
@@ -536,16 +536,24 @@ class BinanceRestClient:
         qty = int(qty / step) * step
         # determine decimal places from step_size
         decimals = max(0, -int(f"{step:e}".split("e")[1]))
-        return round(qty, decimals)
+        qty = round(qty, decimals)
+        # min_notional enforcement: bump up to next step multiple if needed
+        if price > 0 and info.min_notional > 0 and qty * price < info.min_notional:
+            import math
+            min_qty_for_notional = info.min_notional / price
+            steps_needed = math.ceil(min_qty_for_notional / step)
+            qty = steps_needed * step
+            qty = round(qty, decimals)
+        return qty
 
     def calc_qty(self, symbol: str, margin_usdt: float, leverage: int, price: float) -> float:
         """
         Calculate position quantity from margin * leverage / price.
-        Applies step-size rounding and min_qty enforcement.
+        Applies step-size rounding, min_qty, and min_notional enforcement.
         """
         notional = margin_usdt * leverage
         raw_qty = notional / price
-        return self._round_qty(symbol, raw_qty)
+        return self._round_qty(symbol, raw_qty, price=price)
 
     # ------------------------------------------------------------------
     # Top movers for auto-switch
