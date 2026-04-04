@@ -986,7 +986,7 @@ async def _scan_symbols(cfg) -> None:
 
         # symbol_ready MUST go first — UI clears the chart on this message.
         # Candles sent after so they populate the freshly cleared chart.
-        _entry_start_candle   = _engine.candles[-1]["time"] if (_engine and _engine.candles) else 0
+        _entry_start_candle   = 0   # set correctly after update_candles() below
         _neutral_since_candle = 0   # reset neutral clock for the new symbol
         _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
         global _current_scanner_type
@@ -1001,10 +1001,12 @@ async def _scan_symbols(cfg) -> None:
         _htf_bias = "NEUTRAL"
         _last_htf_fetch = 0.0
         _htf_scanner_cache.pop(new_sym, None)   # force fresh HTF fetch for new symbol on next scan
+        await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
         await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
         if fresh_candles:
             _engine.update_candles(fresh_candles)
+            _entry_start_candle = fresh_candles[-1]["time"] if fresh_candles else 0
             _last_candles_fetch = time.time()
             await _do_broadcast({
                 "type":    "candles",
