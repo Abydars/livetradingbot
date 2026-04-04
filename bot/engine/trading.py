@@ -124,6 +124,10 @@ class TradingEngine:
         # Partial TP: True once we have closed the first fraction; reset on full close.
         self._partial_tp_done: bool = False
 
+        # Leverage locked at switch time — set by main.py after prepare_symbol().
+        # Used at entry so we size against the same leverage that's set on the exchange.
+        self._effective_leverage: int = 1
+
         # Latest indicators (cached each tick for broadcast)
         self.last_signal: Dict = {}
         self._scanner_type: str = "momentum"   # scanner type that found current symbol
@@ -169,10 +173,11 @@ class TradingEngine:
         # Cleared here so any tick() that fires before update_candles() computes
         # a clean NEUTRAL signal, and update_candles() sets _prev_indicators={}
         # (not old symbol's last_indicators) on the first call for the new symbol.
-        self.candles          = []
-        self.last_indicators  = {}
-        self._prev_indicators = {}
-        self.last_signal      = {}
+        self.candles             = []
+        self.last_indicators     = {}
+        self._prev_indicators    = {}
+        self.last_signal         = {}
+        self._effective_leverage = 1   # re-set by main.py after prepare_symbol()
 
         logger.info("TradingEngine: state reset for symbol switch")
 
@@ -809,27 +814,14 @@ class TradingEngine:
             await log_signal(cfg.symbol, direction, strength, signal["components"], "skip")
             return
 
-        # Auto leverage: adjust leverage downward so DCA step fits within
-        # Last Resort SL distance. Must run BEFORE the ATR guard so the guard
-        # uses the reduced leverage when checking if DCA fits.
+        # Use leverage locked at switch time — already set on the exchange via prepare_symbol().
+        # Recalculating here would produce a different value than what Binance has, causing
+        # the position to be sized at the wrong leverage.
         atr_pct_cur    = (atr_val / price * 100) if price > 0 else 0.0
-        effective_leverage = cfg.leverage
-        if cfg.auto_leverage and atr_val > 0:
-            buffer        = cfg.last_resort_sl_buffer
-            max_safe_lev  = (buffer * 100) / (atr_pct_cur * 1.5)
-            max_safe_lev  = max_safe_lev * 0.85   # 15% safety margin
-            safe_lev      = max(1, int(max_safe_lev))
-            if safe_lev < cfg.leverage:
-                effective_leverage = safe_lev
-                logger.info(
-                    "TradingEngine: auto-leverage reduced %dx → %dx "
-                    "(ATR=%.2f%%, DCA step would exceed SL at %dx)",
-                    cfg.leverage, effective_leverage, atr_pct_cur, cfg.leverage,
-                )
+        effective_leverage = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
 
-        # High ATR guard: after auto-leverage adjustment, verify DCA step still
-        # fits within Last Resort SL distance. Uses effective_leverage (reduced).
-        # Only blocks if auto-leverage couldn't fix the mismatch (leverage already at min).
+        # High ATR guard: verify DCA step fits within Last Resort SL distance.
+        # Uses the switch-time leverage (already set on exchange) so the check is consistent.
         liq_pct         = (1.0 / effective_leverage) * 100 if effective_leverage > 0 else 10.0
         last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
         dca_step_would_be = max(atr_pct_cur * 1.5, 0.50)
@@ -840,21 +832,24 @@ class TradingEngine:
             )
             return
 
-        # Strength-based sizing: scale margin by signal strength (floored at strength_size_min)
+        # Strength-based sizing: block weak signals, scale margin linearly above minimum.
         if cfg.strength_sizing:
-            scale = max(strength, cfg.strength_size_min)
-            effective_margin = cfg.margin_usdt * scale
+            if strength < cfg.strength_size_min:
+                _blocked(
+                    f"signal strength {strength:.2f} below minimum {cfg.strength_size_min:.2f}"
+                )
+                return
+            effective_margin = cfg.margin_usdt * strength
         else:
             effective_margin = cfg.margin_usdt
-        qty = self._executor.calc_qty(cfg.symbol, effective_margin, effective_leverage, price)
+
+        # Deduct entry taker fee so total margin consumed stays within cfg.margin_usdt.
+        fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
+        fee_adjusted_margin = effective_margin / fee_factor
+        qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
         if qty <= 0:
             logger.warning("TradingEngine: qty=0, skipping entry")
             return
-
-        # Leverage already set at symbol switch time (auto_leverage calculated from ATR).
-        # Only re-sync if auto_leverage is OFF (manual mode, leverage may have changed).
-        if not cfg.auto_leverage:
-            await self._executor.ensure_leverage(cfg.symbol, effective_leverage)
 
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(

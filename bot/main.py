@@ -457,6 +457,7 @@ async def _do_switch(new_sym: str, cfg: BotConfig) -> None:
                 ),
                 return_exceptions=True,
             )
+            _engine._effective_leverage = cfg.leverage   # lock leverage for entry sizing
 
             if isinstance(raw, list) and len(raw) >= 60:
                 fresh = [
@@ -992,6 +993,8 @@ async def _scan_symbols(cfg) -> None:
                 _ws.switch_symbol(new_sym),
                 _executor.prepare_symbol(new_sym, smart_leverage),
             )
+            if _engine:
+                _engine._effective_leverage = smart_leverage   # lock for entry sizing
 
             # Reset stale price so the next tick gets a fresh mark-price for new symbol.
             _last_price = 0.0
