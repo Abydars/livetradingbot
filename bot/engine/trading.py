@@ -351,9 +351,9 @@ class TradingEngine:
         ema21 = ind.get("ema21")
         ema50 = ind.get("ema50")
         if ema9 and ema21 and ema50:
-            if ema9 > ema21 > ema50 and price > ema9:
+            if ema9 > ema21 > ema50 and price > ema21:
                 sig_dir = "LONG"
-            elif ema9 < ema21 < ema50 and price < ema9:
+            elif ema9 < ema21 < ema50 and price < ema21:
                 sig_dir = "SHORT"
             else:
                 sig_dir = "NEUTRAL"
@@ -774,31 +774,67 @@ class TradingEngine:
         if ema9 is None or ema21 is None or ema50 is None:
             gates["EMA STACK"] = (False, "indicator not ready")
         elif direction == "LONG":
-            if ema9 > ema21 > ema50 and price > ema9:
+            if ema9 > ema21 > ema50 and price > ema21:
                 gates["EMA STACK"] = (True, f"e9={ema9:g}")
             else:
                 gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
         else:
-            if ema9 < ema21 < ema50 and price < ema9:
+            if ema9 < ema21 < ema50 and price < ema21:
                 gates["EMA STACK"] = (True, f"e9={ema9:g}")
             else:
                 gates["EMA STACK"] = (False, f"e9={ema9:g} e21={ema21:g} e50={ema50:g}")
 
-        # Gate 4 — Order flow
+        # RSI computed here so confluence check in Gate 4 can reference it
+        rsi_val = RSI(closes, 14)
+
+        # Gate 4 — Order flow (confluence-scaled threshold)
         flow_data  = self._flow.summarize()
         flow_score = flow_data.get("score", 0.0)
         flow_count = flow_data.get("trade_count", 0)
+
+        # Count how many strong-confluence signals are present.
+        # More confluence → lower flow bar (catch moves at the start, not late).
+        _confluence_count = 0
+        if gates.get("CANDLE STRUCTURE", (False,))[0]:
+            _confluence_count += 1
+        if gates.get("EMA STACK", (False,))[0]:
+            _confluence_count += 1
+        if htf_bias == direction:
+            _confluence_count += 1
+        _rsi_ideal = (
+            (direction == "LONG"  and rsi_val is not None and 45 <= rsi_val <= 65) or
+            (direction == "SHORT" and rsi_val is not None and 35 <= rsi_val <= 55)
+        )
+        if _rsi_ideal:
+            _confluence_count += 1
+        # Linear scale: 0 confluence → cfg.min_flow_score; 4/4 → 0.05; floor 0.03
+        _effective_flow_threshold = max(
+            0.03,
+            cfg.min_flow_score - (cfg.min_flow_score - 0.05) * (_confluence_count / 4),
+        )
+
         if flow_count < 10:
             gates["ORDER FLOW"] = (False, f"only {flow_count} trades (need 10)")
-        elif direction == "LONG" and flow_score < cfg.min_flow_score:
-            gates["ORDER FLOW"] = (False, f"score {flow_score:+.2f} < +{cfg.min_flow_score:.2f}")
-        elif direction == "SHORT" and flow_score > -cfg.min_flow_score:
-            gates["ORDER FLOW"] = (False, f"score {flow_score:+.2f} > -{cfg.min_flow_score:.2f}")
+        elif direction == "LONG" and flow_score < _effective_flow_threshold:
+            gates["ORDER FLOW"] = (
+                False,
+                f"score {flow_score:+.2f} < +{_effective_flow_threshold:.2f}"
+                + (f" (reduced from {cfg.min_flow_score:.2f})" if _confluence_count >= 3 else ""),
+            )
+        elif direction == "SHORT" and flow_score > -_effective_flow_threshold:
+            gates["ORDER FLOW"] = (
+                False,
+                f"score {flow_score:+.2f} > -{_effective_flow_threshold:.2f}"
+                + (f" (reduced from {cfg.min_flow_score:.2f})" if _confluence_count >= 3 else ""),
+            )
         else:
-            gates["ORDER FLOW"] = (True, f"{flow_score:+.2f}")
+            gates["ORDER FLOW"] = (
+                True,
+                f"{flow_score:+.2f}"
+                + (f" (thr {_effective_flow_threshold:.2f})" if _confluence_count >= 3 else ""),
+            )
 
         # Gate 5 — RSI zone
-        rsi_val = RSI(closes, 14)
         if rsi_val is None:
             gates["RSI ZONE"] = (False, "indicator not ready")
         elif direction == "LONG" and not (35 <= rsi_val <= 75):
