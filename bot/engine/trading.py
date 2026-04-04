@@ -1313,7 +1313,7 @@ class TradingEngine:
                     )
                     return
 
-            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val)
+            await self._try_dca(cfg, price, direction, avg_price, qty, dca_count, atr_val, signal=signal)
 
     # ------------------------------------------------------------------
     # Take-profit logic (trailing + fixed floor)
@@ -1476,6 +1476,7 @@ class TradingEngine:
         qty: float,
         dca_count: int,
         atr_val: float = 0.0,
+        signal: Dict = None,
     ) -> None:
         """DCA with 5-second adverse pressure confirmation."""
         confirmed = self._flow.check_adverse_pressure(direction, required_seconds=5.0)
@@ -1489,6 +1490,29 @@ class TradingEngine:
 
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
+        # Scale by signal strength — floors at 0.6 so averaging effect stays meaningful
+        if cfg.strength_sizing and signal is not None:
+            sig_strength = signal.get("strength", 1.0)
+            dca_strength_scale = max(sig_strength, 0.6)
+            dca_margin = dca_margin * dca_strength_scale
+
+        # Cumulative margin guard: total deployed must not exceed theoretical max envelope
+        max_total_margin = sum(
+            cfg.margin_usdt * (cfg.dca_multiplier ** i)
+            for i in range(cfg.max_dca + 1)
+        )
+        current_margin = self._session.get("margin", 0.0) if self._session else 0.0
+        if current_margin + dca_margin > max_total_margin * 1.05:
+            logger.warning(
+                "TradingEngine: DCA blocked — cumulative margin %.2f + %.2f would exceed "
+                "max envelope %.2f",
+                current_margin, dca_margin, max_total_margin,
+            )
+            self._broadcast({"type": "notification",
+                             "text": f"DCA blocked: margin envelope exceeded "
+                                     f"(total={current_margin+dca_margin:.1f} > max={max_total_margin:.1f})"})
+            return
+
         session_leverage = self._session.get("leverage", cfg.leverage)
         fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
         fee_adjusted_dca_margin = dca_margin / fee_factor
@@ -1603,6 +1627,50 @@ class TradingEngine:
                 return
 
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
+        # Scale by reversal conviction — floors at 0.6 to keep averaging effect meaningful
+        if cfg.strength_sizing and ind is not None:
+            reversal_count = self._count_reversal_signals(ind, direction)
+            rescue_strength_scale = max(reversal_count / 4.0, 0.6)
+            dca_margin = dca_margin * rescue_strength_scale
+
+        # SL proximity guard: block if price is within 20% of last resort SL distance
+        sess_leverage   = self._session.get("leverage", cfg.leverage) if self._session else cfg.leverage
+        liq_pct         = (1.0 / sess_leverage) * 100 if sess_leverage > 0 else 10.0
+        last_resort_pct = liq_pct * cfg.last_resort_sl_buffer
+        sl_proximity_cutoff = last_resort_pct * 0.80
+        if avg_price > 0:
+            price_pct_now = ((price - avg_price) / avg_price * 100) if direction == "LONG" \
+                            else ((avg_price - price) / avg_price * 100)
+        else:
+            price_pct_now = 0.0
+        if price_pct_now <= -sl_proximity_cutoff:
+            logger.warning(
+                "TradingEngine: rescue DCA blocked — price_pct=%.2f%% within SL proximity "
+                "(cutoff=%.2f%%, last_resort=%.2f%%)",
+                price_pct_now, sl_proximity_cutoff, last_resort_pct,
+            )
+            self._broadcast({"type": "notification",
+                             "text": f"Rescue DCA blocked: too close to SL "
+                                     f"({price_pct_now:.1f}% vs -{sl_proximity_cutoff:.1f}% limit)"})
+            return
+
+        # Cumulative margin guard: total deployed must not exceed theoretical max envelope
+        max_total_margin = sum(
+            cfg.margin_usdt * (cfg.dca_multiplier ** i)
+            for i in range(cfg.max_dca + 1)
+        )
+        current_margin = self._session.get("margin", 0.0) if self._session else 0.0
+        if current_margin + dca_margin > max_total_margin * 1.05:
+            logger.warning(
+                "TradingEngine: DCA blocked — cumulative margin %.2f + %.2f would exceed "
+                "max envelope %.2f",
+                current_margin, dca_margin, max_total_margin,
+            )
+            self._broadcast({"type": "notification",
+                             "text": f"DCA blocked: margin envelope exceeded "
+                                     f"(total={current_margin+dca_margin:.1f} > max={max_total_margin:.1f})"})
+            return
+
         session_leverage = self._session.get("leverage", cfg.leverage)
         fee_factor = 1.0 + (cfg.taker_fee_pct / 100)
         fee_adjusted_dca_margin = dca_margin / fee_factor
