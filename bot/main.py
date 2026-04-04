@@ -86,6 +86,7 @@ _tv_alert_cooldown: dict = {}          # symbol → last-accepted timestamp (rat
 _tv_watcher = None                     # parallel signal monitor for top TV-alerted symbols
 _tv_batch_timer: float = 0.0           # timestamp when batch window started
 _TV_BATCH_WINDOW_S = 15.0              # collect alerts for 15s before switching
+_tv_monitor_weak_cycles: int = 0       # consecutive monitor cycles with no bot_ready symbol
 _switching_in_progress: bool = False   # guard against concurrent symbol switches
 _trading_active: bool = False          # persisted in config.trading_active
 _last_switch_ts: float = 0.0          # timestamp of last auto-switch (for flow warmup)
@@ -524,7 +525,8 @@ async def _tv_monitor_loop() -> None:
             all_sigs = _tv_watcher.get_all_signals(all_syms, _last_top_movers, cfg, _htf_bias)
             _tv_watcher.mark_signals_fresh()
 
-            # Update bot_strength and bot_ready on sidebar entries
+            # Update bot_strength, bot_ready, block_reason on sidebar entries
+            global _tv_monitor_weak_cycles
             updated    = False
             best_ready = None
             for sig in all_sigs:
@@ -532,6 +534,7 @@ async def _tv_monitor_loop() -> None:
                     if m.get("symbol") == sig["symbol"]:
                         m["bot_strength"] = sig["strength"]
                         m["bot_ready"]    = sig["ready"]
+                        m["block_reason"] = sig.get("block_reason", "")
                         updated = True
                 if sig["ready"] and best_ready is None:
                     best_ready = sig
@@ -543,6 +546,13 @@ async def _tv_monitor_loop() -> None:
                     reverse=True,
                 )
                 await _do_broadcast({"type": "top_movers", "movers": _last_top_movers})
+
+            # Track consecutive weak cycles for fallback switch logic
+            current_strength = (_engine.last_signal or {}).get("strength", 0.0) if _engine else 0.0
+            if best_ready:
+                _tv_monitor_weak_cycles = 0
+            else:
+                _tv_monitor_weak_cycles += 1
 
             # Switch to best ready symbol if no position open
             if (best_ready
@@ -560,6 +570,30 @@ async def _tv_monitor_loop() -> None:
                     if m.get("symbol") == best_sym:
                         m["bot_ready"] = False
                 asyncio.ensure_future(_do_switch(best_sym, cfg))
+
+            # Fallback: no bot_ready + current signal dead + stuck for 3+ cycles
+            _TV_FALLBACK_CYCLES  = 3
+            _TV_FALLBACK_MIN_STR = 0.10
+            if (not best_ready
+                    and _tv_monitor_weak_cycles >= _TV_FALLBACK_CYCLES
+                    and current_strength == 0.0
+                    and _engine
+                    and _engine._session is None
+                    and _trading_active
+                    and not _switching_in_progress
+                    and all_sigs):
+                candidates = [s for s in all_sigs
+                              if s.get("strength", 0) >= _TV_FALLBACK_MIN_STR
+                              and s.get("direction", "NEUTRAL") != "NEUTRAL"]
+                if candidates:
+                    best_fb = max(candidates, key=lambda x: x.get("strength", 0))
+                    _tv_monitor_weak_cycles = 0
+                    logger.info(
+                        "TvMonitor: fallback switch to %s strength=%.2f "
+                        "(no bot_ready after %d cycles, current=0%%)",
+                        best_fb["symbol"], best_fb["strength"], _TV_FALLBACK_CYCLES,
+                    )
+                    asyncio.ensure_future(_do_switch(best_fb["symbol"], cfg))
 
         except asyncio.CancelledError:
             return
