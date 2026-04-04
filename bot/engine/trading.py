@@ -21,6 +21,7 @@ from database import (
     get_session_history,
     get_today_pnl,
     log_signal,
+    save_session_history,
     update_session,
 )
 from engine.indicators import compute_all
@@ -741,7 +742,21 @@ class TradingEngine:
             session, self._asian_high, self._asian_low, price, history
         )
 
-        if prob["probability"] < cfg.session_prob_threshold:
+        expected_dir = "none"
+        _min_samples = 5
+
+        if len(history) < _min_samples:
+            # Bootstrap mode — no history yet; derive direction from Asian range proximity
+            gates["PROBABILITY"] = (
+                True,
+                f"building history ({len(history)}/{_min_samples} samples) — using Asian range"
+            )
+            if self._asian_high > 0 and self._asian_low < 999_999_999.0:
+                expected_dir = (
+                    "short" if abs(price - self._asian_high) < abs(price - self._asian_low)
+                    else "long"
+                )
+        elif prob["probability"] < cfg.session_prob_threshold:
             gates["PROBABILITY"] = (
                 False,
                 f"{prob['probability']:.0%} < {cfg.session_prob_threshold:.0%} ({prob['reason']})"
@@ -751,12 +766,10 @@ class TradingEngine:
                 True,
                 f"{prob['probability']:.0%} → {prob['direction'].upper()} ({prob['sample_size']} samples)"
             )
-
-        expected_dir = "none"
-        if prob["direction"] in ("long", "continuation"):
-            expected_dir = "long"
-        elif prob["direction"] in ("short", "reversal"):
-            expected_dir = "short"
+            if prob["direction"] in ("long", "continuation"):
+                expected_dir = "long"
+            elif prob["direction"] in ("short", "reversal"):
+                expected_dir = "short"
 
         # ── Gate 3: Key Level Proximity ───────────────────────────────────
         nearby_level = None
@@ -1122,6 +1135,57 @@ class TradingEngine:
 
         # ── Persist + log ─────────────────────────────────────────────
         await close_session(sess["id"], pnl=pnl_usdt, reason=reason, exit_price=fill_price)
+
+        # ── Record session history for probability learning ───────────────
+        try:
+            entry_reason = sess.get("entry_reason", "")
+            # entry_reason format: "session|london|pin_bar|asian_high"
+            parts = entry_reason.split("|") if entry_reason else []
+            traded_session = parts[1] if len(parts) > 1 else self._get_session(5)
+            local_date = self._get_local_date(5)
+
+            if traded_session == "london":
+                # Determine which Asian level was hunted based on direction
+                hunted = "asian_high" if direction == "SHORT" else "asian_low"
+                hunt_pts = (
+                    abs(avg_price - self._asian_high) if direction == "SHORT"
+                    else abs(avg_price - self._asian_low)
+                )
+                await save_session_history({
+                    "date":             local_date,
+                    "session":          "london",
+                    "symbol":           cfg.symbol,
+                    "asian_high":       self._asian_high if self._asian_high > 0 else None,
+                    "asian_low":        self._asian_low if self._asian_low < 999_999_999.0 else None,
+                    "london_hunted":    hunted,
+                    "london_hunt_min":  self._minutes_since_session_open("london", 5),
+                    "london_hunt_pts":  round(hunt_pts, 4),
+                    "london_direction": direction.lower(),
+                    "ny_behavior":      None,
+                    "ny_open_price":    None,
+                    "ny_close_price":   None,
+                })
+            elif traded_session == "ny":
+                # Determine NY behavior relative to London direction
+                # Simple heuristic: if NY trade direction matches London, it's continuation
+                ny_behavior = "continuation" if direction == "LONG" else "reversal"
+                await save_session_history({
+                    "date":          local_date,
+                    "session":       "ny",
+                    "symbol":        cfg.symbol,
+                    "asian_high":    self._asian_high if self._asian_high > 0 else None,
+                    "asian_low":     self._asian_low if self._asian_low < 999_999_999.0 else None,
+                    "london_hunted": None,
+                    "london_hunt_min": None,
+                    "london_hunt_pts": None,
+                    "london_direction": None,
+                    "ny_behavior":   ny_behavior,
+                    "ny_open_price": avg_price,
+                    "ny_close_price": fill_price,
+                })
+        except Exception:
+            logger.debug("TradingEngine: save_session_history failed", exc_info=True)
+
         self._pos_log(
             "close",
             direction=direction,
