@@ -352,7 +352,7 @@ async def _ticker_loop() -> None:
                 else:
                     _tv_batch_timer = 0.0
 
-            await _engine.tick(cfg, price, allow_entry=_trading_active, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
+            await _engine.tick(cfg, price, allow_entry=_trading_active and not _switching_in_progress, flow_warmup=in_flow_warmup, htf_bias=_htf_bias)
 
             # Detect trade close → signal scanner to run immediately
             cur_session_open = _engine._session is not None
@@ -921,110 +921,115 @@ async def _scan_symbols(cfg) -> None:
             new_sym = candidates[0]
 
         logger.info("Auto-switch: %s → %s  (tried: %s)", cfg.symbol, new_sym, sorted(_tried_syms))
-        await set_config_bulk({"symbol": new_sym})
-        # Fetch 200 candles for the new symbol BEFORE switching so the engine
-        # is ready to compute a signal on the very first tick after switch —
-        # no extra 30-second candle-refresh cycle needed.
-        raw_candles = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
-        fresh_candles = [
-            {
-                "open":   float(k[1]),
-                "high":   float(k[2]),
-                "low":    float(k[3]),
-                "close":  float(k[4]),
-                "volume": float(k[5]),
-                "time":   int(k[0]) // 1000,
-            }
-            for k in raw_candles
-        ] if raw_candles else []
+        global _switching_in_progress
+        _switching_in_progress = True
+        try:
+            await set_config_bulk({"symbol": new_sym})
+            # Fetch 200 candles for the new symbol BEFORE switching so the engine
+            # is ready to compute a signal on the very first tick after switch —
+            # no extra 30-second candle-refresh cycle needed.
+            raw_candles = await _rest.get_klines(new_sym, interval=cfg.timeframe, limit=200)
+            fresh_candles = [
+                {
+                    "open":   float(k[1]),
+                    "high":   float(k[2]),
+                    "low":    float(k[3]),
+                    "close":  float(k[4]),
+                    "volume": float(k[5]),
+                    "time":   int(k[0]) // 1000,
+                }
+                for k in raw_candles
+            ] if raw_candles else []
 
-        # Guard: require at least 60 candles for reliable indicator computation.
-        # EMA50 needs 50+, MACD needs 35+ — below 60 the signal engine produces
-        # NEUTRAL on every tick regardless of price action (new listings, thin markets).
-        # Skip this symbol and let auto-switch try the next candidate instead.
-        _MIN_CANDLES_FOR_ENTRY = 60
-        if len(fresh_candles) < _MIN_CANDLES_FOR_ENTRY:
-            logger.warning(
-                "Auto-switch: %s skipped — only %d candles available (need %d). "
-                "New listing or thin market — marking as tried.",
-                new_sym, len(fresh_candles), _MIN_CANDLES_FOR_ENTRY,
+            # Guard: require at least 60 candles for reliable indicator computation.
+            # EMA50 needs 50+, MACD needs 35+ — below 60 the signal engine produces
+            # NEUTRAL on every tick regardless of price action (new listings, thin markets).
+            # Skip this symbol and let auto-switch try the next candidate instead.
+            _MIN_CANDLES_FOR_ENTRY = 60
+            if len(fresh_candles) < _MIN_CANDLES_FOR_ENTRY:
+                logger.warning(
+                    "Auto-switch: %s skipped — only %d candles available (need %d). "
+                    "New listing or thin market — marking as tried.",
+                    new_sym, len(fresh_candles), _MIN_CANDLES_FOR_ENTRY,
+                )
+                _tried_syms.add(new_sym)
+                return
+
+            # Calculate ATR-based safe leverage from fresh candles before setting on exchange.
+            # This avoids setting leverage at entry time (which adds latency to order placement).
+            smart_leverage = cfg.leverage
+            if cfg.auto_leverage and fresh_candles and len(fresh_candles) >= 15:
+                from exchange.binance_rest import _scan_atr as _atr
+                highs  = [c["high"]  for c in fresh_candles[-15:]]
+                lows   = [c["low"]   for c in fresh_candles[-15:]]
+                closes = [c["close"] for c in fresh_candles[-15:]]
+                last_price = closes[-1]
+                if last_price > 0:
+                    atr_val   = _atr(highs, lows, closes, 14)
+                    atr_pct   = atr_val / last_price * 100
+                    buffer    = cfg.last_resort_sl_buffer
+                    max_lev   = (buffer * 100) / (atr_pct * 1.5) * 0.85
+                    safe_lev  = max(1, int(max_lev))
+                    smart_leverage = min(cfg.leverage, safe_lev)
+                    if smart_leverage < cfg.leverage:
+                        logger.info(
+                            "Auto-switch: %s ATR=%.2f%% → leverage %dx → %dx",
+                            new_sym, atr_pct, cfg.leverage, smart_leverage,
+                        )
+
+            # WS resubscribe and Binance symbol prep run in parallel.
+            await asyncio.gather(
+                _ws.switch_symbol(new_sym),
+                _executor.prepare_symbol(new_sym, smart_leverage),
             )
-            _tried_syms.add(new_sym)
-            return
 
-        # Calculate ATR-based safe leverage from fresh candles before setting on exchange.
-        # This avoids setting leverage at entry time (which adds latency to order placement).
-        smart_leverage = cfg.leverage
-        if cfg.auto_leverage and fresh_candles and len(fresh_candles) >= 15:
-            from exchange.binance_rest import _scan_atr as _atr
-            highs  = [c["high"]  for c in fresh_candles[-15:]]
-            lows   = [c["low"]   for c in fresh_candles[-15:]]
-            closes = [c["close"] for c in fresh_candles[-15:]]
-            last_price = closes[-1]
-            if last_price > 0:
-                atr_val   = _atr(highs, lows, closes, 14)
-                atr_pct   = atr_val / last_price * 100
-                buffer    = cfg.last_resort_sl_buffer
-                max_lev   = (buffer * 100) / (atr_pct * 1.5) * 0.85
-                safe_lev  = max(1, int(max_lev))
-                smart_leverage = min(cfg.leverage, safe_lev)
-                if smart_leverage < cfg.leverage:
-                    logger.info(
-                        "Auto-switch: %s ATR=%.2f%% → leverage %dx → %dx",
-                        new_sym, atr_pct, cfg.leverage, smart_leverage,
-                    )
+            # Reset stale price so the next tick gets a fresh mark-price for new symbol.
+            _last_price = 0.0
+            _last_price_rest_fetch = 0.0
 
-        # WS resubscribe and Binance symbol prep run in parallel.
-        await asyncio.gather(
-            _ws.switch_symbol(new_sym),
-            _executor.prepare_symbol(new_sym, smart_leverage),
-        )
+            # symbol_ready MUST go first — UI clears the chart on this message.
+            # Candles sent after so they populate the freshly cleared chart.
+            _entry_start_candle   = 0   # set correctly after update_candles() below
+            _neutral_since_candle = 0   # reset neutral clock for the new symbol
+            _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
+            global _current_scanner_type
+            # Find scanner type for the new symbol from top movers list
+            new_sym_data = next((t for t in _last_top_movers if t.get("symbol") == new_sym), {})
+            _current_scanner_type = new_sym_data.get("scanner_type", "momentum")
+            if _engine:
+                _engine.set_scanner_type(_current_scanner_type)
+            logger.info("Auto-switch scanner type: %s → %s", new_sym, _current_scanner_type)
+            global _last_switch_ts, _htf_bias, _last_htf_fetch
+            _last_switch_ts = time.time()
+            _htf_bias = "NEUTRAL"
+            _last_htf_fetch = 0.0
+            _htf_scanner_cache.pop(new_sym, None)   # force fresh HTF fetch for new symbol on next scan
+            await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
+            await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
 
-        # Reset stale price so the next tick gets a fresh mark-price for new symbol.
-        _last_price = 0.0
-        _last_price_rest_fetch = 0.0
-
-        # symbol_ready MUST go first — UI clears the chart on this message.
-        # Candles sent after so they populate the freshly cleared chart.
-        _entry_start_candle   = 0   # set correctly after update_candles() below
-        _neutral_since_candle = 0   # reset neutral clock for the new symbol
-        _tried_syms.discard(new_sym)   # new symbol is active candidate — remove from tried if present
-        global _current_scanner_type
-        # Find scanner type for the new symbol from top movers list
-        new_sym_data = next((t for t in _last_top_movers if t.get("symbol") == new_sym), {})
-        _current_scanner_type = new_sym_data.get("scanner_type", "momentum")
-        if _engine:
-            _engine.set_scanner_type(_current_scanner_type)
-        logger.info("Auto-switch scanner type: %s → %s", new_sym, _current_scanner_type)
-        global _last_switch_ts, _htf_bias, _last_htf_fetch
-        _last_switch_ts = time.time()
-        _htf_bias = "NEUTRAL"
-        _last_htf_fetch = 0.0
-        _htf_scanner_cache.pop(new_sym, None)   # force fresh HTF fetch for new symbol on next scan
-        await _do_broadcast({"type": "htf_bias", "bias": "NEUTRAL", "timeframe": ""})
-        await _do_broadcast({"type": "symbol_ready", "symbol": new_sym})
-
-        if fresh_candles:
-            _engine.update_candles(fresh_candles)
-            _entry_start_candle = fresh_candles[-1]["time"] if fresh_candles else 0
-            _last_candles_fetch = time.time()
-            await _do_broadcast({
-                "type":    "candles",
-                "candles": fresh_candles[-100:],
-            })
-            ind = _engine.last_indicators
-            if ind:
+            if fresh_candles:
+                _engine.update_candles(fresh_candles)
+                _entry_start_candle = fresh_candles[-1]["time"] if fresh_candles else 0
+                _last_candles_fetch = time.time()
                 await _do_broadcast({
-                    "type":       "indicators",
-                    "indicators": _safe_ind(ind),
+                    "type":    "candles",
+                    "candles": fresh_candles[-100:],
                 })
-        else:
-            _last_candles_fetch = 0.0
+                ind = _engine.last_indicators
+                if ind:
+                    await _do_broadcast({
+                        "type":       "indicators",
+                        "indicators": _safe_ind(ind),
+                    })
+            else:
+                _last_candles_fetch = 0.0
 
-        await _do_broadcast({
-            "type": "notification",
-            "text": f"Auto-switched: {cfg.symbol} → {new_sym}",
-        })
+            await _do_broadcast({
+                "type": "notification",
+                "text": f"Auto-switched: {cfg.symbol} → {new_sym}",
+            })
+        finally:
+            _switching_in_progress = False
     except Exception as exc:
         logger.warning("_scan_symbols error: %s", exc)
         _on_exchange_error(f"Symbol scan failed: {exc}")
