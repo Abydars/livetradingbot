@@ -371,46 +371,50 @@ class TradingEngine:
         return 1.0
 
     @staticmethod
-    def _count_reversal_signals(ind: Dict, direction: str) -> int:
+    def _count_reversal_signals(ind: Dict, direction: str, prev_ind: Dict = None) -> int:
         """
         Count reversal indicators confirming a potential bounce (0–4).
         Used to gate DCA entries when smart_dca_gate is enabled.
-        Each signal must be genuinely extreme — not just slightly off-centre.
         """
         count = 0
         rsi_val   = ind.get("rsi")
         bb        = ind.get("bollinger")
         macd_data = ind.get("macd")
 
-        # Signal 1: RSI genuinely oversold/overbought
+        # Signal 1: RSI pullback zone (relaxed from 35/65 to catch gradual dips)
         if rsi_val is not None:
-            if direction == "LONG" and rsi_val < 35:      # was 38
+            if direction == "LONG" and rsi_val < 40:
                 count += 1
-            elif direction == "SHORT" and rsi_val > 65:   # was 62
+            elif direction == "SHORT" and rsi_val > 60:
                 count += 1
 
-        # Signal 2: Bollinger Band extreme touch (price at/beyond band)
+        # Signal 2: Bollinger Band lower/upper range (relaxed from 5%/95% to 20%/80%)
         if bb is not None:
             pct_b = bb.get("pct_b", 0.5)
-            if direction == "LONG" and pct_b <= 0.05:     # was 0.08
+            if direction == "LONG" and pct_b <= 0.20:
                 count += 1
-            elif direction == "SHORT" and pct_b >= 0.95:  # was 0.92
+            elif direction == "SHORT" and pct_b >= 0.80:
                 count += 1
 
-        # Signal 3: MACD histogram actively turning (not just near zero)
-        # Must be positive for LONG (turning up) or negative for SHORT (turning down)
-        # Previous threshold < 0.0001 fired on almost every tick
-        if macd_data is not None:
-            hist = macd_data.get("hist", 0.0)
-            if direction == "LONG" and hist > 0:           # was > -0.0001
+        # Signal 3: MACD histogram slope improving (catches the turn, not the full reversal).
+        # Slope check: hist moving toward zero is the real DCA opportunity.
+        # Fallback to absolute check when prev_ind not available.
+        if macd_data is not None and prev_ind is not None:
+            hist      = macd_data.get("hist", 0.0)
+            prev_macd = prev_ind.get("macd")
+            prev_hist = prev_macd.get("hist", 0.0) if prev_macd else 0.0
+            if direction == "LONG" and hist > prev_hist:
                 count += 1
-            elif direction == "SHORT" and hist < 0:        # was < 0.0001
+            elif direction == "SHORT" and hist < prev_hist:
+                count += 1
+        elif macd_data is not None:
+            hist = macd_data.get("hist", 0.0)
+            if direction == "LONG" and hist > 0:
+                count += 1
+            elif direction == "SHORT" and hist < 0:
                 count += 1
 
         # Signal 4: StochRSI extreme (genuinely oversold/overbought)
-        # k < 20 = oversold → LONG reversal likely
-        # k > 80 = overbought → SHORT reversal likely
-        # Fires ~20% of time vs BB width which fired ~100% of time
         sr = ind.get("stoch_rsi")
         if sr is not None:
             k = float(sr.get("k", 50.0))
@@ -1298,7 +1302,7 @@ class TradingEngine:
 
             # Gate 2: Smart DCA reversal-indicator gate
             if cfg.smart_dca_gate:
-                reversal_count = self._count_reversal_signals(ind, direction)
+                reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
                 if reversal_count < cfg.smart_dca_signals:
                     logger.debug(
                         "TradingEngine: DCA gated — reversal signals %d/%d",
@@ -1624,7 +1628,7 @@ class TradingEngine:
 
         # Require at least 1 reversal signal — rescue is permissive but not blind
         if ind is not None:
-            reversal_count = self._count_reversal_signals(ind, direction)
+            reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
             if reversal_count < 1:
                 logger.info(
                     "TradingEngine: rescue DCA blocked — 0 reversal signals "
@@ -1637,7 +1641,7 @@ class TradingEngine:
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
         # Scale by reversal conviction — floors at 0.6 to keep averaging effect meaningful
         if cfg.strength_sizing and ind is not None:
-            reversal_count = self._count_reversal_signals(ind, direction)
+            reversal_count = self._count_reversal_signals(ind, direction, self._prev_indicators)
             rescue_strength_scale = max(reversal_count / 4.0, 0.6)
             dca_margin = dca_margin * rescue_strength_scale
 
