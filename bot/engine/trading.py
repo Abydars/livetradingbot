@@ -331,11 +331,275 @@ class TradingEngine:
 
         if self._session is None:
             if allow_entry:
-                await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
+                entered = await self._try_early_entry(cfg, price, ind, atr_val, htf_bias=htf_bias)
+                if not entered:
+                    await self._try_entry(cfg, price, signal, ind, atr_val, flow_warmup=flow_warmup, htf_bias=htf_bias)
             else:
                 self._broadcast({"type": "entry_blocked", "reason": entry_block_reason or "Trading paused — press Start to enable entries", "gates": {}})
         else:
             await self._manage_position(cfg, price, signal, ind, atr_val)
+
+    # ------------------------------------------------------------------
+    # Early entry — compression + breakout detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_compression(candles: List[Dict], cfg) -> Dict:
+        """
+        Analyse the last N closed candles for price compression (coiling).
+        Excludes the currently forming candle (candles[-1]).
+        """
+        n = cfg.compression_bars
+        window = candles[-n - 1:-1]   # last N closed candles, not the forming one
+        if len(window) < n:
+            return {"compressed": False}
+
+        ratios = []
+        for c in window:
+            rng = c["high"] - c["low"]
+            if rng > 0:
+                ratios.append(abs(c["close"] - c["open"]) / rng)
+
+        if not ratios:
+            return {"compressed": False}
+
+        avg_body_ratio = sum(ratios) / len(ratios)
+        range_high     = max(c["high"] for c in window)
+        range_low      = min(c["low"]  for c in window)
+        atr_pct        = (range_high - range_low) / range_low * 100 if range_low > 0 else 999.0
+
+        compressed = (
+            avg_body_ratio <= cfg.compression_body_max and
+            atr_pct        <= cfg.compression_atr_max
+        )
+        return {
+            "compressed":     compressed,
+            "avg_body_ratio": avg_body_ratio,
+            "atr_pct":        atr_pct,
+            "range_high":     range_high,
+            "range_low":      range_low,
+        }
+
+    async def _try_early_entry(
+        self,
+        cfg: BotConfig,
+        price: float,
+        ind: Dict,
+        atr_val: float,
+        htf_bias: str = "NEUTRAL",
+    ) -> bool:
+        """
+        Pre-breakout early entry on the forming candle.
+        Returns True if an entry was placed, False otherwise (never raises).
+        """
+        try:
+            if not cfg.early_entry_enabled:
+                return False
+            if self._session is not None or self._closing:
+                return False
+            if len(self.candles) < 60 or atr_val <= 0:
+                return False
+            if time.time() - self._last_exit_time < cfg.entry_cooldown_s:
+                return False
+
+            # ── Phase 1 — Compression on closed candles ───────────────────
+            comp = self._detect_compression(self.candles, cfg)
+            if not comp["compressed"]:
+                return False
+
+            # ── Phase 2 — Forming candle breakout check ───────────────────
+            forming    = self.candles[-1]
+            f_open     = forming["open"]
+            f_close    = forming["close"]
+            f_high     = forming["high"]
+            f_low      = forming["low"]
+            f_volume   = forming["volume"]
+            full_range = f_high - f_low
+            if full_range <= 0:
+                return False
+
+            body       = abs(f_close - f_open)
+            body_ratio = body / full_range
+
+            if f_close > f_open:
+                direction = "LONG"
+            elif f_close < f_open:
+                direction = "SHORT"
+            else:
+                return False
+
+            if body_ratio < cfg.breakout_body_min:
+                return False
+
+            # Price must have broken out of the compression range
+            if direction == "LONG"  and f_high <= comp["range_high"]:
+                return False
+            if direction == "SHORT" and f_low  >= comp["range_low"]:
+                return False
+
+            # ── HTF filter ────────────────────────────────────────────────
+            if cfg.htf_filter and htf_bias not in ("NEUTRAL", direction):
+                return False
+
+            # ── Phase 3 — Volume pace ─────────────────────────────────────
+            if len(self.candles) >= 2:
+                tf_secs = max(60, self.candles[-1]["time"] - self.candles[-2]["time"])
+                # Handle millisecond timestamps
+                if self.candles[-1]["time"] > 1e10:
+                    tf_secs = max(60, (self.candles[-1]["time"] - self.candles[-2]["time"]) // 1000)
+            else:
+                tf_secs = 60
+
+            candle_open_ts = self.candles[-1]["time"]
+            if candle_open_ts > 1e10:
+                candle_open_ts = candle_open_ts / 1000
+            elapsed_secs = max(1, time.time() - candle_open_ts)
+            elapsed_pct  = max(0.05, min(elapsed_secs / tf_secs, 1.0))
+
+            projected_volume = f_volume / elapsed_pct
+            vol_window = [c["volume"] for c in self.candles[-22:-2]]
+            if len(vol_window) < 5:
+                return False
+            vol_avg  = sum(vol_window) / len(vol_window)
+            vol_pace = projected_volume / vol_avg if vol_avg > 0 else 0.0
+
+            if vol_pace < cfg.breakout_vol_pace_min:
+                return False
+
+            # ── Phase 4 — Order flow ──────────────────────────────────────
+            flow_data  = self._flow.summarize()
+            flow_score = flow_data.get("score", 0.0)
+            flow_count = flow_data.get("trade_count", 0)
+            if flow_count < 10:
+                return False
+            if direction == "LONG"  and flow_score < cfg.breakout_flow_min:
+                return False
+            if direction == "SHORT" and flow_score > -cfg.breakout_flow_min:
+                return False
+
+            # ── Phase 5 — EMA stack ───────────────────────────────────────
+            closes = [c["close"] for c in self.candles]
+            ema9   = EMA(closes, 9)
+            ema21  = EMA(closes, 21)
+            ema50  = EMA(closes, 50)
+            if None in (ema9, ema21, ema50):
+                return False
+            if direction == "LONG"  and not (ema9 > ema21 > ema50):
+                return False
+            if direction == "SHORT" and not (ema9 < ema21 < ema50):
+                return False
+
+            # ── Phase 6 — RSI zone ────────────────────────────────────────
+            rsi_val = RSI(closes, 14)
+            if rsi_val is None:
+                return False
+            if direction == "LONG"  and not (35 <= rsi_val <= 75):
+                return False
+            if direction == "SHORT" and not (25 <= rsi_val <= 65):
+                return False
+
+            # ── Phase 7 — R:R ─────────────────────────────────────────────
+            levels   = self._compute_scalp_levels(atr_val, price, direction, price, cfg)
+            rr_ratio = levels["rr_ratio"]
+            if rr_ratio < cfg.min_rr_ratio:
+                return False
+
+            # ── Daily loss check (async) ───────────────────────────────────
+            if cfg.max_daily_loss_usdt > 0:
+                today_pnl = await get_today_pnl()
+                if today_pnl < -cfg.max_daily_loss_usdt:
+                    return False
+
+            # ── All phases passed — place entry ───────────────────────────
+            effective_leverage  = self._effective_leverage if self._effective_leverage > 0 else cfg.leverage
+            fee_factor          = 1.0 + (cfg.taker_fee_pct / 100)
+            fee_adjusted_margin = cfg.margin_usdt / fee_factor
+            qty = self._executor.calc_qty(cfg.symbol, fee_adjusted_margin, effective_leverage, price)
+            if qty <= 0:
+                return False
+
+            side  = "BUY" if direction == "LONG" else "SELL"
+            order = await self._executor.place_market_order(cfg.symbol, side, qty, current_price=price)
+            fill_price = float(order.get("avgPrice") or price)
+
+            order_id = int(order.get("orderId", 0))
+            if order_id:
+                self._pending_fills[order_id] = {"type": "entry", "prior_qty": 0.0, "prior_avg": 0.0}
+
+            levels = self._compute_scalp_levels(atr_val, fill_price, direction, fill_price, cfg)
+
+            await create_session(
+                symbol=cfg.symbol,
+                direction=direction,
+                entry_price=fill_price,
+                qty=qty,
+                margin=cfg.margin_usdt,
+                leverage=effective_leverage,
+                entry_reason=f"early_scalp|{direction}|comp={comp['avg_body_ratio']:.2f}",
+                signal_strength=0.8,
+                signal_price=price,
+            )
+            self._session         = await get_open_session()
+            self._trail_activated = False
+            self._trail_price     = None
+
+            self._scalp_tp_price    = levels["tp_price"]
+            self._scalp_sl_price    = levels["sl_price"]
+            self._scalp_tp_pct      = levels["tp_pct"]
+            self._scalp_sl_pct      = levels["sl_pct"]
+            self._scalp_atr_pct     = levels["atr_pct"]
+            self._entry_candle_time = self.candles[-1]["time"]
+
+            await update_session(
+                self._session["id"],
+                scalp_tp_price=self._scalp_tp_price,
+                scalp_sl_price=self._scalp_sl_price,
+                scalp_tp_pct=self._scalp_tp_pct,
+                scalp_sl_pct=self._scalp_sl_pct,
+                scalp_atr_pct=self._scalp_atr_pct,
+                scalp_entry_candle_time=self._entry_candle_time,
+            )
+
+            msg = (
+                f"{_mode_prefix(cfg.trading_mode)}"
+                f"⚡ EARLY ENTRY {direction} @ {fill_price:.4f}  "
+                f"TP={self._scalp_tp_price:.4f} (+{self._scalp_tp_pct:.2f}%)  "
+                f"SL={self._scalp_sl_price:.4f} (-{self._scalp_sl_pct:.2f}%)  "
+                f"R:R={rr_ratio:.2f}  vol_pace={vol_pace:.1f}×  flow={flow_score:+.2f}"
+            )
+            logger.info("TradingEngine: %s", msg)
+            self._broadcast({
+                "type": "entry_blocked",
+                "reason": "Early entry fired",
+                "gates": {
+                    "COMPRESSION": (True, f"body {comp['avg_body_ratio']:.0%} atr {comp['atr_pct']:.2f}%"),
+                },
+            })
+            self._broadcast({"type": "notification", "text": msg})
+            self._pos_log(
+                "open", direction=direction, price=fill_price, qty=qty,
+                symbol=cfg.symbol, mode=cfg.trading_mode,
+                tp=self._scalp_tp_price, sl=self._scalp_sl_price,
+                rr=rr_ratio, entry_type="early",
+            )
+            self._push_session()
+
+            await notify(cfg.discord_webhook, "TRADE_OPEN", {
+                "symbol":       cfg.symbol,
+                "direction":    direction,
+                "price":        fill_price,
+                "margin":       cfg.margin_usdt,
+                "tp_price":     self._scalp_tp_price,
+                "sl_price":     self._scalp_sl_price,
+                "rr_ratio":     rr_ratio,
+                "trading_mode": cfg.trading_mode,
+                "entry_type":   "early_breakout",
+            })
+            return True
+
+        except Exception:
+            logger.exception("TradingEngine: _try_early_entry failed — skipping")
+            return False
 
     # ------------------------------------------------------------------
     # Entry

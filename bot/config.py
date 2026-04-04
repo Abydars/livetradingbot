@@ -84,6 +84,15 @@ class BotConfig:
     min_vol_ratio:     float
     min_flow_score:    float
 
+    # Early-entry (pre-breakout compression)
+    early_entry_enabled:    bool
+    compression_bars:       int
+    compression_body_max:   float
+    compression_atr_max:    float
+    breakout_body_min:      float
+    breakout_vol_pace_min:  float
+    breakout_flow_min:      float
+
     # Exchange secrets (env-only, never in DB)
     api_key: str
     api_secret: str
@@ -187,6 +196,13 @@ async def load_config() -> BotConfig:
         min_body_ratio=_f("min_body_ratio", 0.45),
         min_vol_ratio=_f("min_vol_ratio", 1.30),
         min_flow_score=_f("min_flow_score", 0.15),
+        early_entry_enabled=_b("early_entry_enabled", True),
+        compression_bars=_i("compression_bars", 4),
+        compression_body_max=_f("compression_body_max", 0.30),
+        compression_atr_max=_f("compression_atr_max", 0.12),
+        breakout_body_min=_f("breakout_body_min", 0.50),
+        breakout_vol_pace_min=_f("breakout_vol_pace_min", 2.0),
+        breakout_flow_min=_f("breakout_flow_min", 0.25),
         api_key=api_key,
         api_secret=api_secret,
     )

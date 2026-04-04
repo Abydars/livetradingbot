@@ -135,6 +135,14 @@ _DEFAULT_CONFIG: Dict[str, str] = {
     "min_body_ratio":        "0.45",
     "min_vol_ratio":         "1.30",
     "min_flow_score":        "0.15",
+    # Early-entry (pre-breakout compression) config fields
+    "early_entry_enabled":   "1",
+    "compression_bars":      "4",
+    "compression_body_max":  "0.30",
+    "compression_atr_max":   "0.12",
+    "breakout_body_min":     "0.50",
+    "breakout_vol_pace_min": "2.0",
+    "breakout_flow_min":     "0.25",
 }
 
 
