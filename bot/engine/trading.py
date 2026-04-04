@@ -1535,7 +1535,8 @@ class TradingEngine:
 
         # Geometric DCA sizing: multiply margin by dca_multiplier^dca_count
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
-        new_qty = self._executor.calc_qty(cfg.symbol, dca_margin, cfg.leverage, price)
+        session_leverage = self._session.get("leverage", cfg.leverage)
+        new_qty = self._executor.calc_qty(cfg.symbol, dca_margin, session_leverage, price)
         side = "BUY" if direction == "LONG" else "SELL"
         order = await self._executor.place_market_order(
             cfg.symbol, side, new_qty, current_price=price
@@ -1622,7 +1623,8 @@ class TradingEngine:
         price then arms a tight trailing stop to minimize the eventual loss.
         """
         dca_margin = cfg.margin_usdt * (cfg.dca_multiplier ** dca_count)
-        new_qty    = self._executor.calc_qty(cfg.symbol, dca_margin, cfg.leverage, price)
+        session_leverage = self._session.get("leverage", cfg.leverage)
+        new_qty    = self._executor.calc_qty(cfg.symbol, dca_margin, session_leverage, price)
         side       = "BUY" if direction == "LONG" else "SELL"
 
         order = await self._executor.place_market_order(
