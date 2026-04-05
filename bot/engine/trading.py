@@ -596,10 +596,16 @@ class TradingEngine:
         SL: sl_extreme ± cfg.session_sl_buffer_pts
         TP: next key level beyond entry with R:R >= session_min_rr, else fallback
         """
-        buf = cfg.session_sl_buffer_pts
+        # Cap buffer so it never exceeds 1 % of entry — keeps SL sane for
+        # low-priced coins (e.g. RLSUSDT @ 0.005) where a flat 4-pt buffer
+        # would push SL to a negative price.
+        raw_buf = cfg.session_sl_buffer_pts
+        buf     = min(raw_buf, entry_price * 0.01) if entry_price > 0 else raw_buf
 
         if direction == "long":
             sl_price = sl_extreme - buf
+            # Never let SL go below zero
+            sl_price = max(sl_price, entry_price * 0.001)
             sl_dist  = entry_price - sl_price
         else:
             sl_price = sl_extreme + buf
